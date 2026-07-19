@@ -1,0 +1,105 @@
+name: Release (Windows)
+
+# Builds the native Windows herdr binary with `--remote` support by cloning
+# upstream (ogulcancelik/herdr) at the release tag pinned in
+# patches/herdr/BASE, applying the patch series with `git am`, and publishing
+# the result as a GitHub release asset.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*-win.*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  UPSTREAM_REPO: https://github.com/ogulcancelik/herdr
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseSafe
+      LIBGHOSTTY_VT_SIMD: 'false'
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Clone upstream at pinned base
+        shell: pwsh
+        run: |
+          $base = (Get-Content patches\herdr\BASE).Trim()
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tagBase = $env:GITHUB_REF_NAME -replace '-win\.\d+$', ''
+            if ($tagBase -ne $base) {
+              throw "tag $env:GITHUB_REF_NAME does not match pinned base $base (patches/herdr/BASE)"
+            }
+          }
+          git clone --depth 1 --branch $base $env:UPSTREAM_REPO checkouts/herdr
+          "UPSTREAM_BASE=$base" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+
+      - name: Apply patches
+        shell: pwsh
+        working-directory: checkouts/herdr
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          $patches = Get-ChildItem ..\..\patches\herdr\*.patch | Sort-Object Name
+          git am $patches.FullName
+          if ($LASTEXITCODE -ne 0) { throw "git am failed" }
+          "PATCHED_COMMIT=$(git rev-parse HEAD)" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Build
+        working-directory: checkouts/herdr
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          Copy-Item checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe herdr-windows-x86_64.exe
+          "repo_commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
+          "upstream_base=$env:UPSTREAM_BASE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          "patched_commit=$env:PATCHED_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          $hash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.exe).Hash.ToLowerInvariant()
+          "sha256=$hash  herdr-windows-x86_64.exe" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = 'windows-remote-latest'
+          }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --prerelease `
+              --title "herdr $tag (Windows --remote)" `
+              --notes "Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support. See BUILD_INFO.txt for commits and sha256."
+          }
+          gh release upload $tag herdr-windows-x86_64.exe BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --clobber

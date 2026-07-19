@@ -1,0 +1,72 @@
+From 02ab748f7ec6ed0488ca8fd4b815e63efcb73467 Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Thu, 16 Jul 2026 15:28:14 +0800
+Subject: [PATCH 3/5] feat(fork): disable self-update and background version
+ check
+
+This binary is the windows-remote fork; the updater compares against the
+official herdr.dev manifests and would replace it with an upstream build
+that has no native Windows --remote support.
+
+- `herdr update` now errors with a pointer to the fork releases page
+- the background version check (startup + periodic) is skipped, so no
+  'update available' notice can steer the user onto upstream binaries
+- the agent-manifest background check is intentionally left enabled
+  (agent detection data, unrelated to the herdr binary)
+- the remote-install path is untouched: installing the matching official
+  Linux binary on the ssh target from the official manifest is exactly
+  what `--remote` needs
+---
+ src/update.rs | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/src/update.rs b/src/update.rs
+index 98d3a7a..82fce39 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -24,6 +24,14 @@ use interprocess::local_socket::traits::Stream as _;
+ use serde::{Deserialize, Deserializer};
+ 
+ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
++
++/// This build is the iamwrm/herdr `windows-remote` fork. Self-update and the
++/// background version check are disabled: they compare against the *official*
++/// herdr.dev manifests and would replace this binary with an upstream build
++/// that lacks native Windows `--remote` support. Fork releases live at
++/// [`FORK_RELEASES_URL`].
++const FORK_BUILD: bool = true;
++const FORK_RELEASES_URL: &str = "https://github.com/iamwrm/herdr/releases";
+ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+ const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+ const HERDR_UPDATE_COMMAND: &str = "herdr update";
+@@ -1943,6 +1951,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
+ 
+ /// Manual self-update command (`herdr update`).
+ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
++    if FORK_BUILD {
++        return Err(format!(
++            "self-update is disabled for this windows-remote fork build: it would install an official upstream binary without `--remote` support on Windows.\nDownload fork builds from {FORK_RELEASES_URL} instead."
++        ));
++    }
++
+     let channel = UpdateChannel::configured();
+     #[cfg(windows)]
+     if channel == UpdateChannel::Stable {
+@@ -2078,6 +2092,14 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
+ /// Background update check: only surface availability and release notes.
+ /// Runs in a background thread at startup.
+ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
++    if FORK_BUILD {
++        // No version check against the official manifests: any "update
++        // available" notice would steer the user into replacing this fork
++        // build with an upstream binary. Watch FORK_RELEASES_URL instead.
++        tracing::info!("skipping update check: windows-remote fork build");
++        return;
++    }
++
+     crate::logging::update_check_started();
+     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
+         let version = version.trim();
+-- 
+2.52.0.windows.1
+

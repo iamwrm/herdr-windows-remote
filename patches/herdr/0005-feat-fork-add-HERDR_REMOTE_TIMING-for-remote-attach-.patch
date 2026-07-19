@@ -1,0 +1,203 @@
+From c2dc3657e7a10c166d1c385c08b00f997675951a Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Thu, 16 Jul 2026 19:59:15 +0800
+Subject: [PATCH 5/5] feat(fork): add HERDR_REMOTE_TIMING for remote attach
+ phase diagnostics
+
+Set HERDR_REMOTE_TIMING=1 to print per-phase timing to stderr during
+`herdr --remote` setup: config load, every ssh round-trip (labelled with
+the remote command), the prepare/server-ready phases, total setup time,
+and the bridge ssh transport spawn.
+
+Windows has no ssh ControlMaster, so the launcher's five discovery and
+status round-trips are each a fresh TCP+KEX+auth connection; on slow or
+high-latency links they dominate attach time. The timing output shows
+whether the cost is per-connection (network/auth - fix with ssh-agent,
+GSSAPIAuthentication=no, AddressFamily inet, or a faster KexAlgorithm)
+or a slow remote command (server status, version probe).
+---
+ src/remote/launcher.rs | 108 +++++++++++++++++++++++++++++------------
+ src/remote/windows.rs  |   6 ++-
+ 2 files changed, 81 insertions(+), 33 deletions(-)
+
+diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
+index e39c1ff..0840ecd 100644
+--- a/src/remote/launcher.rs
++++ b/src/remote/launcher.rs
+@@ -28,6 +28,41 @@ pub(crate) const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
+ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
+ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+ const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
++/// When set (e.g. `HERDR_REMOTE_TIMING=1`), the launcher prints per-phase
++/// timing to stderr so slow attaches can be diagnosed. Each ssh round-trip is
++/// a fresh connection on Windows (no ControlMaster), so phase timing usually
++/// pinpoints either per-connection auth cost or a slow remote command.
++const REMOTE_TIMING_ENV_VAR: &str = "HERDR_REMOTE_TIMING";
++
++pub(crate) fn remote_timing_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var_os(REMOTE_TIMING_ENV_VAR).is_some_and(|value| !value.is_empty())
++    })
++}
++
++pub(crate) fn remote_timing(label: &str, detail: &str, elapsed: Duration) {
++    if !remote_timing_enabled() {
++        return;
++    }
++    if detail.is_empty() {
++        eprintln!("herdr: remote timing: {label} took {elapsed:.2?}");
++    } else {
++        eprintln!("herdr: remote timing: {label} [{detail}] took {elapsed:.2?}");
++    }
++}
++
++fn timed<T>(label: &str, detail: &str, run: impl FnOnce() -> T) -> T {
++    let started = Instant::now();
++    let result = run();
++    remote_timing(label, detail, started.elapsed());
++    result
++}
++
++/// First line of a remote shell script, for timing labels.
++fn script_summary(script: &str) -> &str {
++    script.lines().next().unwrap_or("").trim()
++}
+ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+ 
+ pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+@@ -157,6 +192,7 @@ fn validate_remote_target(target: &str) -> Result<&str, String> {
+ }
+ 
+ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
++    let launch_started = Instant::now();
+     let session_name = crate::session::active_name()
+         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
+     let local_socket = sys::local_forward_socket_path(&remote.target, &session_name);
+@@ -170,19 +206,22 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         remote.keybindings,
+         remote.live_handoff,
+     );
+-    let manage_ssh_config = crate::config::Config::load()
+-        .config
+-        .remote
+-        .manage_ssh_config;
++    let manage_ssh_config = timed("phase: load config", "", || {
++        crate::config::Config::load().config.remote.manage_ssh_config
++    });
+     let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+-    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
+-    ensure_remote_server_ready(
+-        &remote_ssh,
+-        &prepared_remote.remote_herdr,
+-        prepared_remote.installed_or_replaced,
+-        prepared_remote.stop_after_install_approved,
+-        remote.live_handoff,
+-    )?;
++    let prepared_remote = timed("phase: prepare remote herdr", "", || {
++        prepare_remote_herdr(&remote_ssh, remote.live_handoff)
++    })?;
++    timed("phase: ensure remote server ready", "", || {
++        ensure_remote_server_ready(
++            &remote_ssh,
++            &prepared_remote.remote_herdr,
++            prepared_remote.installed_or_replaced,
++            prepared_remote.stop_after_install_approved,
++            remote.live_handoff,
++        )
++    })?;
+ 
+     let _bridge = sys::SshStdioBridge::start(
+         remote.target,
+@@ -192,6 +231,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         remote_ssh.options(),
+     )?;
+ 
++    remote_timing("phase: setup before client", "", launch_started.elapsed());
+     run_client_process(&local_socket, &reattach_command, remote.keybindings)
+ }
+ 
+@@ -433,29 +473,33 @@ impl RemoteSsh {
+     }
+ 
+     fn sh_output(&self, script: &str) -> io::Result<Output> {
+-        let mut child = self
+-            .command()
+-            .arg("/bin/sh -s")
+-            .stdin(Stdio::piped())
+-            .stdout(Stdio::piped())
+-            .stderr(Stdio::piped())
+-            .spawn()?;
+-
+-        let write_result = if let Some(mut stdin) = child.stdin.take() {
+-            stdin.write_all(script.as_bytes())
+-        } else {
+-            Err(io::Error::new(
+-                io::ErrorKind::BrokenPipe,
+-                "ssh bootstrap stdin missing",
+-            ))
+-        };
+-        let output = child.wait_with_output()?;
+-        write_result?;
+-        Ok(output)
++        timed("ssh sh script", script_summary(script), || {
++            let mut child = self
++                .command()
++                .arg("/bin/sh -s")
++                .stdin(Stdio::piped())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped())
++                .spawn()?;
++
++            let write_result = if let Some(mut stdin) = child.stdin.take() {
++                stdin.write_all(script.as_bytes())
++            } else {
++                Err(io::Error::new(
++                    io::ErrorKind::BrokenPipe,
++                    "ssh bootstrap stdin missing",
++                ))
++            };
++            let output = child.wait_with_output()?;
++            write_result?;
++            Ok(output)
++        })
+     }
+ 
+     fn user_shell_output(&self, command: &str) -> io::Result<Output> {
+-        self.command().arg(command).output()
++        timed("ssh user shell", command, || {
++            self.command().arg(command).output()
++        })
+     }
+ 
+     fn install_herdr(&self, remote_herdr: &RemoteHerdr, source_path: &Path) -> io::Result<()> {
+diff --git a/src/remote/windows.rs b/src/remote/windows.rs
+index 69e9699..383343c 100644
+--- a/src/remote/windows.rs
++++ b/src/remote/windows.rs
+@@ -33,7 +33,9 @@ use std::time::Duration;
+ 
+ use interprocess::local_socket::traits::Listener as _;
+ 
+-use super::launcher::{copy_flush, remote_bridge_command, sanitize_path_component, RemoteHerdr};
++use super::launcher::{
++    copy_flush, remote_bridge_command, remote_timing, sanitize_path_component, RemoteHerdr,
++};
+ use crate::ipc::LocalStream;
+ 
+ /// How often the client→ssh pump checks for new client data or a stop
+@@ -205,9 +207,11 @@ fn bridge_connection(
+         .stdout(Stdio::piped())
+         .stderr(Stdio::inherit());
+ 
++    let spawn_started = std::time::Instant::now();
+     let mut child = command
+         .spawn()
+         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
++    remote_timing("bridge: ssh transport spawn", target, spawn_started.elapsed());
+     let mut child_stdin = child
+         .stdin
+         .take()
+-- 
+2.52.0.windows.1
+
