@@ -1,0 +1,253 @@
+From 13bb74aab3c6e19c3b144ce1aec6aa6615668166 Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Sun, 19 Jul 2026 12:46:30 +0800
+Subject: [PATCH 09/11] perf(windows): remove 10ms poll from the remote bridge
+ keystroke pump
+
+The client->ssh pump polled PeekNamedPipe every 10ms because a blocking
+named-pipe read cannot be unblocked from another thread, adding 0-10ms of
+jitter to every keystroke (i0002 W4).
+
+The pump now blocks in read; shutdown cancels the in-flight read with
+CancelIoEx on the pipe handle (retried until the pump observes its stop
+flag). CancelSynchronousIo does not work here: interprocess implements
+'sync' named-pipe reads as internally-awaited overlapped I/O, invisible
+to the synchronous cancel API - verified by a test that hung with it and
+passes with CancelIoEx. The download pump is joined before cancelling, so
+no other I/O on the pipe can be cancelled by accident.
+
+Adds windows-sys Win32_System_IO for CancelIoEx and pump tests
+(forward + close, cancel-while-blocked).
+---
+ Cargo.toml            |   1 +
+ src/remote/windows.rs | 159 ++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 132 insertions(+), 28 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index fff4350..308ea18 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -54,6 +54,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Diagnostics_ToolHelp",
+     "Win32_System_Console",
+     "Win32_System_JobObjects",
++    "Win32_System_IO",
+     "Win32_System_Kernel",
+     "Win32_System_Memory",
+     "Win32_System_Ole",
+diff --git a/src/remote/windows.rs b/src/remote/windows.rs
+index fdeaa9e..e7541be 100644
+--- a/src/remote/windows.rs
++++ b/src/remote/windows.rs
+@@ -15,10 +15,12 @@
+ //!   repeated password prompts.
+ //! - Named pipes have no half-close: dropping the send half of a split stream
+ //!   does not deliver EOF to the peer, and reads cannot be unblocked by a
+-//!   shutdown from another thread. The client→ssh pump therefore polls with
+-//!   `PeekNamedPipe` (like `crate::ipc::poll_local_stream_read` does) instead
+-//!   of blocking in `read`, so the whole pipe can be dropped — which *is*
+-//!   observable by the client — once the ssh transport dies.
++//!   shutdown from another thread. The client→ssh pump therefore blocks in
++//!   `read` and is released with `CancelIoEx` on the pipe handle once the ssh
++//!   transport dies (i0002 W4 — this used to be a 10 ms `PeekNamedPipe` poll,
++//!   which added 0–10 ms to every keystroke; `CancelSynchronousIo` does *not*
++//!   work here because interprocess emulates sync reads with overlapped I/O).
++//!   The whole pipe is then dropped, which *is* observable by the client.
+ 
+ use std::fs;
+ use std::io::{self, Read as _};
+@@ -38,10 +40,10 @@ use super::launcher::{
+ };
+ use crate::ipc::LocalStream;
+ 
+-/// How often the client→ssh pump checks for new client data or a stop
+-/// request. Only waited out when the client is idle; pending input is drained
+-/// before sleeping again.
+-const CLIENT_READ_POLL: Duration = Duration::from_millis(10);
++/// Backoff between `CancelSynchronousIo` retries while waiting for the pump
++/// thread to observe its stop flag (the cancel is a no-op when the thread is
++/// momentarily between blocking reads).
++const CANCEL_RETRY: Duration = Duration::from_millis(1);
+ 
+ /// Windows has no ssh connection multiplexing, so the "managed" options are
+ /// just inline keepalive flags for every ssh command we spawn.
+@@ -279,6 +281,11 @@ fn bridge_connection(
+     let status = child.wait()?;
+     let _ = download.join();
+     stop.store(true, Ordering::Release);
++    // A blocking named-pipe read cannot be unblocked by closing the handle
++    // from another thread; cancel the pump's in-flight read instead. The
++    // download pump has already been joined, so no other I/O on the pipe can
++    // be cancelled by accident.
++    cancel_blocking_pipe_read(&stream, &upload);
+     let _ = upload.join();
+     // All Arc clones are gone here: the pipe handle closes, which the client
+     // observes as a broken pipe and reports as a lost connection.
+@@ -294,8 +301,10 @@ fn bridge_connection(
+     }
+ }
+ 
+-/// Pumps client bytes into ssh's stdin without ever blocking in `read`, so a
+-/// stop request (ssh died) is honored even while the client is idle.
++/// Pumps client bytes into ssh's stdin with plain blocking reads. When the
++/// ssh transport dies, `bridge_connection` sets `stop` and cancels the
++/// in-flight read with [`cancel_synchronous_io_until_finished`]; keystrokes
++/// are otherwise forwarded the moment they arrive, with no poll latency.
+ fn pump_client_to_ssh(
+     stream: &LocalStream,
+     child_stdin: &mut (impl io::Write + Send),
+@@ -306,32 +315,53 @@ fn pump_client_to_ssh(
+         if stop.load(Ordering::Acquire) {
+             return;
+         }
+-        match crate::ipc::windows_named_pipe_available(stream) {
++        let mut reader = stream;
++        match reader.read(&mut buffer) {
+             // Client closed its end of the pipe.
+-            Ok(None) => return,
+-            Ok(Some(0)) => thread::sleep(CLIENT_READ_POLL),
+-            Ok(Some(_)) => {
+-                let mut reader = stream;
+-                match reader.read(&mut buffer) {
+-                    Ok(0) => return,
+-                    Ok(bytes_read) => {
+-                        if child_stdin
+-                            .write_all(&buffer[..bytes_read])
+-                            .and_then(|()| child_stdin.flush())
+-                            .is_err()
+-                        {
+-                            return;
+-                        }
+-                    }
+-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+-                    Err(_) => return,
++            Ok(0) => return,
++            Ok(bytes_read) => {
++                if child_stdin
++                    .write_all(&buffer[..bytes_read])
++                    .and_then(|()| child_stdin.flush())
++                    .is_err()
++                {
++                    return;
+                 }
+             }
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            // ERROR_OPERATION_ABORTED: our read was cancelled at shutdown.
++            Err(err) if err.raw_os_error() == Some(995) => return,
+             Err(_) => return,
+         }
+     }
+ }
+ 
++/// Repeatedly cancels in-flight I/O on the pipe until the pump thread exits.
++/// The caller must have set the pump's stop flag first, so a cancel that
++/// lands between two reads is followed by a clean flag-observed exit instead
++/// of another blocking read racing the next cancel forever.
++///
++/// Uses `CancelIoEx` on the pipe handle — not `CancelSynchronousIo` on the
++/// thread — because interprocess implements "sync" named-pipe reads as
++/// overlapped I/O awaited internally, which is invisible to the synchronous
++/// cancel API. The cancelled read surfaces as `ERROR_OPERATION_ABORTED`.
++fn cancel_blocking_pipe_read(stream: &LocalStream, thread: &JoinHandle<()>) {
++    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
++
++    let LocalStream::NamedPipe(pipe) = stream;
++    while !thread.is_finished() {
++        // Returns ERROR_NOT_FOUND when no I/O is in flight at this instant;
++        // harmless, retry until the stop flag is observed.
++        let _ = unsafe {
++            windows_sys::Win32::System::IO::CancelIoEx(
++                pipe.as_handle().as_raw_handle(),
++                std::ptr::null(),
++            )
++        };
++        thread::sleep(CANCEL_RETRY);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::super::launcher::RemotePlatform;
+@@ -399,6 +429,79 @@ mod tests {
+         assert_eq!(plain.get_args().count(), 0);
+     }
+ 
++    #[derive(Clone, Default)]
++    struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
++
++    impl io::Write for SharedSink {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            self.0.lock().expect("sink lock").extend_from_slice(buf);
++            Ok(buf.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn pipe_pair(name: &str) -> (LocalStream, LocalStream) {
++        use interprocess::local_socket::traits::Listener as _;
++        let path = std::env::temp_dir().join(format!(
++            "herdr-pump-test-{name}-{}.sock",
++            std::process::id()
++        ));
++        let listener = crate::ipc::bind_local_listener(&path).expect("bind");
++        let client = crate::ipc::connect_local_stream(&path).expect("connect");
++        let server = listener.accept().expect("accept");
++        let _ = fs::remove_file(&path);
++        (client, server)
++    }
++
++    #[test]
++    fn pump_forwards_client_bytes_and_exits_on_client_close() {
++        use std::io::Write as _;
++
++        let (mut client, server) = pipe_pair("forward");
++        let sink = SharedSink::default();
++        let mut pump_sink = sink.clone();
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop);
++        });
++
++        client.write_all(b"keystrokes").expect("client write");
++        let deadline = std::time::Instant::now() + Duration::from_secs(5);
++        while sink.0.lock().expect("sink lock").len() < 10 {
++            assert!(std::time::Instant::now() < deadline, "pump never forwarded");
++            thread::sleep(Duration::from_millis(1));
++        }
++        assert_eq!(sink.0.lock().expect("sink lock").as_slice(), b"keystrokes");
++
++        // Client close must end the pump without any cancel.
++        drop(client);
++        pump.join().expect("pump thread");
++    }
++
++    #[test]
++    fn pump_blocked_in_read_is_released_by_cancel() {
++        let (client, server) = pipe_pair("cancel");
++        let server = Arc::new(server);
++        let pump_stream = Arc::clone(&server);
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            pump_client_to_ssh(&pump_stream, &mut io::sink(), &pump_stop);
++        });
++
++        // Let the pump enter its blocking read, then stop it the way
++        // bridge_connection does.
++        thread::sleep(Duration::from_millis(50));
++        assert!(!pump.is_finished(), "pump must be blocked in read");
++        stop.store(true, Ordering::Release);
++        cancel_blocking_pipe_read(&server, &pump);
++        pump.join().expect("pump thread");
++        drop(client);
++    }
++
+     #[test]
+     fn bridge_drop_wakes_blocking_accept_without_spawning_ssh() {
+         let socket = std::env::temp_dir().join(format!(
+-- 
+2.52.0.windows.1
+

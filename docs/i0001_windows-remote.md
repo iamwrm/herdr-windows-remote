@@ -2,7 +2,7 @@
 
 **Status:** implemented and exported; shipped as prerelease Windows binaries
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** five-patch series in `patches/herdr/` + `.github/workflows/release-windows.yml`
+**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 under [i0002](i0002_latency_improvements.md) (latency improvements)
 **Implementation base:** upstream release tag `v0.7.4` (`50aaa2e`), pinned in `patches/herdr/BASE`
 
 ## Goal

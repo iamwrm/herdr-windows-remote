@@ -1,11 +1,12 @@
 # i0002: Remote-attach latency improvements for high-RTT links
 
-**Status:** proposed — doc only, no patches landed yet
+**Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4, W3);
+live deb1 verification and the W1 packet-capture verdict still pending
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** patch series continuing `patches/herdr/` at `0006-*` (numbers
-reserved per workstream below) + a deb1 network-simulation test harness
-**Implementation base:** whatever `patches/herdr/BASE` pins at landing time
-(currently `v0.7.4`); patches stack on top of the i0001 series (0001–0005)
+**Deliverable:** patches `patches/herdr/0006-*` … `0011-*` + the deb1
+network-simulation harness below
+**Implementation base:** `v0.7.4` (`50aaa2e`), stacked on the i0001 series
+(0001–0005)
 
 ## Goal
 
@@ -70,7 +71,7 @@ What already helps at high RTT (do not regress):
 Landing order = W0 → W2 → W1 → W4 → W3 (measure first, cheapest wins next).
 W5 is exploration only. Each workstream is one patch unless noted.
 
-### W0 — measurement: keystroke-echo latency probe (reserved patch `0006`)
+### W0 — measurement: keystroke-echo latency probe (patch `0006`, landed)
 
 Everything else needs before/after numbers. `HERDR_REMOTE_TIMING` only covers
 attach; add a steady-state probe.
@@ -86,8 +87,13 @@ attach; add a steady-state probe.
 - **Acceptance:** with deb1 netem at 200 ms, reported echo latency ≈ RTT +
   small constant; numbers stable across runs.
 - **Non-invasive:** no protocol change, no behavior change when env var unset.
+- **As landed:** `src/client/echo_timing.rs`; on Windows only key
+  presses/repeats and pastes start probes (mouse/focus filtered via
+  `is_key_or_paste_event`). `=1` prints one summary on exit;
+  `=verbose` adds rolling reports every 25 samples (the rolling lines were
+  too noisy to be the default during live testing).
 
-### W1 — TCP_NODELAY via ProxyCommand relay (reserved patch `0008`)
+### W1 — TCP_NODELAY via ProxyCommand relay (patch `0008`, landed; verification pending)
 
 **Hypothesis to verify first, not assume:** OpenSSH sets `TCP_NODELAY` only
 for interactive (tty) sessions; the bridge uses `ssh -T` (no tty), so Nagle +
@@ -117,8 +123,16 @@ while a previous one is unacked (typing fast ⇒ perceived ~2×RTT).
   to `windows.rs` for upstreamability).
 - **Acceptance:** fast-typing p95 echo latency ≈ slow-typing p95 (no Nagle
   step); no regression when ssh config uses jump hosts (auto-disabled).
+- **As landed:** `src/remote/tcp_relay.rs` (`herdr remote-tcp-relay <host>
+  <port>`, hidden subcommand) + injection in
+  `src/remote/windows.rs::apply_managed_ssh_options`. **Opt-in**:
+  `remote.tcp_relay = true` (default false, requires `manage_ssh_config`),
+  env override `HERDR_REMOTE_TCP_RELAY=1|0`. Landed ahead of the packet
+  capture because it is inert by default — the capture verdict decides
+  whether to recommend enabling it, not whether the code ships. Fixes only
+  the client→server leg; measure both directions with W0.
 
-### W2 — batch the setup probes + verified-host cache (reserved patch `0007`)
+### W2 — batch the setup probes + verified-host cache (patch `0007`, landed)
 
 Collapse the 4–5 sequential probe connections into 1, and skip probing
 entirely on reattach.
@@ -155,8 +169,19 @@ entirely on reattach.
   dropping from ~6–9 s to ~2–3 s at 200 ms RTT (cold) and ~1.5 s (warm
   cache); all existing `remote::` tests pass; install and restart flows
   unchanged.
+- **As landed:** `src/remote/probe.rs` — one `ssh /bin/sh -s` script emits a
+  sentinel-tagged blob (`__HERDR_PROBE__ <tag> …`) with uname, login-shell
+  PATH lookup, known-location scan, per-candidate `--version` + `status
+  client --json`, and `status server --json` from the best candidate.
+  `ensure_remote_server_ready` consumes the probed status and only does a
+  live round trip when the blob had none (fresh install). Happy path is
+  **1+1** connections (better than the 2+1 projected: the server-status
+  probe folded in too). Cache (`state_dir()/remote-probe-cache/<target>.json`)
+  also stores the platform, so warm reattaches skip `uname` and the
+  login-shell spawn. Deviation: the kill switch is env
+  `HERDR_REMOTE_NO_CACHE=1`, not a `--remote-no-cache` flag.
 
-### W3 — predictive local echo, mosh-style (reserved patches `0010`+, multi-patch)
+### W3 — predictive local echo, mosh-style (patches `0010` + `0011`, landed)
 
 The biggest UX win and the hardest. Hide the RTT for the common case: typing
 printable characters (and backspace) into a shell/editor.
@@ -202,8 +227,25 @@ printable characters (and backspace) into a shell/editor.
   with underline and are confirmed (underline drops) after ~1 RTT;
   mispredictions self-heal ≤1 RTT; `off` restores today's behavior
   byte-for-byte.
+- **As landed (`0010`):** `src/client/screen_model.rs` — instead of a full
+  libghostty-vt integration, a dedicated parser for `BlitEncoder`'s narrow
+  vocabulary (no scrolling, no relative motion; every cell write is
+  CUP-prefixed, so a printable run between escapes is exactly one cell).
+  Tracks symbols, plain-vs-styled pen, hyperlinks, cursor, and reports
+  touched cells. Validated by round-trip tests against real `BlitEncoder`
+  output (full + diff frames, wide chars, hyperlinks).
+- **As landed (`0011`):** `src/client/predict.rs` — `remote.predictive_echo
+  = "off"|"auto"|"always"` (default `auto`), env `HERDR_PREDICTIVE_ECHO`.
+  Conservatism as shipped: width-1 printable chars only (±shift), max 8
+  outstanding, target *and* right-neighbor cells must be plain, same-row,
+  visible cursor; backspace only over own predictions; any other key
+  repaints server truth; 5 s unconfirmed → flush; `auto` draws only after
+  2 confirmations with ≥60 ms echo delay (fast links never see underlines).
+  Typed-ahead predictions surviving a frame are re-drawn and the host
+  cursor re-anchored past them. Active only for remote full-app
+  terminal-ansi clients.
 
-### W4 — event-driven upload pump (reserved patch `0009`)
+### W4 — event-driven upload pump (patch `0009`, landed)
 
 Remove the 0–10 ms polling jitter on the keystroke path.
 
@@ -224,6 +266,14 @@ Remove the 0–10 ms polling jitter on the keystroke path.
 - **Acceptance:** W0 probe shows jitter floor drops by ~5 ms median; bridge
   drop/reconnect tests (`bridge_drop_wakes_blocking_accept_without_spawning_ssh`
   and the `remote::` suite) still pass.
+- **As landed:** neither overlapped I/O nor a shorter poll — the pump does a
+  plain **blocking read**, and shutdown cancels the in-flight read with
+  `CancelIoEx` on the pipe handle (retried until the stop flag is
+  observed). Zero idle latency, zero CPU. Finding worth keeping:
+  `CancelSynchronousIo` does **not** work here — interprocess implements
+  "sync" named-pipe reads as internally-awaited overlapped I/O, invisible
+  to the synchronous cancel API (a test hung with it, passes with
+  `CancelIoEx`). Requires `windows-sys` feature `Win32_System_IO`.
 
 ### W5 — lossy-link transport (exploration only, no patch reserved)
 
@@ -285,16 +335,16 @@ Standard measurements per scenario: `HERDR_REMOTE_TIMING=1` attach phases,
 W0 echo p50/p95 (slow typing ~2 key/s and fast ~8 key/s), subjective TUI
 feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 
-## Files affected (planned summary)
+## Files affected (as landed)
 
 | Workstream | Patch | Files |
 |---|---|---|
-| W0 echo probe | `0006` | `src/client/mod.rs` |
-| W2 batched probes + cache | `0007` | `src/remote/launcher.rs` (+ small state-file module) |
-| W1 tcp relay | `0008` | `src/remote/windows.rs`, `src/main.rs`, `src/cli.rs`, `src/config/model.rs` |
-| W4 event pump | `0009` | `src/remote/windows.rs`, possibly `src/ipc.rs` |
-| W3 screen model | `0010` | `src/client/mod.rs`, `src/client/` new module, ghostty-vt bindings |
-| W3 prediction | `0011` | `src/client/` prediction module, `src/config/model.rs` |
+| W0 echo probe | `0006` | `src/client/echo_timing.rs` (new), `src/client/mod.rs` |
+| W2 batched probes + cache | `0007` | `src/remote/probe.rs` (new), `src/remote/launcher.rs` (probe funcs replaced), `src/remote.rs` |
+| W1 tcp relay | `0008` | `src/remote/tcp_relay.rs` (new), `src/remote/windows.rs`, `src/remote/unix.rs` (signature parity), `src/main.rs`, `src/config/model.rs` |
+| W4 blocking pump + CancelIoEx | `0009` | `src/remote/windows.rs`, `Cargo.toml` (`Win32_System_IO`) |
+| W3 screen model | `0010` | `src/client/screen_model.rs` (new), `src/client/mod.rs` |
+| W3 prediction | `0011` | `src/client/predict.rs` (new), `src/client/mod.rs`, `src/config/model.rs` |
 
 ## Non-goals
 
@@ -306,28 +356,45 @@ feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 - Not chasing sub-RTT for anything other than typing echo (W3); command
   output fundamentally arrives after 1 RTT.
 
-## Verification plan
+## Verification
 
-- Per-workstream acceptance criteria above, all run against the deb1 netem
-  matrix, with W0 numbers recorded in this doc per landing.
-- Test filters (same as i0001): `cargo test --bin herdr remote::`,
-  `cargo test --bin herdr windows_`,
-  `cargo test --bin herdr server::client_transport::tests`, plus
-  `cargo clippy --bin herdr -- -D warnings`.
-- W1 requires the packet-capture findings logged below **before** the patch
-  lands.
+Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
+
+- `cargo clippy --bin herdr -- -D warnings` clean on every patch.
+- Test filters all green: `remote::` (75), `client::` (133), `windows_`
+  (121), `server::client_transport::tests` (19), `config::` (120) —
+  including new suites: `echo_timing` (4), `probe` (9), `tcp_relay` (3),
+  pump (2), `screen_model` (9, round-trip against real `BlitEncoder`),
+  `predict` (13, full confirm/mispredict/typeahead/auto-unlock matrix).
+- Clean-room: all 11 patches `git am` onto a fresh `v0.7.4` worktree and
+  reproduce the working tree exactly (only the fork-era CI workflow file,
+  deliberately outside the series, differs).
+
+Still pending (record results in the check log):
+
+- Live attach + typing against deb1 with the netem matrix; W0 baseline
+  numbers before/after enabling `remote.tcp_relay` and with
+  `predictive_echo` off/auto/always.
+- W1 packet capture (both directions) for the Nagle verdict.
+- `HERDR_REMOTE_TIMING=1` cold vs warm-cache attach timing.
 
 ## Decisions & deferred
 
-- **Client-side only** — locked in by the official-server constraint.
-- Patch numbers `0006`–`0011` reserved as above; landing order
-  W0 → W2 → W1 → W4 → W3; renumber only if a workstream is dropped.
+- **Client-side only** — locked in by the official-server constraint; held
+  throughout, no wire-protocol change in any patch.
+- Landed order W0 → W2 → W1 → W4 → W3 as patches `0006`–`0011` (numbers as
+  reserved).
+- W1 landed inert-by-default ahead of its packet-capture verification (see
+  workstream note); the capture decides the *recommendation*, not the code.
 - Deferred: W5 transport swap; symmetric-loss ifb recipe; widening W3
-  prediction contexts beyond plain-text typing; upstreaming (W0/W3 are
-  platform-generic and may be worth offering upstream once proven, same
-  policy as i0001 patches 0002/0004).
+  prediction contexts beyond plain-text typing (wide chars, backspace over
+  committed text); a `--remote-no-cache` CLI flag (env var shipped
+  instead); upstreaming (W0/W3 are platform-generic and may be worth
+  offering upstream once proven, same policy as i0001 patches 0002/0004).
 
 ## Check log
 
-- (empty — first entry should be the W1 Nagle packet-capture verdict and the
-  W0 baseline numbers at 200 ms netem)
+- 2026-07-19: patches `0006`–`0011` implemented and landed on `v0.7.4`;
+  clippy + full test filters green; clean-room apply verified. Pending: W1
+  Nagle packet-capture verdict, W0 baseline numbers at 200 ms netem, cold
+  vs warm-cache attach timing on deb1.

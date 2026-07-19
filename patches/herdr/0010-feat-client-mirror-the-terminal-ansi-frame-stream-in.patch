@@ -1,0 +1,524 @@
+From c881fe15ff6e1b3821a55caba2aab286465912cb Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Sun, 19 Jul 2026 12:52:11 +0800
+Subject: [PATCH 10/11] feat(client): mirror the terminal-ansi frame stream in
+ a screen model
+
+Predictive local echo (i0002 W3) needs the terminal-ansi client to know
+what is on screen: cursor position, cell contents, and whether a cell is
+unstyled. New src/client/screen_model.rs replays received TerminalFrame
+bytes into a cell grid.
+
+The frame stream comes exclusively from BlitEncoder, whose vocabulary is
+small and has no scrolling or relative cursor motion - every cell write is
+preceded by an absolute CUP, so a printable run between escapes is exactly
+one cell's grapheme cluster. The parser covers CUP, SGR (tracking only
+plain-vs-styled pen), 2J, ?25h/l, ?2026 sync, DECSCUSR, OSC 8 hyperlinks
+(cells under a link are not plain), OSC 52 and Kitty APC passthrough.
+apply() reports touched cells for prediction reconciliation.
+
+Round-trip tests validate the model against real BlitEncoder output (full
+and diff frames, wide chars, hyperlinks, hidden cursor). Not wired into
+the client loop yet; the prediction engine lands separately.
+---
+ src/client/mod.rs          |   1 +
+ src/client/screen_model.rs | 475 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 476 insertions(+)
+ create mode 100644 src/client/screen_model.rs
+
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 94e30e2..4de1f2c 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -14,6 +14,7 @@
+ 
+ mod echo_timing;
+ mod input;
++mod screen_model;
+ 
+ use std::collections::HashSet;
+ use std::io::{self, BufRead, Write as _};
+diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
+new file mode 100644
+index 0000000..4b0ba4a
+--- /dev/null
++++ b/src/client/screen_model.rs
+@@ -0,0 +1,475 @@
++//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
++//!
++//! Terminal-ansi clients normally blit server frame bytes to stdout without
++//! understanding them. Predictive local echo needs to know what is on screen
++//! (cursor position, cell contents and styling), so this model replays every
++//! received `TerminalFrame` into a cell grid.
++//!
++//! The frame stream is produced exclusively by `protocol::render_ansi::
++//! BlitEncoder`, whose output vocabulary is small and, crucially, contains
++//! **no scrolling and no relative cursor motion**: every cell write is
++//! preceded by an absolute `CUP`, so any run of printable text between two
++//! escape sequences is exactly one cell's grapheme cluster. The parser below
++//! handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
++//! visibility, `?2026 h/l` sync markers, DECSCUSR, OSC (hyperlinks,
++//! clipboard) and APC (Kitty graphics) passthrough — and ignores everything
++//! else. Round-trip tests validate the model against `BlitEncoder` output of
++//! reference frames.
++
++// Consumed by the prediction engine (next patch in the i0002 W3 series);
++// until it lands only the round-trip tests exercise the model.
++#![allow(dead_code)]
++
++/// The SGR parameter list `build_sgr` emits for a completely unstyled cell.
++const PLAIN_SGR_PARAMS: &str = "0;39;49";
++
++/// One mirrored cell.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct ModelCell {
++    /// Grapheme cluster displayed in the cell. Blank cells hold `" "`.
++    pub(crate) symbol: String,
++    /// Whether the cell was written with the plain pen (default colors, no
++    /// modifiers, no hyperlink). Predictions only ever target plain cells.
++    pub(crate) plain: bool,
++}
++
++impl ModelCell {
++    fn blank() -> Self {
++        Self {
++            symbol: " ".to_string(),
++            plain: true,
++        }
++    }
++
++    /// Wide-character continuation cells: covered by the cell to their left.
++    fn continuation() -> Self {
++        Self {
++            symbol: String::new(),
++            plain: false,
++        }
++    }
++}
++
++pub(crate) struct ScreenModel {
++    width: u16,
++    height: u16,
++    cells: Vec<ModelCell>,
++    /// 0-based (col, row) of the host cursor after the last applied frame.
++    cursor: (u16, u16),
++    cursor_visible: bool,
++    /// Whether the current pen is the plain SGR.
++    pen_plain: bool,
++    /// Whether an OSC 8 hyperlink is currently open.
++    hyperlink_open: bool,
++}
++
++impl ScreenModel {
++    pub(crate) fn new() -> Self {
++        Self {
++            width: 0,
++            height: 0,
++            cells: Vec::new(),
++            cursor: (0, 0),
++            cursor_visible: false,
++            pen_plain: false,
++            hyperlink_open: false,
++        }
++    }
++
++    pub(crate) fn ensure_size(&mut self, width: u16, height: u16) {
++        if self.width == width && self.height == height {
++            return;
++        }
++        self.width = width;
++        self.height = height;
++        self.cells = vec![ModelCell::blank(); width as usize * height as usize];
++        self.cursor = (0, 0);
++        self.cursor_visible = false;
++    }
++
++    pub(crate) fn cursor(&self) -> (u16, u16) {
++        self.cursor
++    }
++
++    pub(crate) fn cursor_visible(&self) -> bool {
++        self.cursor_visible
++    }
++
++    pub(crate) fn width(&self) -> u16 {
++        self.width
++    }
++
++    pub(crate) fn cell(&self, x: u16, y: u16) -> Option<&ModelCell> {
++        if x >= self.width || y >= self.height {
++            return None;
++        }
++        self.cells.get(y as usize * self.width as usize + x as usize)
++    }
++
++    /// Replays one frame's bytes into the grid. `touched` receives the
++    /// (col, row) of every cell the frame wrote, for prediction reconcile.
++    pub(crate) fn apply(&mut self, bytes: &[u8], touched: &mut Vec<(u16, u16)>) {
++        let mut index = 0;
++        while index < bytes.len() {
++            if bytes[index] == 0x1b {
++                index = self.apply_escape(bytes, index, touched);
++            } else if bytes[index] < 0x20 || bytes[index] == 0x7f {
++                // Stray C0/DEL outside an escape — the encoder never emits
++                // these, skip defensively.
++                index += 1;
++            } else {
++                index = self.apply_text_run(bytes, index, touched);
++            }
++        }
++    }
++
++    /// Consumes one escape sequence starting at `start` (which is ESC).
++    fn apply_escape(&mut self, bytes: &[u8], start: usize, touched: &mut Vec<(u16, u16)>) -> usize {
++        let Some(&kind) = bytes.get(start + 1) else {
++            return start + 1;
++        };
++        match kind {
++            b'[' => {
++                // CSI: parameter bytes 0x30..=0x3f, intermediates 0x20..=0x2f,
++                // final 0x40..=0x7e.
++                let mut end = start + 2;
++                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
++                    end += 1;
++                }
++                if end >= bytes.len() {
++                    return bytes.len();
++                }
++                let params = &bytes[start + 2..end];
++                self.apply_csi(params, bytes[end], touched);
++                end + 1
++            }
++            b']' => {
++                // OSC: terminated by BEL or ST (ESC \).
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x07 {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 1;
++                    }
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            b'_' => {
++                // APC (Kitty graphics passthrough): terminated by ST.
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            // Stray ST or an escape we do not model.
++            _ => start + 2,
++        }
++    }
++
++    fn apply_csi(&mut self, params: &[u8], final_byte: u8, touched: &mut Vec<(u16, u16)>) {
++        let params = std::str::from_utf8(params).unwrap_or("");
++        match final_byte {
++            b'H' => {
++                let mut split = params.split(';');
++                let row: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                let col: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                self.cursor = (
++                    col.saturating_sub(1).min(self.width.saturating_sub(1)),
++                    row.saturating_sub(1).min(self.height.saturating_sub(1)),
++                );
++            }
++            b'm' => {
++                self.pen_plain = matches!(params, "" | "0" | PLAIN_SGR_PARAMS);
++            }
++            b'J' => {
++                if params == "2" {
++                    for (index, cell) in self.cells.iter_mut().enumerate() {
++                        if cell.symbol != " " || !cell.plain {
++                            *cell = ModelCell::blank();
++                            touched.push((
++                                (index % self.width.max(1) as usize) as u16,
++                                (index / self.width.max(1) as usize) as u16,
++                            ));
++                        }
++                    }
++                }
++            }
++            // ?2026 sync markers carry no screen state; only ?25 does.
++            b'h' | b'l' if params == "?25" => {
++                self.cursor_visible = final_byte == b'h';
++            }
++            // DECSCUSR (`CSI Ps SP q`) and anything else: no cell effect.
++            _ => {}
++        }
++    }
++
++    fn apply_osc(&mut self, payload: &[u8]) {
++        // OSC 8 hyperlink open/close; OSC 52 clipboard is passthrough.
++        if let Some(rest) = payload.strip_prefix(b"8;") {
++            let uri = rest.splitn(2, |b| *b == b';').nth(1).unwrap_or(b"");
++            self.hyperlink_open = !uri.is_empty();
++        }
++    }
++
++    /// Consumes one printable run. The encoder emits a CUP before every cell,
++    /// so the whole run is a single cell's grapheme cluster.
++    fn apply_text_run(
++        &mut self,
++        bytes: &[u8],
++        start: usize,
++        touched: &mut Vec<(u16, u16)>,
++    ) -> usize {
++        let mut end = start;
++        while end < bytes.len() && bytes[end] != 0x1b && bytes[end] >= 0x20 && bytes[end] != 0x7f {
++            end += 1;
++        }
++        let symbol = String::from_utf8_lossy(&bytes[start..end]).into_owned();
++        self.write_symbol(symbol, touched);
++        end
++    }
++
++    fn write_symbol(&mut self, symbol: String, touched: &mut Vec<(u16, u16)>) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let (x, y) = self.cursor;
++        if x >= self.width || y >= self.height {
++            return;
++        }
++        let width = symbol.width().max(1) as u16;
++        let plain = self.pen_plain && !self.hyperlink_open;
++        let index = y as usize * self.width as usize + x as usize;
++        self.cells[index] = ModelCell { symbol, plain };
++        touched.push((x, y));
++        for offset in 1..width {
++            let column = x + offset;
++            if column >= self.width {
++                break;
++            }
++            self.cells[index + offset as usize] = ModelCell::continuation();
++            touched.push((column, y));
++        }
++        self.cursor.0 = (x + width).min(self.width.saturating_sub(1));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::render_ansi::BlitEncoder;
++    use crate::protocol::{CellData, CursorState, FrameData};
++
++    fn plain_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0,
++            bg: 0,
++            modifier: 0,
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn styled_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0x00_00_00_02, // red
++            bg: 0,
++            modifier: 1, // bold
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn frame(width: u16, height: u16, cells: Vec<CellData>, cursor: (u16, u16)) -> FrameData {
++        FrameData {
++            cells,
++            width,
++            height,
++            cursor: Some(CursorState {
++                x: cursor.0,
++                y: cursor.1,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    fn assert_model_matches(model: &ScreenModel, frame: &FrameData) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let mut expect_continuations = 0;
++        for y in 0..frame.height {
++            for x in 0..frame.width {
++                let cell = &frame.cells[y as usize * frame.width as usize + x as usize];
++                let model_cell = model.cell(x, y).expect("cell in range");
++                if expect_continuations > 0 {
++                    expect_continuations -= 1;
++                    assert_eq!(
++                        model_cell,
++                        &ModelCell::continuation(),
++                        "continuation at ({x},{y})"
++                    );
++                    continue;
++                }
++                if cell.skip {
++                    continue;
++                }
++                assert_eq!(model_cell.symbol, cell.symbol, "symbol at ({x},{y})");
++                let plain = cell.fg == 0 && cell.bg == 0 && cell.modifier == 0;
++                assert_eq!(model_cell.plain, plain, "plainness at ({x},{y})");
++                expect_continuations = cell.symbol.width().saturating_sub(1);
++            }
++        }
++        let cursor = frame.cursor.as_ref().expect("cursor");
++        assert_eq!(model.cursor(), (cursor.x, cursor.y), "cursor position");
++        assert_eq!(model.cursor_visible(), cursor.visible, "cursor visibility");
++    }
++
++    /// Encodes `frames` in sequence through a real `BlitEncoder` (full frame
++    /// first, then diffs) and replays the bytes into a model.
++    fn replay(frames: &[FrameData]) -> ScreenModel {
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++        for frame in frames {
++            let encoded = encoder.encode(frame, false);
++            model.ensure_size(frame.width, frame.height);
++            model.apply(&encoded.bytes, &mut touched);
++            encoder.commit(frame.clone(), encoded);
++        }
++        model
++    }
++
++    #[test]
++    fn full_frame_round_trips_through_real_encoder() {
++        let mut cells = vec![plain_cell(" "); 12];
++        cells[0] = plain_cell("$");
++        cells[2] = styled_cell("l");
++        cells[3] = plain_cell("s");
++        let frame = frame(4, 3, cells, (1, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_model_matches(&model, &frame);
++    }
++
++    #[test]
++    fn incremental_frame_round_trips_through_real_encoder() {
++        let mut first_cells = vec![plain_cell(" "); 12];
++        first_cells[0] = plain_cell("$");
++        let first = frame(4, 3, first_cells.clone(), (2, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("e");
++        second_cells[5] = styled_cell("X");
++        let second = frame(4, 3, second_cells, (3, 0));
++
++        let model = replay(&[first, second.clone()]);
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn wide_symbol_occupies_two_columns() {
++        let mut cells = vec![plain_cell(" "); 8];
++        cells[0] = plain_cell("你");
++        cells[1] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        cells[2] = plain_cell("!");
++        let frame = frame(4, 2, cells, (3, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "你");
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::continuation());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn hyperlinked_cells_are_not_plain() {
++        let mut cells = vec![plain_cell(" "); 4];
++        cells[0] = CellData {
++            hyperlink: Some(0),
++            ..plain_cell("h")
++        };
++        cells[1] = plain_cell("x");
++        let mut frame = frame(4, 1, cells, (2, 0));
++        frame.hyperlinks = vec!["https://example.com".to_string()];
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert!(!model.cell(0, 0).unwrap().plain, "hyperlinked cell");
++        assert!(model.cell(1, 0).unwrap().plain, "cell after link close");
++    }
++
++    #[test]
++    fn hidden_cursor_is_reported_hidden() {
++        let mut reference = frame(2, 1, vec![plain_cell("a"), plain_cell(" ")], (0, 0));
++        reference.cursor.as_mut().expect("cursor").visible = false;
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert!(!model.cursor_visible());
++    }
++
++    #[test]
++    fn resize_clears_the_grid() {
++        let reference = frame(2, 1, vec![plain_cell("a"), plain_cell("b")], (0, 0));
++        let mut model = replay(std::slice::from_ref(&reference));
++        model.ensure_size(3, 2);
++        assert_eq!(model.cell(0, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.width(), 3);
++    }
++
++    #[test]
++    fn touched_reports_written_cells() {
++        let mut first_cells = vec![plain_cell(" "); 4];
++        first_cells[0] = plain_cell("a");
++        let first = frame(4, 1, first_cells.clone(), (1, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("b");
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++
++        let encoded = encoder.encode(&first, false);
++        model.ensure_size(first.width, first.height);
++        model.apply(&encoded.bytes, &mut touched);
++        encoder.commit(first, encoded);
++
++        touched.clear();
++        let encoded = encoder.encode(&second, false);
++        model.apply(&encoded.bytes, &mut touched);
++        assert_eq!(touched, vec![(2, 0)], "diff frame touches only the change");
++    }
++
++    #[test]
++    fn kitty_graphics_and_osc52_are_passthrough() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(b"\x1b_Ga=T;payload\x1b\\\x1b]52;c;YQ==\x07\x1b[1;1Hz", &mut touched);
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "z");
++    }
++
++    #[test]
++    fn truncated_escape_at_end_does_not_panic() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(b"\x1b[1;1", &mut touched);
++        model.apply(b"\x1b]8;;unterminated", &mut touched);
++        model.apply(b"\x1b", &mut touched);
++    }
++}
+-- 
+2.52.0.windows.1
+
