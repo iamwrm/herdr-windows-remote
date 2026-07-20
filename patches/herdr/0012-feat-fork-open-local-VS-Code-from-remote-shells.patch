@@ -1,0 +1,613 @@
+From 49626b315051609cc8c9beaecfcc1e892bae28d5 Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Mon, 20 Jul 2026 13:40:45 +0800
+Subject: [PATCH] feat(fork): open local VS Code from remote shells
+
+---
+ src/client/code_open.rs | 419 ++++++++++++++++++++++++++++++++++++++++
+ src/client/mod.rs       |  20 +-
+ src/config/model.rs     |  21 ++
+ src/remote.rs           |   1 +
+ src/remote/launcher.rs  |  15 +-
+ 5 files changed, 473 insertions(+), 3 deletions(-)
+ create mode 100644 src/client/code_open.rs
+
+diff --git a/src/client/code_open.rs b/src/client/code_open.rs
+new file mode 100644
+index 0000000..14a593c
+--- /dev/null
++++ b/src/client/code_open.rs
+@@ -0,0 +1,419 @@
++//! `code .` typed on a remote herdr host opens local VS Code Remote-SSH.
++//!
++//! A shim script installed on the remote host (shipped as
++//! `extras/remote-bin/code` in the patches repo) emits an OSC 52 clipboard
++//! write whose payload is a magic JSON blob carrying absolute paths. The
++//! official Linux server already forwards pane OSC 52 writes to the
++//! foreground client as `ServerMessage::Clipboard`, so the blob arrives here
++//! with no wire-protocol change. When the decoded payload starts with the
++//! magic prefix, the client opens a
++//! `vscode://vscode-remote/ssh-remote+<target>/<path>` URL instead of touching
++//! the local clipboard. The platform URL handler launches the user's
++//! registered VS Code installation without a shell or launcher discovery.
++//!
++//! Safety posture — any remote program can emit the sequence, so the client
++//! keeps control of everything that matters:
++//! - the ssh authority comes from `HERDR_REMOTE_TARGET` (set by the local
++//!   launcher), never from the payload;
++//! - paths must be absolute, control-character-free, and bounded in count
++//!   and length;
++//! - the opened URL has a fixed VS Code Remote-SSH prefix and a
++//!   percent-encoded path;
++//! - launches are rate-limited;
++//! - `remote.code_open = false` (or `HERDR_REMOTE_CODE_OPEN=0`) disables the
++//!   feature entirely.
++
++use std::time::{Duration, Instant};
++
++use base64::Engine;
++use tracing::{info, warn};
++
++/// Decoded payloads must start with these exact bytes to be treated as a
++/// code-open request; everything else is a normal clipboard write. The shim
++/// script emits its JSON with this exact key order.
++const MAGIC_PREFIX: &[u8] = b"{\"herdr\":\"code-open\"";
++/// Overrides `remote.code_open` for testing: `HERDR_REMOTE_CODE_OPEN=1`
++/// forces the feature on, `=0` forces it off.
++const ENV_VAR: &str = "HERDR_REMOTE_CODE_OPEN";
++/// Payload format version this client understands.
++const SUPPORTED_VERSION: u32 = 1;
++const MAX_PATHS: usize = 8;
++const MAX_PATH_LEN: usize = 4096;
++/// Minimum time between launches, so a hostile remote loop cannot spawn an
++/// unbounded number of VS Code windows.
++const MIN_LAUNCH_INTERVAL: Duration = Duration::from_secs(1);
++
++#[derive(serde::Deserialize)]
++struct Payload {
++    herdr: String,
++    v: u32,
++    paths: Vec<PayloadPath>,
++}
++
++#[derive(serde::Deserialize)]
++struct PayloadPath {
++    p: String,
++    #[serde(default)]
++    dir: bool,
++}
++
++/// What a clipboard payload turned out to be.
++#[derive(Debug, PartialEq, Eq)]
++enum Outcome {
++    /// Not a code-open payload; forward it to the clipboard as usual.
++    NotOurs,
++    /// A code-open payload that failed validation or rate limiting. Consumed
++    /// (kept off the clipboard) but nothing is launched.
++    Rejected(String),
++    /// A valid request: open these VS Code Remote-SSH URLs.
++    Open(Vec<String>),
++}
++
++pub(crate) struct CodeOpen {
++    target: String,
++    enabled: bool,
++    last_launch: Option<Instant>,
++}
++
++impl CodeOpen {
++    /// Build the handler for this client process. Returns `None` only when
++    /// this is not a remote attach; disabled handlers still consume magic
++    /// payloads so they never overwrite the real clipboard.
++    pub(crate) fn from_client_env(config_enabled: bool) -> Option<Self> {
++        let enabled = match std::env::var(ENV_VAR) {
++            Ok(value) => match value.trim() {
++                "1" | "true" => true,
++                "0" | "false" => false,
++                _ => config_enabled,
++            },
++            Err(_) => config_enabled,
++        };
++        let target = std::env::var(crate::remote::REMOTE_TARGET_ENV_VAR).ok()?;
++        // Keep a handler even when disabled or the target is unsupported so
++        // magic requests are consumed rather than copied into the clipboard.
++        Some(Self {
++            target,
++            enabled,
++            last_launch: None,
++        })
++    }
++
++    #[cfg(test)]
++    fn new(target: String) -> Option<Self> {
++        if !is_valid_target(&target) {
++            return None;
++        }
++        Some(Self {
++            target,
++            enabled: true,
++            last_launch: None,
++        })
++    }
++
++    /// Handle a `ServerMessage::Clipboard` payload (base64). Returns true
++    /// when the payload was a code-open request (whether or not it launched);
++    /// false means it is a normal clipboard write for the caller to forward.
++    pub(crate) fn try_handle(&mut self, data: &str) -> bool {
++        match self.evaluate(data, Instant::now()) {
++            Outcome::NotOurs => false,
++            Outcome::Rejected(reason) => {
++                warn!(reason, "ignored code-open request from remote");
++                true
++            }
++            Outcome::Open(urls) => {
++                info!(?urls, "opening VS Code for remote code-open request");
++                for url in urls {
++                    if let Err(err) = crate::platform::open_url(&url) {
++                        warn!(%err, "failed to open VS Code Remote-SSH URL");
++                    }
++                }
++                true
++            }
++        }
++    }
++
++    fn evaluate(&mut self, data: &str, now: Instant) -> Outcome {
++        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
++            return Outcome::NotOurs;
++        };
++        if !bytes.starts_with(MAGIC_PREFIX) {
++            return Outcome::NotOurs;
++        }
++
++        let payload: Payload = match serde_json::from_slice(&bytes) {
++            Ok(payload) => payload,
++            Err(err) => return Outcome::Rejected(format!("invalid payload JSON: {err}")),
++        };
++        if payload.herdr != "code-open" {
++            return Outcome::Rejected("unexpected payload kind".to_string());
++        }
++        if payload.v != SUPPORTED_VERSION {
++            return Outcome::Rejected(format!("unsupported payload version {}", payload.v));
++        }
++        if !self.enabled {
++            return Outcome::Rejected("disabled by remote.code_open".to_string());
++        }
++        if !is_valid_target(&self.target) {
++            return Outcome::Rejected("unsupported ssh target syntax".to_string());
++        }
++        if payload.paths.is_empty() {
++            return Outcome::Rejected("no paths in payload".to_string());
++        }
++        if payload.paths.len() > MAX_PATHS {
++            return Outcome::Rejected(format!("too many paths ({})", payload.paths.len()));
++        }
++
++        let mut urls = Vec::with_capacity(payload.paths.len());
++        for path in &payload.paths {
++            if let Err(reason) = validate_remote_path(&path.p) {
++                return Outcome::Rejected(format!("rejected path {:?}: {reason}", path.p));
++            }
++            urls.push(remote_url(&self.target, &path.p, path.dir));
++        }
++
++        if let Some(last) = self.last_launch {
++            if now.duration_since(last) < MIN_LAUNCH_INTERVAL {
++                return Outcome::Rejected("rate limited".to_string());
++            }
++        }
++        self.last_launch = Some(now);
++
++        Outcome::Open(urls)
++    }
++}
++
++/// The ssh target is set by our own launcher, but validate it anyway so a
++/// corrupt value can never smuggle URI or argv structure.
++fn is_valid_target(target: &str) -> bool {
++    !target.is_empty()
++        && target.len() <= 256
++        && target
++            .chars()
++            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@'))
++}
++
++fn validate_remote_path(path: &str) -> Result<(), &'static str> {
++    if path.is_empty() {
++        return Err("empty");
++    }
++    if !path.starts_with('/') {
++        return Err("not absolute");
++    }
++    if path.len() > MAX_PATH_LEN {
++        return Err("too long");
++    }
++    if path.chars().any(char::is_control) {
++        return Err("contains control characters");
++    }
++    Ok(())
++}
++
++/// Percent-encode a remote absolute path for use in a VS Code URL,
++/// keeping only RFC 3986 unreserved characters and `/`.
++fn percent_encode_path(path: &str) -> String {
++    let mut encoded = String::with_capacity(path.len());
++    for byte in path.bytes() {
++        match byte {
++            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
++                encoded.push(byte as char);
++            }
++            _ => encoded.push_str(&format!("%{byte:02X}")),
++        }
++    }
++    encoded
++}
++
++fn remote_url(target: &str, path: &str, directory: bool) -> String {
++    let mut encoded_path = percent_encode_path(path);
++    if directory && !encoded_path.ends_with('/') {
++        encoded_path.push('/');
++    }
++    format!("vscode://vscode-remote/ssh-remote+{target}{encoded_path}")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn handler() -> CodeOpen {
++        CodeOpen::new("deb1".to_string()).expect("valid target")
++    }
++
++    fn encode(json: &str) -> String {
++        base64::engine::general_purpose::STANDARD.encode(json)
++    }
++
++    #[test]
++    fn plain_clipboard_payload_is_not_ours() {
++        let mut code_open = handler();
++        assert_eq!(
++            code_open.evaluate(&encode("hello world"), Instant::now()),
++            Outcome::NotOurs
++        );
++    }
++
++    #[test]
++    fn invalid_base64_is_not_ours() {
++        let mut code_open = handler();
++        assert_eq!(
++            code_open.evaluate("not-base64!!!", Instant::now()),
++            Outcome::NotOurs
++        );
++    }
++
++    #[test]
++    fn folder_request_builds_folder_url() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/home/u/proj","dir":true}]}"#;
++        assert_eq!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Open(vec![
++                "vscode://vscode-remote/ssh-remote+deb1/home/u/proj/".to_string(),
++            ])
++        );
++    }
++
++    #[test]
++    fn file_request_builds_file_url() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/etc/hosts","dir":false}]}"#;
++        assert_eq!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Open(vec![
++                "vscode://vscode-remote/ssh-remote+deb1/etc/hosts".to_string(),
++            ])
++        );
++    }
++
++    #[test]
++    fn paths_are_percent_encoded() {
++        let mut code_open = handler();
++        let payload =
++            r#"{"herdr":"code-open","v":1,"paths":[{"p":"/home/u/my dir+文","dir":true}]}"#;
++        let Outcome::Open(urls) = code_open.evaluate(&encode(payload), Instant::now()) else {
++            panic!("expected URL");
++        };
++        assert_eq!(
++            urls[0],
++            "vscode://vscode-remote/ssh-remote+deb1/home/u/my%20dir%2B%E6%96%87/"
++        );
++    }
++
++    #[test]
++    fn user_at_host_target_is_preserved() {
++        let mut code_open = CodeOpen::new("admin@deb1".to_string()).expect("valid target");
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/x","dir":true}]}"#;
++        let Outcome::Open(urls) = code_open.evaluate(&encode(payload), Instant::now()) else {
++            panic!("expected URL");
++        };
++        assert_eq!(urls[0], "vscode://vscode-remote/ssh-remote+admin@deb1/x/");
++    }
++
++    #[test]
++    fn relative_path_is_rejected() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"proj","dir":true}]}"#;
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn control_characters_in_path_are_rejected() {
++        let mut code_open = handler();
++        let payload = "{\"herdr\":\"code-open\",\"v\":1,\"paths\":[{\"p\":\"/a\\u001b]0;x\\u0007\",\"dir\":true}]}";
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn disabled_handler_consumes_request_without_launching() {
++        let mut code_open = handler();
++        code_open.enabled = false;
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/x","dir":true}]}"#;
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn unsupported_version_is_rejected() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":2,"paths":[{"p":"/x","dir":true}]}"#;
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn malformed_magic_payload_is_consumed_not_forwarded() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":"#; // truncated JSON
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn too_many_paths_are_rejected() {
++        let mut code_open = handler();
++        let entries: Vec<String> = (0..9)
++            .map(|i| format!(r#"{{"p":"/d{i}","dir":true}}"#))
++            .collect();
++        let payload = format!(
++            r#"{{"herdr":"code-open","v":1,"paths":[{}]}}"#,
++            entries.join(",")
++        );
++        assert!(matches!(
++            code_open.evaluate(&encode(&payload), Instant::now()),
++            Outcome::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn repeat_requests_are_rate_limited() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/x","dir":true}]}"#;
++        let now = Instant::now();
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), now),
++            Outcome::Open(_)
++        ));
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), now + Duration::from_millis(200)),
++            Outcome::Rejected(_)
++        ));
++        assert!(matches!(
++            code_open.evaluate(&encode(payload), now + Duration::from_millis(1200)),
++            Outcome::Open(_)
++        ));
++    }
++
++    #[test]
++    fn multiple_paths_build_multiple_urls() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/a","dir":true},{"p":"/b/f.txt","dir":false}]}"#;
++        assert_eq!(
++            code_open.evaluate(&encode(payload), Instant::now()),
++            Outcome::Open(vec![
++                "vscode://vscode-remote/ssh-remote+deb1/a/".to_string(),
++                "vscode://vscode-remote/ssh-remote+deb1/b/f.txt".to_string(),
++            ])
++        );
++    }
++
++    #[test]
++    fn hostile_target_values_are_refused() {
++        assert!(CodeOpen::new(String::new()).is_none());
++        assert!(CodeOpen::new("host/../x".to_string()).is_none());
++        assert!(CodeOpen::new("host name".to_string()).is_none());
++        assert!(CodeOpen::new("host\u{7}".to_string()).is_none());
++        assert!(CodeOpen::new("host?query".to_string()).is_none());
++    }
++}
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 9d3432b..5f9aef4 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -12,6 +12,7 @@
+ //! - Forwards OSC 52 clipboard writes from server to its own stdout
+ //! - Displays sound/toast notifications forwarded from server
+ 
++mod code_open;
+ mod echo_timing;
+ mod input;
+ mod predict;
+@@ -57,6 +58,9 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
+ struct ClientLoopConfig {
+     /// `remote.predictive_echo` setting ("off" | "auto" | "always").
+     predictive_echo: String,
++    /// `remote.code_open` setting: allow the remote `code` shim to open
++    /// local VS Code Remote-SSH windows (i0004).
++    code_open: bool,
+     sound_config: crate::config::SoundConfig,
+     mouse_scroll_lines: usize,
+     redraw_on_focus_gained: bool,
+@@ -1132,6 +1136,7 @@ fn run_client_with_mode(
+         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+     let loop_config = ClientLoopConfig {
+         predictive_echo: loaded_config.config.remote.predictive_echo.clone(),
++        code_open: loaded_config.config.remote.code_open,
+         sound_config: loaded_config.config.ui.sound,
+         mouse_scroll_lines,
+         redraw_on_focus_gained,
+@@ -1304,6 +1309,10 @@ async fn run_client_loop(
+         None
+     };
+ 
++    // `code <path>` typed on the remote host → local VS Code Remote-SSH
++    // window (i0004). Only active for remote attach clients.
++    let mut code_open = code_open::CodeOpen::from_client_env(config.code_open);
++
+     let mut state = ClientState {
+         blit_encoder: render_ansi::BlitEncoder::new(),
+         mouse_capture_active: config.mouse_capture_active,
+@@ -1604,8 +1613,15 @@ async fn run_client_loop(
+                     handle_notify(kind, &message, body.as_deref(), &state.sound_config);
+                 }
+                 ServerMessage::Clipboard { data } => {
+-                    forward_clipboard(&data);
+-                    let _ = io::stdout().flush();
++                    // The remote `code` shim rides the OSC 52 channel; its
++                    // magic payloads must never reach the real clipboard.
++                    let handled = code_open
++                        .as_mut()
++                        .is_some_and(|code_open| code_open.try_handle(&data));
++                    if !handled {
++                        forward_clipboard(&data);
++                        let _ = io::stdout().flush();
++                    }
+                 }
+                 ServerMessage::WindowTitle { title } => {
+                     write_window_title(title.as_deref());
+diff --git a/src/config/model.rs b/src/config/model.rs
+index beec62e..1fe281b 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -874,6 +874,12 @@ pub struct RemoteConfig {
+     /// once echo delay is observed to be high), or `"always"`.
+     /// Default: "auto".
+     pub predictive_echo: String,
++    /// Allow the remote `code` shim script to open local VS Code Remote-SSH
++    /// windows for paths on the attached host (`code .` inside
++    /// `herdr --remote`). The client only ever launches VS Code with
++    /// `vscode://vscode-remote/ssh-remote+<target>` URLs for the current
++    /// attach target. Env override: `HERDR_REMOTE_CODE_OPEN=1|0`. Default: true.
++    pub code_open: bool,
+ }
+ 
+ impl Default for RemoteConfig {
+@@ -882,6 +888,7 @@ impl Default for RemoteConfig {
+             manage_ssh_config: true,
+             tcp_relay: false,
+             predictive_echo: "auto".to_string(),
++            code_open: true,
+         }
+     }
+ }
+@@ -1541,6 +1548,20 @@ mouse_scroll_lines = 0
+         assert!(toml::from_str::<Config>(toml).is_err());
+     }
+ 
++    #[test]
++    fn remote_config_defaults_and_code_open_parse() {
++        let config = Config::default();
++        assert!(config.remote.code_open);
++
++        let toml = r#"
++[remote]
++code_open = false
++"#;
++        let config: Config = toml::from_str(toml).unwrap();
++        assert!(!config.remote.code_open);
++        assert!(config.remote.manage_ssh_config);
++    }
++
+     #[test]
+     fn toast_config_parses() {
+         let toml = r#"
+diff --git a/src/remote.rs b/src/remote.rs
+index 6f5de59..b632a6e 100644
+--- a/src/remote.rs
++++ b/src/remote.rs
+@@ -14,6 +14,7 @@ mod windows;
+ 
+ pub(crate) use launcher::{
+     extract_remote_args, run_remote, REATTACH_COMMAND_ENV_VAR, REMOTE_KEYBINDINGS_ENV_VAR,
++    REMOTE_TARGET_ENV_VAR,
+ };
+ pub(crate) use tcp_relay::run_remote_tcp_relay;
+ 
+diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
+index e4853b9..730e0ce 100644
+--- a/src/remote/launcher.rs
++++ b/src/remote/launcher.rs
+@@ -68,6 +68,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+ 
+ pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
+ 
++/// Ssh target of the active `herdr --remote` attach, exported to the spawned
++/// client process so client-local integrations (the remote `code` shim →
++/// local VS Code Remote-SSH, i0004) know which host they are attached to.
++pub(crate) const REMOTE_TARGET_ENV_VAR: &str = "HERDR_REMOTE_TARGET";
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum RemoteKeybindings {
+     Local,
+@@ -235,6 +240,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         probe::save_cache(&remote.target, path, &prepared_remote.remote_herdr.platform);
+     }
+ 
++    let target = remote.target.clone();
+     let _bridge = sys::SshStdioBridge::start(
+         remote.target,
+         prepared_remote.remote_herdr,
+@@ -244,7 +250,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+     )?;
+ 
+     remote_timing("phase: setup before client", "", launch_started.elapsed());
+-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
++    run_client_process(
++        &local_socket,
++        &reattach_command,
++        remote.keybindings,
++        &target,
++    )
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -1589,6 +1600,7 @@ fn run_client_process(
+     local_socket: &Path,
+     reattach_command: &str,
+     keybindings: RemoteKeybindings,
++    target: &str,
+ ) -> io::Result<()> {
+     let exe = std::env::current_exe()?;
+     let status = Command::new(exe)
+@@ -1600,6 +1612,7 @@ fn run_client_process(
+         .env("HERDR_RENDER_ENCODING", "terminal-ansi")
+         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
+         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
++        .env(REMOTE_TARGET_ENV_VAR, target)
+         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
+         .stdin(Stdio::inherit())
+         .stdout(Stdio::inherit())
+-- 
+2.52.0.windows.1
+

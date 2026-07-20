@@ -107,3 +107,6 @@ together — keep it updated as the patch series evolves.
 - Number patches (`0001-...`, `0002-...`) so apply order is explicit.
 - If a patch stops applying cleanly, fix it and commit the updated patch —
   the patch files are the source of truth, not the checkouts.
+- Patch files are format-patch mailboxes, whose context and `-- ` footer
+  contain intentional trailing spaces. `.gitattributes` excludes only those
+  artifacts from whitespace checks; validate their applied source separately.
