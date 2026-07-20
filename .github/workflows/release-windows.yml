@@ -15,9 +15,11 @@ permissions:
   contents: write
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   RUST_TOOLCHAIN_VERSION: 1.96.1
   UPSTREAM_REPO: https://github.com/ogulcancelik/herdr
+  ZIG_VERSION: 0.15.2
+  ZIG_SHA256: 3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
 
 jobs:
   build-windows:
@@ -27,9 +29,10 @@ jobs:
       LIBGHOSTTY_VT_SIMD: 'false'
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          fetch-depth: 5
 
       - name: Clone upstream at pinned base
         shell: pwsh
@@ -41,7 +44,12 @@ jobs:
               throw "tag $env:GITHUB_REF_NAME does not match pinned base $base (patches/herdr/BASE)"
             }
           }
-          git clone --depth 1 --branch $base $env:UPSTREAM_REPO checkouts/herdr
+          git init checkouts/herdr
+          git -C checkouts/herdr remote add origin $env:UPSTREAM_REPO
+          git -C checkouts/herdr fetch --depth 1 origin "refs/tags/$base"
+          if ($LASTEXITCODE -ne 0) { throw "failed to fetch upstream tag $base" }
+          git -C checkouts/herdr checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "failed to check out upstream tag $base" }
           "UPSTREAM_BASE=$base" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
 
       - name: Apply patches
@@ -56,15 +64,37 @@ jobs:
           "PATCHED_COMMIT=$(git rev-parse HEAD)" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master 2026-07-16
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
           targets: x86_64-pc-windows-msvc
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      - name: Restore Zig build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          version: 0.15.2
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
+          key: zig-${{ runner.os }}-${{ env.ZIG_VERSION }}-${{ hashFiles('patches/herdr/*.patch') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ env.ZIG_VERSION }}-
+
+      # mlugg/setup-zig v2.2.1 still targets deprecated Node.js 20. Install the
+      # pinned Zig archive directly until that action publishes a Node.js 24 release.
+      - name: Install Zig
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "zig-$env:ZIG_VERSION.zip"
+          $installRoot = Join-Path $env:RUNNER_TEMP "zig-$env:ZIG_VERSION"
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:ZIG_SHA256) {
+            throw "Zig archive sha256 mismatch: expected $env:ZIG_SHA256, got $actualHash"
+          }
+          Expand-Archive -Path $archive -DestinationPath $installRoot
+          $zigDir = Get-ChildItem -Path $installRoot -Directory | Select-Object -First 1
+          if ($null -eq $zigDir) { throw "Zig archive did not contain a directory" }
+          $zigDir.FullName | Out-File -Encoding utf8 -Append $env:GITHUB_PATH
+          & (Join-Path $zigDir.FullName 'zig.exe') version
 
       - name: Build
         working-directory: checkouts/herdr
@@ -93,6 +123,22 @@ jobs:
           } else {
             $tag = 'windows-remote-latest'
           }
+          $commitLines = (git log -5 --pretty=format:"%H%x09%h%x09%s" | ForEach-Object {
+            $parts = $_ -split "`t", 3
+            "- [$($parts[1])](https://github.com/$env:GITHUB_REPOSITORY/commit/$($parts[0])) $($parts[2])"
+          }) -join "`n"
+          @"
+          Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support.
+
+          **Repository commit:** [$($env:GITHUB_SHA.Substring(0, 7))](https://github.com/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA)
+
+          ### Recent repository commits (up to 5)
+
+          $commitLines
+
+          See BUILD_INFO.txt for the upstream and patched commits and the binary sha256.
+          "@ | Out-File -Encoding utf8 RELEASE_NOTES.md
+
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag `
@@ -100,6 +146,11 @@ jobs:
               --target $env:GITHUB_SHA `
               --prerelease `
               --title "herdr $tag (Windows --remote)" `
-              --notes "Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support. See BUILD_INFO.txt for commits and sha256."
+              --notes-file RELEASE_NOTES.md
+          } else {
+            gh release edit $tag `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "herdr $tag (Windows --remote)" `
+              --notes-file RELEASE_NOTES.md
           }
           gh release upload $tag herdr-windows-x86_64.exe BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --clobber
