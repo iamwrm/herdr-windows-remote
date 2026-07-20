@@ -1,13 +1,14 @@
 # i0003: Predictive echo inside pi's input prompt
 
-**Status:** PoC implemented and deployed to deb1; escape-level verification
-done, live typing test pending
+**Status:** PoC implemented and deployed to deb1; live typing exposed an
+untouched-space reconciliation bug, fixed in herdr patch `0013`; high-RTT
+retest pending
 **Upstream:** [earendil-works/pi](https://github.com/earendil-works/pi)
 (pi-tui) — no herdr changes, no pi-core changes
 **Deliverable:** [`extras/pi-extensions/predictive-echo-cursor.ts`](../extras/pi-extensions/predictive-echo-cursor.ts)
 (a pi extension installed on the machine that runs pi, i.e. the herdr
 *server*)
-**Depends on:** i0002 W3 (herdr client predictive echo, patches 0010/0011)
+**Depends on:** i0002 W3 (herdr client predictive echo, patches 0010/0011 + cursor-only reconciliation in 0013)
 
 ## Goal
 
@@ -58,9 +59,12 @@ The extension therefore:
   marker (positioning intact) and the grapheme/space (line width intact)
   → caret cell unstyled → predictor gate 2 passes.
 
-Typeahead works precisely because the block is *gone*: the server's echo
-then touches only the typed cell, so still-pending predictions to its
-right are never falsely invalidated.
+Typeahead works precisely because the block is *gone*: normal character
+echoes touch only their typed cells, so still-pending predictions to the
+right are not falsely invalidated. A space typed over an already blank cell
+is the exception—it produces cursor movement without a cell write. Herdr
+patch `0013` now treats same-row authoritative cursor progress as cumulative
+acknowledgement and explicitly removes the space's local underline.
 
 Side benefit independent of herdr: fixes pi's double-cursor when users
 enable `showHardwareCursor` manually (hardware cursor + software block at
@@ -76,7 +80,11 @@ the same cell today).
 - Escape-level check over a pty: with the extension active and text in the
   editor, pi's output contains `ESC[?25h` (cursor shown) and **zero**
   `ESC[7m` sequences — both predictor gates confirmed passable.
-- Pending: live typing test through `herdr --remote deb1` at 200 ms netem
+- A live typing test reproduced a stuck underline/cursor with `abc def`:
+  the unchanged space blocked later FIFO confirmations and pi's separate
+  cursor-position write arrived as a cursor-only frame.
+- Herdr patch `0013` now covers the exact content-then-cursor frame sequence;
+  live retest through `herdr --remote deb1` at 200 ms netem remains pending
   (record in the i0002 check log).
 
 ## Install
@@ -111,3 +119,6 @@ same pattern as i0001's [When to retire](i0001_windows-remote.md#when-to-retire)
 
 - 2026-07-19: PoC built and deployed against pi 0.80.10; escape-level
   verification green; live 200 ms typing test pending.
+- 2026-07-20: live typing reproduced the `abc def` stuck-cursor defect.
+  Root cause was client reconciliation of unchanged spaces, not the extension;
+  patch `0013` adds cursor-only acknowledgement and regression coverage.

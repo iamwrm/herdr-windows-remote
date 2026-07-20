@@ -1,0 +1,143 @@
+From 981ebaad09aa97ad9ac72351eb5e43152d66605b Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Mon, 20 Jul 2026 17:20:20 +0800
+Subject: [PATCH 14/14] perf(client): batch interactive input writes
+
+---
+ src/client/input/windows_vti.rs | 37 +++++++++++++++++++++++---
+ src/protocol/wire.rs            | 47 +++++++++++++++++++++++++++++----
+ 2 files changed, 75 insertions(+), 9 deletions(-)
+
+diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
+index 66a1623..d044979 100644
+--- a/src/client/input/windows_vti.rs
++++ b/src/client/input/windows_vti.rs
+@@ -67,12 +67,14 @@ fn process_platform_input_items(
+     pump: &mut WindowsInputPump,
+     event_tx: &mpsc::Sender<ClientLoopEvent>,
+ ) -> bool {
++    // ReadConsoleInputW already gives us one immediately available batch.
++    // Preserve that batching through the client protocol instead of framing
++    // every translated console record as a separate tiny pipe/SSH write.
++    let mut events = Vec::new();
+     for item in items {
+-        if !send_windows_client_input_events(pump.process(item), event_tx) {
+-            return false;
+-        }
++        events.extend(pump.process(item));
+     }
+-    true
++    send_windows_client_input_events(events, event_tx)
+ }
+ 
+ #[cfg(windows)]
+@@ -1059,6 +1061,33 @@ fn windows_input_trace_enabled() -> bool {
+ mod tests {
+     use super::*;
+ 
++    #[cfg(windows)]
++    #[test]
++    fn available_console_items_are_sent_as_one_event_batch() {
++        let (event_tx, mut event_rx) = mpsc::channel(4);
++        let mut pump = WindowsInputPump::default();
++        let items = vec![
++            PlatformInputItem::Semantic(crate::protocol::ClientInputEvent::FocusGained),
++            PlatformInputItem::Semantic(crate::protocol::ClientInputEvent::FocusLost),
++        ];
++
++        assert!(process_platform_input_items(items, &mut pump, &event_tx));
++        let ClientLoopEvent::StdinEvents(events) = event_rx.try_recv().expect("event batch") else {
++            panic!("expected stdin events");
++        };
++        assert_eq!(
++            events,
++            vec![
++                crate::protocol::ClientInputEvent::FocusGained,
++                crate::protocol::ClientInputEvent::FocusLost,
++            ]
++        );
++        assert!(
++            event_rx.try_recv().is_err(),
++            "only one batch should be queued"
++        );
++    }
++
+     fn key_char(ch: char) -> WindowsInputRecord {
+         WindowsInputRecord::Key(WindowsKeyRecord {
+             key_down: true,
+diff --git a/src/protocol/wire.rs b/src/protocol/wire.rs
+index e31f8ff..d5fd799 100644
+--- a/src/protocol/wire.rs
++++ b/src/protocol/wire.rs
+@@ -819,19 +819,23 @@ impl From<io::Error> for FramingError {
+ /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
+ /// (would be truncated by the length prefix cast).
+ pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
+-    let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
++    // Build the prefix and payload in one buffer so small interactive input
++    // reaches pipes/TCP as one write instead of two independently packetized
++    // writes. Encode directly after the reserved prefix to avoid a copy.
++    let mut frame = Vec::with_capacity(256);
++    frame.resize(LENGTH_PREFIX_BYTES, 0);
++    let len = bincode::serde::encode_into_std_write(msg, &mut frame, bincode::config::standard())
+         .map_err(|e| FramingError::Bincode(e.to_string()))?;
+ 
+-    let len = payload.len();
+     if len > u32::MAX as usize {
+         return Err(FramingError::Bincode(format!(
+-            "payload length {len} exceeds u32::MAX ({}), would be truncated by length prefix",
++            "payload length {len} exceeds u32::MAX ({}), would be truncated by the length prefix",
+             u32::MAX
+         )));
+     }
++    frame[..LENGTH_PREFIX_BYTES].copy_from_slice(&(len as u32).to_le_bytes());
+ 
+-    writer.write_all(&(len as u32).to_le_bytes())?;
+-    writer.write_all(&payload)?;
++    writer.write_all(&frame)?;
+     writer.flush()?;
+     Ok(())
+ }
+@@ -1443,6 +1447,39 @@ mod tests {
+         assert_eq!(msg, decoded);
+     }
+ 
++    #[derive(Default)]
++    struct RecordingWriter {
++        bytes: Vec<u8>,
++        writes: usize,
++        flushes: usize,
++    }
++
++    impl Write for RecordingWriter {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.writes += 1;
++            self.bytes.extend_from_slice(bytes);
++            Ok(bytes.len())
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            self.flushes += 1;
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn framing_uses_one_write_for_prefix_and_payload() {
++        let msg = ClientMessage::Input { data: vec![b'x'] };
++        let mut writer = RecordingWriter::default();
++        write_message(&mut writer, &msg).unwrap();
++
++        assert_eq!(writer.writes, 1);
++        assert_eq!(writer.flushes, 1);
++        let decoded: ClientMessage =
++            read_message(&mut writer.bytes.as_slice(), MAX_FRAME_SIZE).unwrap();
++        assert_eq!(decoded, msg);
++    }
++
+     #[test]
+     fn framing_large_payload_roundtrip() {
+         // Create a Frame message that is ≥128 KB.
+-- 
+2.52.0.windows.1
+

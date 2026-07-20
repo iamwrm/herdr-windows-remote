@@ -1,10 +1,12 @@
 # i0002: Remote-attach latency improvements for high-RTT links
 
-**Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4, W3);
-live deb1 verification and the W1 packet-capture verdict still pending
+**Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4,
+W3), with cursor-reconciliation and input-packetization follow-ups in
+`0013`–`0014`; live deb1 verification and the W1 packet-capture verdict still
+pending
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** patches `patches/herdr/0006-*` … `0011-*` + the deb1
-network-simulation harness below
+**Deliverable:** patches `patches/herdr/0006-*` … `0011-*` and `0013-*` …
+`0014-*` (`0012` belongs to i0004) + the deb1 network-simulation harness below
 **Implementation base:** `v0.7.4` (`50aaa2e`), stacked on the i0001 series
 (0001–0005)
 
@@ -245,6 +247,39 @@ printable characters (and backspace) into a shell/editor.
   cursor re-anchored past them. Active only for remote full-app
   terminal-ansi clients.
 
+### W3 follow-up — cursor-only reconciliation and input batching (patches `0013`–`0014`)
+
+Live pi typing exposed a deterministic hole in the original reconciliation
+rule. Typing a space over an already blank cell changes no cell, so the server
+emits only cursor movement. Patch `0011` required the predicted cell to appear
+in the current frame's `touched` list; the untouched space therefore blocked
+later `d/e/f` acknowledgements in `abc def`. Pi also writes changed content and
+its hardware-cursor position separately, making a content frame followed by a
+cursor-only frame normal rather than exceptional.
+
+Patch `0013` makes observations cumulative and accepts same-row authoritative
+cursor progress as acknowledgement when the modeled symbol matches.
+Cursor-only confirmations explicitly remove their local underline. Matching
+server writes remove overlays even while an older prediction is pending;
+mismatches preserve the server's styling. Unsafe/untracked input, hidden or
+cross-row cursors, capacity exhaustion, resize, and timeout now flush and
+suspend prediction until a fresh frame. The 100 ms client timer enforces the
+existing 5 s timeout even when no more frames arrive. Frame corrections are
+buffered, inserted before synchronized-output ends, and replace Linux's stale
+post-sync IME cursor repeat, producing one atomic stdout flush instead of a
+visible frame-then-correction pair.
+
+Patch `0014` reduces upload packetization without a timer or wire change: each
+length-prefixed protocol message is built and written contiguously, and all
+events already returned by one `ReadConsoleInputW` batch become one ordered
+`InputEvents` message. This removes avoidable tiny prefix/payload and
+per-console-record writes; whether TCP Nagle still adds material delay remains
+a packet-capture question for W1.
+
+Confirmation is expected after roughly **one full RTT**, not half an RTT:
+input must travel to the server and the rendered echo must return. Local
+underlined prediction should remain immediate.
+
 ### W4 — event-driven upload pump (patch `0009`, landed)
 
 Remove the 0–10 ms polling jitter on the keystroke path.
@@ -345,6 +380,8 @@ feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 | W4 blocking pump + CancelIoEx | `0009` | `src/remote/windows.rs`, `Cargo.toml` (`Win32_System_IO`) |
 | W3 screen model | `0010` | `src/client/screen_model.rs` (new), `src/client/mod.rs` |
 | W3 prediction | `0011` | `src/client/predict.rs` (new), `src/client/mod.rs`, `src/config/model.rs` |
+| W3 cursor reconciliation | `0013` | `src/client/predict.rs`, `src/client/screen_model.rs`, `src/client/mod.rs` |
+| Input packetization | `0014` | `src/protocol/wire.rs`, `src/client/input/windows_vti.rs` |
 
 ## Non-goals
 
@@ -366,7 +403,13 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   including new suites: `echo_timing` (4), `probe` (9), `tcp_relay` (3),
   pump (2), `screen_model` (9, round-trip against real `BlitEncoder`),
   `predict` (13, full confirm/mispredict/typeahead/auto-unlock matrix).
-- Clean-room: all 11 patches `git am` onto a fresh `v0.7.4` worktree and
+- Follow-up verification for `0013`–`0014`: `client::` (164),
+  `protocol::wire::tests` (51), predictor regressions (23), and Clippy with
+  `-D warnings` are green. Coverage includes coalesced and split `abc def`,
+  cursor-only space confirmation, timeout, hidden/cross-row/full frames,
+  stale IME-anchor replacement, one-write framing, and one-message console
+  batches.
+- Clean-room: all 14 patches `git am` onto a fresh `v0.7.4` worktree and
   reproduce the working tree exactly (only the fork-era CI workflow file,
   deliberately outside the series, differs).
 
@@ -382,8 +425,9 @@ Still pending (record results in the check log):
 
 - **Client-side only** — locked in by the official-server constraint; held
   throughout, no wire-protocol change in any patch.
-- Landed order W0 → W2 → W1 → W4 → W3 as patches `0006`–`0011` (numbers as
-  reserved).
+- Landed order W0 → W2 → W1 → W4 → W3 as patches `0006`–`0011`
+  (numbers as reserved); i0002 resumes at `0013`–`0014` after i0004 used
+  `0012`.
 - W1 landed inert-by-default ahead of its packet-capture verification (see
   workstream note); the capture decides the *recommendation*, not the code.
 - Deferred: W5 transport swap; symmetric-loss ifb recipe; widening W3
@@ -391,6 +435,11 @@ Still pending (record results in the check log):
   committed text); a `--remote-no-cache` CLI flag (env var shipped
   instead); upstreaming (W0/W3 are platform-generic and may be worth
   offering upstream once proven, same policy as i0001 patches 0002/0004).
+- The shared 256-event queue, direct TCP Nagle behavior, and dense-frame model
+  cost remain measurement hypotheses, not reasons for speculative transport
+  changes. `HERDR_ECHO_TIMING` starts after its blocking send and ends at the
+  next frame, so use packet capture or capture-to-stable-flush tracing before
+  attributing any remaining delay.
 
 ## Check log
 
@@ -398,3 +447,9 @@ Still pending (record results in the check log):
   clippy + full test filters green; clean-room apply verified. Pending: W1
   Nagle packet-capture verdict, W0 baseline numbers at 200 ms netem, cold
   vs warm-cache attach timing on deb1.
+- 2026-07-20: reproduced the pi `abc def` stuck-underline/cursor failure as
+  an untouched-space FIFO block followed by pi's cursor-only frame. Patches
+  `0013`–`0014` implement cumulative cursor acknowledgement, idle timeout
+  repair, atomic frame correction, contiguous protocol writes, and Windows
+  console-event batching. Clippy, 164 client tests, 51 wire tests, and a
+  clean-room 14-patch apply are green; live high-RTT retest pending.
