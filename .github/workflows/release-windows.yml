@@ -3,7 +3,7 @@ name: Release (Windows)
 # Builds the native Windows herdr binary with `--remote` support by cloning
 # upstream (ogulcancelik/herdr) at the release tag pinned in
 # patches/herdr/BASE, applying the patch series with `git am`, and publishing
-# the result as a GitHub release asset.
+# the Windows executable and Linux hcode shim as GitHub release assets.
 
 on:
   workflow_dispatch:
@@ -100,18 +100,21 @@ jobs:
         working-directory: checkouts/herdr
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
-      - name: Package artifact
+      - name: Package artifacts
         shell: pwsh
         run: |
           Copy-Item checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe herdr-windows-x86_64.exe
+          Copy-Item extras\remote-bin\hcode hcode
           "repo_commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
           "upstream_base=$env:UPSTREAM_BASE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "patched_commit=$env:PATCHED_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          $hash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.exe).Hash.ToLowerInvariant()
-          "sha256=$hash  herdr-windows-x86_64.exe" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          $binaryHash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.exe).Hash.ToLowerInvariant()
+          "sha256=$binaryHash  herdr-windows-x86_64.exe" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          $hcodeHash = (Get-FileHash -Algorithm SHA256 hcode).Hash.ToLowerInvariant()
+          "sha256=$hcodeHash  hcode" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
 
       - name: Publish release
         shell: pwsh
@@ -128,7 +131,7 @@ jobs:
             "- [$($parts[1])](https://github.com/$env:GITHUB_REPOSITORY/commit/$($parts[0])) $($parts[2])"
           }) -join "`n"
           @"
-          Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support.
+          Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support. Includes the ``hcode`` Linux shim for opening local VS Code Remote-SSH.
 
           **Repository commit:** [$($env:GITHUB_SHA.Substring(0, 7))](https://github.com/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA)
 
@@ -136,7 +139,7 @@ jobs:
 
           $commitLines
 
-          See BUILD_INFO.txt for the upstream and patched commits and the binary sha256.
+          See BUILD_INFO.txt for the upstream and patched commits and artifact SHA-256 checksums.
           "@ | Out-File -Encoding utf8 RELEASE_NOTES.md
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
@@ -153,4 +156,4 @@ jobs:
               --title "herdr $tag (Windows --remote)" `
               --notes-file RELEASE_NOTES.md
           }
-          gh release upload $tag herdr-windows-x86_64.exe BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --clobber
+          gh release upload $tag herdr-windows-x86_64.exe hcode BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --clobber

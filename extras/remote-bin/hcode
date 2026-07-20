@@ -1,32 +1,32 @@
 #!/bin/sh
-# code — herdr remote shim: open local VS Code (Remote-SSH) on this host.
+# hcode — herdr remote shim: open local VS Code (Remote-SSH) on this host.
 #
 # Install on every Linux host you attach to with `herdr --remote`:
 #
 #   mkdir -p ~/.local/bin
-#   cp code ~/.local/bin/code && chmod +x ~/.local/bin/code
+#   cp hcode ~/.local/bin/hcode && chmod +x ~/.local/bin/hcode
 #
-# (~/.local/bin must be on PATH and must win over any real `code` binary.)
+# (~/.local/bin must be on PATH.)
 #
 # How it works: inside a herdr pane this script emits an OSC 52 clipboard
 # write whose payload is a magic JSON blob. The herdr server forwards pane
 # OSC 52 writes to the attached client; the patched Windows client (patch
 # 0012, i0004) recognizes the blob and launches local VS Code with
-# `vscode-remote://ssh-remote+<target>` URIs instead of touching the
+# `vscode://vscode-remote/ssh-remote+<target>` URLs instead of touching the
 # clipboard. Unpatched or non-herdr terminals just get a short junk string
 # on their clipboard, nothing else.
 
 set -eu
 
 if [ "${HERDR_ENV:-}" != "1" ]; then
-    echo "code: not inside a herdr pane; this shim only works under 'herdr --remote'" >&2
+    echo "hcode: not inside a herdr pane; this shim only works under 'herdr --remote'" >&2
     exit 1
 fi
 
 [ "$#" -gt 0 ] || set -- .
 
 if [ "$#" -gt 8 ]; then
-    echo "code: too many paths (max 8)" >&2
+    echo "hcode: too many paths (max 8)" >&2
     exit 1
 fi
 
@@ -35,7 +35,7 @@ sep=''
 for arg in "$@"; do
     # -m: allow not-yet-existing paths (VS Code opens them as new files).
     if ! abs=$(realpath -m -- "$arg" 2>/dev/null); then
-        echo "code: cannot resolve path: $arg" >&2
+        echo "hcode: cannot resolve path: $arg" >&2
         exit 1
     fi
     if [ -d "$abs" ]; then dir=true; else dir=false; fi

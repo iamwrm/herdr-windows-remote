@@ -409,7 +409,7 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: all 14 patches `git am` onto a fresh `v0.7.4` worktree and
+- Clean-room: all 15 patches `git am` onto a fresh `v0.7.4` worktree and
   reproduce the working tree exactly (only the fork-era CI workflow file,
   deliberately outside the series, differs).
 

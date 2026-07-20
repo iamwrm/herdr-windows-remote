@@ -2,7 +2,7 @@
 
 **Status:** implemented and exported; shipped as prerelease Windows binaries
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012 under [i0004](i0004_vscode-remote-open.md) (`code .` → local VS Code Remote-SSH)
+**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012 and 0015 under [i0004](i0004_vscode-remote-open.md) (`hcode .` → local VS Code Remote-SSH)
 **Implementation base:** upstream release tag `v0.7.4` (`50aaa2e`), pinned in `patches/herdr/BASE`
 
 ## Goal
@@ -181,7 +181,7 @@ labelled) for diagnosing slow attaches.
 `.github/workflows/release-windows.yml` builds `x86_64-pc-windows-msvc` with
 upstream's pinned steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 `cargo build --release --locked`) and publishes a prerelease with
-`herdr-windows-x86_64.exe` + `BUILD_INFO.txt`.
+`herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.txt`.
 
 - **Trigger by tag:** `git tag vX.Y.Z-win.<n> && git push origin <tag>`.
   The `vX.Y.Z` part must match `patches/herdr/BASE` (enforced by the

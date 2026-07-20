@@ -71,8 +71,9 @@ Then update `patches/herdr/BASE` and commit the refreshed patches.
 
 `.github/workflows/release-windows.yml` clones upstream at `BASE`, applies the
 patch series with `git am`, builds `x86_64-pc-windows-msvc` with upstream's
-pinned steps, and publishes a prerelease with `herdr-windows-x86_64.exe` +
-`BUILD_INFO.txt` (repo commit, upstream base, patched tree sha256).
+pinned steps, and publishes a prerelease with `herdr-windows-x86_64.exe`, the
+Linux `hcode` shim, and `BUILD_INFO.txt` (repo/upstream/patched commits and
+artifact SHA-256 checksums).
 
 - **Trigger by tag:** `git tag vX.Y.Z-win.<n> && git push origin <tag>` →
   release under that tag. The `vX.Y.Z` part must match `patches/herdr/BASE`

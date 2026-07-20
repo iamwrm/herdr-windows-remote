@@ -7,7 +7,8 @@ quality-of-life improvements for that workflow. Retire this repo as soon as
 upstream supports the required Windows remote functionality natively.
 
 Download builds from this repo's **Releases** (`herdr-windows-x86_64.exe`).
-Fork builds do not self-update — update by downloading from Releases.
+The same release includes the Linux `hcode` shim for opening local VS Code
+Remote-SSH. Fork builds do not self-update — update by downloading from Releases.
 
 See [docs/repo.md](docs/repo.md) for the repo layout and workflow
 (plain clones in `checkouts/`, durable patches in `patches/` — no forks, no
@@ -16,7 +17,7 @@ for the port itself: design, patch series, version-bump runbook, and
 retirement criteria. Additional initiatives cover
 [remote latency/predictive echo](docs/i0002_latency_improvements.md),
 [pi predictive-echo compatibility](docs/i0003_pi-predictive-echo.md), and
-[`code .` → local VS Code Remote-SSH](docs/i0004_vscode-remote-open.md).
+[`hcode .` → local VS Code Remote-SSH](docs/i0004_vscode-remote-open.md).
 
 This repo replaces the retired fork `iamwrm/herdr` (see its issue #1 for the
 original fork-era notes; everything durable now lives here).

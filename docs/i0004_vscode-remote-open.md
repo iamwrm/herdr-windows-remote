@@ -1,8 +1,12 @@
 # i0004: Open local VS Code Remote-SSH from a remote herdr shell
 
-**Status:** implemented and exported as patch `0012`; automated tests and live deb1 request transport verification complete
+**Status:** implemented and exported as patch `0012`; remote command renamed to
+`hcode` in patch `0015` and shipped as a release artifact; automated tests and
+live deb1 request transport verification complete
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** `patches/herdr/0012-*` + [`extras/remote-bin/code`](../extras/remote-bin/code)
+**Deliverable:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
+[`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode` release
+asset
 **Implementation base:** `v0.7.4` (`50aaa2e`), stacked on patches `0001`–`0011`
 
 ## Goal
@@ -11,7 +15,7 @@ While attached from Windows with `herdr --remote deb1`, make this remote-shell w
 
 ```sh
 cd /some/project
-code .
+hcode .
 ```
 
 launch Windows VS Code in Remote-SSH mode, connected through the same ssh target (`deb1`) and opening `/some/project` as its remote folder.
@@ -30,13 +34,16 @@ pane child OSC 52 write
   → local client normally writes it to the host clipboard
 ```
 
-A remote `code` shim emits an OSC 52 write containing a recognizable JSON request. The patched local client intercepts that request before ordinary clipboard forwarding, validates it, and starts local VS Code. Every non-magic OSC 52 payload follows the existing clipboard path unchanged.
+A remote `hcode` shim emits an OSC 52 write containing a recognizable JSON request. The patched local client intercepts that request before ordinary clipboard forwarding, validates it, and starts local VS Code. Every non-magic OSC 52 payload follows the existing clipboard path unchanged.
 
 ## Implemented design
 
 ### Remote shim
 
-[`extras/remote-bin/code`](../extras/remote-bin/code) is a POSIX-sh script installed as `~/.local/bin/code` on each Linux target.
+[`extras/remote-bin/hcode`](../extras/remote-bin/hcode) is a POSIX-sh script
+installed as `~/.local/bin/hcode` on each Linux target. The distinct name
+avoids shadowing the official VS Code `code` CLI. Numbered Windows releases
+also publish this script as the `hcode` asset.
 
 - requires `HERDR_ENV=1` (exported by herdr panes), so invoking the shim in a plain ssh shell fails with an explanation;
 - treats no arguments as `.`, resolves each argument with `realpath -m`, and marks existing directories as folders (other paths as files);
@@ -83,11 +90,14 @@ From this repository:
 
 ```sh
 ssh deb1 'mkdir -p ~/.local/bin'
-scp extras/remote-bin/code deb1:~/.local/bin/code
-ssh deb1 'chmod +x ~/.local/bin/code'
+scp extras/remote-bin/hcode deb1:~/.local/bin/hcode
+ssh deb1 'chmod +x ~/.local/bin/hcode'
 ```
 
-Ensure `~/.local/bin` precedes any other `code` command in the remote login shell's `PATH`. Then start the patched Windows build:
+Alternatively, download the `hcode` asset from the same numbered GitHub
+release as the Windows executable and install it with mode `0755`. Ensure
+`~/.local/bin` is in the remote login shell's `PATH`. Then start the patched
+Windows build:
 
 ```powershell
 herdr --remote deb1
@@ -97,7 +107,7 @@ Inside its Linux shell:
 
 ```sh
 cd /some/project
-code .
+hcode .
 ```
 
 VS Code's Remote-SSH extension must be installed locally, and the target should be a normal ssh alias/host accepted by both herdr and VS Code (for example `deb1` or `user@deb1`). Workspace Trust remains governed by VS Code.
@@ -115,7 +125,15 @@ Repository-only file:
 
 | File | Change |
 |---|---|
-| `extras/remote-bin/code` | installable Linux-side command shim |
+| `extras/remote-bin/hcode` | installable Linux-side command shim and release asset |
+
+## Patch 0015 — rename the remote command to `hcode`
+
+Patch `0015` updates final-tree source comments and generated-config guidance
+to use `hcode`. The wire payload (`code-open`), Rust identifiers,
+`remote.code_open`, and `HERDR_REMOTE_CODE_OPEN` remain unchanged for backward
+compatibility; they are internal integration names and do not claim the Linux
+`code` command.
 
 ## Security properties
 
@@ -134,7 +152,7 @@ This is intentionally not a general remote-to-local command execution mechanism.
 
 ## Known caveats
 
-- VS Code normally asks for confirmation before opening a remote protocol link. This adds one local confirmation to `code .`; users can govern it with VS Code's `security.promptForRemoteFileProtocolHandling` setting.
+- VS Code normally asks for confirmation before opening a remote protocol link. This adds one local confirmation to `hcode .`; users can govern it with VS Code's `security.promptForRemoteFileProtocolHandling` setting.
 - The official server shows its normal **“copied to clipboard”** toast when it receives the shim's OSC 52 request, even though the patched client intercepts the magic payload and does not modify the Windows clipboard. Suppressing that server-side cosmetic toast would require an official-server change or a new wire message, both intentionally out of scope.
 
 ## Non-goals
@@ -157,15 +175,23 @@ Completed on Windows with Zig 0.15.2:
 - `cargo test --bin herdr config::` — 121 passed;
 - focused `client::code_open::tests` — 15 passed after refactoring to the platform URL opener, including URL encoding, folder/file URLs, validation/rate limiting, and disabled-request consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all 12 patches applied with `git am` to a fresh `v0.7.4` worktree; `src/` exactly matches the implementation checkout (the only whole-tree difference is the known fork-era CI workflow intentionally excluded from the series);
+- clean-room: all 15 patches applied with `git am` to a fresh `v0.7.4`
+  worktree; `src/` exactly matches the implementation checkout (the only
+  whole-tree difference is the known fork-era CI workflow intentionally
+  excluded from the series);
 - `git diff --check` — clean.
 
 Test binaries report nine pre-existing test-only unused-code/import warnings; production clippy with warnings denied is clean.
 
 Live deb1 verification:
 
-- installed the shim as `~/.cargo/bin/code` because that is deb1's first user-writable PATH directory;
-- through the official Linux v0.7.4 server, `cd /tmp && code .` reached a temporary local capture executable as exactly `--folder-uri` + `vscode-remote://ssh-remote+deb1/tmp`;
+- before the rename, the identical shim was installed as `~/.cargo/bin/code`
+  because that is deb1's first user-writable PATH directory;
+- through the official Linux v0.7.4 server, `cd /tmp && code .` reached a
+  temporary local capture executable as exactly `--folder-uri` +
+  `vscode-remote://ssh-remote+deb1/tmp`;
+- the renamed `hcode` script produces the same validated payload and is now
+  installed as `~/.cargo/bin/hcode`;
 - before the URL-opener refactor, VS Code Remote-SSH activated its resolver for `ssh-remote+deb1`; current launch plumbing reuses herdr's existing Windows `ShellExecuteW` URL opener and the machine's registered `vscode` handler (`Code.exe --open-url -- "%1"`);
 - VS Code's documented remote protocol-link format was checked against `vscode://vscode-remote/ssh-remote+[USER@]HOST[:PORT]/path`.
 
@@ -174,7 +200,7 @@ Live deb1 verification:
 - Preserve ordinary clipboard fallback for every non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
 - Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
-- Patch `0012` applies after i0002's `0011`.
+- Patch `0012` applies after i0002's `0011`; comment-only rename patch `0015` applies after `0014`.
 
 ## Decisions and deferred work
 
@@ -184,4 +210,7 @@ Live deb1 verification:
 
 ## Check log
 
-- 2026-07-20: patch `0012` implemented/exported; automated tests green; live deb1 OSC 52 request transport verified `/tmp`; VS Code Remote-SSH resolver launch verified. Launch code was then simplified to herdr's existing platform URL opener using VS Code's documented remote protocol URL. deb1 shim installed at `~/.cargo/bin/code`.
+- 2026-07-20: patch `0012` implemented/exported; automated tests green; live deb1 OSC 52 request transport verified `/tmp`; VS Code Remote-SSH resolver launch verified. Launch code was then simplified to herdr's existing platform URL opener using VS Code's documented remote protocol URL.
+- 2026-07-20: renamed the Linux command from `code` to `hcode` so it cannot
+  shadow the official VS Code CLI; added `hcode` to release assets and
+  installed it on deb1 at `~/.cargo/bin/hcode`.
