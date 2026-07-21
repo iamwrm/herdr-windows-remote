@@ -1,12 +1,12 @@
 # i0004: Open local VS Code Remote-SSH from a remote herdr shell
 
-**Status:** implemented and exported as patch `0012`; remote command renamed to
-`hcode` in patch `0015` and shipped as a release artifact; automated tests and
-live deb1 request transport verification complete
+**Status:** implemented in patches `0012`, `0015`, and `0016`; remote command
+renamed to `hcode` and shipped as a release artifact; automated tests and live
+deb1 request transport verification complete
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 **Deliverable:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
-[`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode` release
-asset
+`patches/herdr/0016-*`, [`extras/remote-bin/hcode`](../extras/remote-bin/hcode),
+and the `hcode` release asset
 **Implementation base:** `v0.7.4` (`50aaa2e`), stacked on patches `0001`–`0011`
 
 ## Goal
@@ -61,10 +61,22 @@ The remote launcher passes the original ssh target to its child client as `HERDR
 For a valid request, `src/client/code_open.rs` builds a registered VS Code Remote-SSH URL:
 
 ```text
-vscode://vscode-remote/ssh-remote+deb1/home/user/project/
+vscode://vscode-remote/ssh-remote+deb1/home/user/project/?windowId=_blank
 ```
 
-Directories get a trailing slash; files do not. Paths are required to be absolute and control-character-free, then UTF-8 percent-encoded. The ssh authority always comes from the local launcher's target, never from remote payload data.
+Directories get a trailing slash and `windowId=_blank`. Files get a `:1`
+line marker, which VS Code removes before opening the file; this is required
+for its remote protocol parser to classify the path as a file. Paths are
+required to be absolute and control-character-free, then UTF-8 percent-encoded.
+The ssh authority always comes from the local launcher's target, never from
+remote payload data.
+
+For folders, `windowId=_blank` is a new-window **fallback**: VS Code first
+focuses an already-open window whose remote workspace URI exactly matches; if
+there is no match, it opens a new window instead of replacing an unrelated
+active workspace. This also keeps multiple requested folders from collapsing
+into one repeatedly replaced window. File links naturally select an existing
+window containing the file, or open a new one when no workspace contains it.
 
 The client passes each URL to herdr's existing platform URL opener. On Windows that is `ShellExecuteW`, which invokes the registered `vscode` protocol handler directly—no `cmd.exe`, `code.cmd`, install-path discovery, or shell-built command is involved. This is VS Code's documented remote file/workspace protocol and lets the OS select the registered installation.
 
@@ -135,6 +147,13 @@ to use `hcode`. The wire payload (`code-open`), Rust identifiers,
 compatibility; they are internal integration names and do not claim the Linux
 `code` command.
 
+## Patch 0016 — preserve existing VS Code windows
+
+Patch `0016` adds VS Code's `windowId=_blank` URL parameter to folder links.
+Exact matching workspaces are still reused and focused; unmatched folders open
+separately instead of replacing an existing workspace. It also adds the `:1`
+marker required for VS Code to route file links to a containing window.
+
 ## Security properties
 
 A process running in the remote pane can emit OSC 52, so it can attempt a code-open request. The client limits that capability:
@@ -173,9 +192,9 @@ Completed on Windows with Zig 0.15.2:
 - `cargo test --bin herdr windows_` — 121 passed;
 - `cargo test --bin herdr server::client_transport::tests` — 19 passed;
 - `cargo test --bin herdr config::` — 121 passed;
-- focused `client::code_open::tests` — 15 passed after refactoring to the platform URL opener, including URL encoding, folder/file URLs, validation/rate limiting, and disabled-request consumption;
+- focused `client::code_open::tests` — 15 passed after patch `0016`, including URL encoding, folder/file new-window fallbacks, validation/rate limiting, and disabled-request consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all 15 patches applied with `git am` to a fresh `v0.7.4`
+- clean-room: all 16 patches applied with `git am` to a fresh `v0.7.4`
   worktree; `src/` exactly matches the implementation checkout (the only
   whole-tree difference is the known fork-era CI workflow intentionally
   excluded from the series);
@@ -200,7 +219,8 @@ Live deb1 verification:
 - Preserve ordinary clipboard fallback for every non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
 - Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
-- Patch `0012` applies after i0002's `0011`; comment-only rename patch `0015` applies after `0014`.
+- Patch `0012` applies after i0002's `0011`; comment-only rename patch `0015`
+  applies after `0014`, and window-preservation patch `0016` applies last.
 
 ## Decisions and deferred work
 
@@ -214,3 +234,6 @@ Live deb1 verification:
 - 2026-07-20: renamed the Linux command from `code` to `hcode` so it cannot
   shadow the official VS Code CLI; added `hcode` to release assets and
   installed it on deb1 at `~/.cargo/bin/hcode`.
+- 2026-07-21: added the `windowId=_blank` fallback so exact existing
+  workspaces are focused while unmatched folders cannot replace unrelated
+  VS Code windows.

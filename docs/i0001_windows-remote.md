@@ -2,7 +2,7 @@
 
 **Status:** implemented and exported; shipped as prerelease Windows binaries
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012 and 0015 under [i0004](i0004_vscode-remote-open.md) (`hcode .` → local VS Code Remote-SSH)
+**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012, 0015, and 0016 under [i0004](i0004_vscode-remote-open.md) (`hcode .` → local VS Code Remote-SSH)
 **Implementation base:** upstream release tag `v0.7.4` (`50aaa2e`), pinned in `patches/herdr/BASE`
 
 ## Goal
