@@ -2,7 +2,7 @@
 
 These rules apply to GitHub Actions and releases in this repository. The source
 of truth for the Windows build is `.github/workflows/release-windows.yml`; also
-follow the release runbook in `docs/i0001_windows-remote.md`.
+follow the release runbook in `docs/IV-0001-windows-remote.md`.
 
 ## GitHub Actions
 

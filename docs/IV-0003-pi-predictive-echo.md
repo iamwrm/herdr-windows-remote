@@ -1,16 +1,19 @@
-# i0003: Predictive echo inside pi's input prompt
+# IV-0003: Predictive echo inside pi's input prompt
 
-**Status:** PoC implemented and deployed to deb1; live typing exposed an
-untouched-space reconciliation bug, fixed in herdr patch `0013`; high-RTT
-retest pending
-**Upstream:** [earendil-works/pi](https://github.com/earendil-works/pi)
-(pi-tui) — no herdr changes, no pi-core changes
-**Deliverable:** [`extras/pi-extensions/predictive-echo-cursor.ts`](../extras/pi-extensions/predictive-echo-cursor.ts)
-(a pi extension installed on the machine that runs pi, i.e. the herdr
-*server*)
-**Depends on:** i0002 W3 (herdr client predictive echo, patches 0010/0011 + cursor-only reconciliation in 0013)
+## Record
 
-## Goal
+- **Status:** proof of concept implemented and deployed to deb1; live typing
+  exposed an untouched-space reconciliation bug, fixed in herdr patch `0013`;
+  high-RTT retest pending
+- **Upstream:** [earendil-works/pi](https://github.com/earendil-works/pi)
+  (`pi-tui`) — no herdr or pi-core changes
+- **Deliverable:**
+  [`extras/pi-extensions/predictive-echo-cursor.ts`](../extras/pi-extensions/predictive-echo-cursor.ts),
+  installed on the machine running pi (the herdr server)
+- **Dependency:** [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed)
+  provides herdr client predictive echo and cursor-only reconciliation
+
+## Purpose
 
 herdr's predictive echo works in vim but not in pi's input prompt. Make
 typing into pi over a 200 ms link feel local, without weakening the
@@ -18,7 +21,7 @@ predictor's safety gates.
 
 ## Root cause
 
-The predictor (i0002 patch 0011) refuses to predict unless the **hardware
+The predictor (IV-0002 patch `0011`) refuses to predict unless the **hardware
 cursor is visible** and the **target cell is unstyled**. pi fails both by
 design: pi-tui hides the hardware cursor and draws its caret as an
 inverse-video cell (`ESC[7m<char>ESC[0m`,
@@ -70,7 +73,15 @@ Side benefit independent of herdr: fixes pi's double-cursor when users
 enable `showHardwareCursor` manually (hardware cursor + software block at
 the same cell today).
 
-## PoC verification
+## Non-goals
+
+- Do not weaken herdr's prediction safety gates or duplicate prediction inside
+  the remote pi process.
+- Do not change herdr's wire protocol or require a patched remote server.
+- Do not change pi-core; use a removable pi-tui extension until the behavior
+  has a suitable upstream home.
+
+## Evidence and reproduction
 
 - Transform unit-checked in node: marker preserved, block stripped,
   cursor-on-char and cursor-at-end-of-line cases width-preserving,
@@ -85,7 +96,7 @@ the same cell today).
   cursor-position write arrived as a cursor-only frame.
 - Herdr patch `0013` now covers the exact content-then-cursor frame sequence;
   live retest through `herdr --remote deb1` at 200 ms netem remains pending
-  (record in the i0002 check log).
+  (record in the [IV-0002 evidence log](IV-0002-latency-improvements.md#evidence-log)).
 
 ## Install
 
@@ -101,7 +112,7 @@ pi's stock block caret.
 - The caret look changes from pi's block to the host terminal's real
   cursor (shape/blink follow the terminal).
 - Completion accept / line rewrap rewrite cells under pending predictions
-  → one self-healing repaint (≤1 RTT), by design of i0002 W3.
+  → one self-healing repaint (≤1 RTT), by design of IV-0002 W3.
 - The extension unconditionally forces the hardware cursor visible; users
   who want pi's stock look should not install it (per-host opt-in by
   file placement).
@@ -113,9 +124,9 @@ skip drawing the software caret in `pi-tui` editor/input components (the
 hardware cursor is already positioned correctly; drawing both is
 redundant). Once upstream ships that, this extension reduces to
 `showHardwareCursor: true` in settings and this initiative retires —
-same pattern as i0001's [When to retire](i0001_windows-remote.md#when-to-retire).
+the same pattern as [IV-0001's retirement criteria](IV-0001-windows-remote.md#when-to-retire).
 
-**Check log:**
+## Evidence log
 
 - 2026-07-19: PoC built and deployed against pi 0.80.10; escape-level
   verification green; live 200 ms typing test pending.

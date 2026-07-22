@@ -4,7 +4,7 @@
  *
  * Why: pi normally hides the hardware terminal cursor and draws its own
  * caret as an inverse-video cell (`ESC[7m<char>ESC[0m`). Remote thin
- * clients that implement predictive local echo (herdr i0002 W3) refuse to
+ * clients that implement predictive local echo (herdr IV-0002 W3) refuse to
  * predict when the hardware cursor is hidden or the target cell is styled,
  * so typing into pi over a high-RTT link feels like the full round trip.
  *

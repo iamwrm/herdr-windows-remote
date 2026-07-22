@@ -1,15 +1,23 @@
-# i0004: Open local VS Code Remote-SSH from a remote herdr shell
+# IV-0004: Open local VS Code Remote-SSH from a remote herdr shell
 
-**Status:** implemented in patches `0012`, `0015`, and `0016`; remote command
-renamed to `hcode` and shipped as a release artifact; automated tests and live
-deb1 request transport verification complete
-**Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
-`patches/herdr/0016-*`, [`extras/remote-bin/hcode`](../extras/remote-bin/hcode),
-and the `hcode` release asset
-**Implementation base:** `v0.7.5` (`ef4c23f`), stacked on patches `0001`–`0011`
+## Record
 
-## Goal
+- **Status:** implemented in patches `0012`, `0015`, and `0016`; remote
+  command renamed to `hcode` and shipped as a release artifact; automated
+  tests and live deb1 request-transport verification complete
+- **Upstream:** `checkouts/herdr`
+  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+- **Deliverables:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
+  `patches/herdr/0016-*`,
+  [`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode`
+  release asset
+- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on patches
+  `0001`–`0011`
+- **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
+  Windows remote client; [IV-0002](IV-0002-latency-improvements.md) owns the
+  interleaved surrounding patches
+
+## Purpose
 
 While attached from Windows with `herdr --remote deb1`, make this remote-shell workflow:
 
@@ -182,7 +190,7 @@ This is intentionally not a general remote-to-local command execution mechanism.
 - No support for exotic ssh target syntax (simple host aliases and `user@host` are supported; use an ssh config alias for IPv6/proxy complexity).
 - No server-side patch and no protocol change.
 
-## Verification
+## Evidence and reproduction
 
 Completed on Windows with Zig 0.15.2:
 
@@ -218,7 +226,7 @@ Live deb1 verification:
 - Preserve ordinary clipboard fallback for every non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
 - Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
-- Patch `0012` applies after i0002's `0011`; comment-only rename patch `0015`
+- Patch `0012` applies after IV-0002's `0011`; comment-only rename patch `0015`
   applies after `0014`, and window-preservation patch `0016` applies last.
 
 ## Decisions and deferred work
@@ -227,7 +235,7 @@ Live deb1 verification:
 - OSC 52 was chosen because the official server already forwards it as a typed protocol message; arbitrary terminal escape passthrough would not survive server-side rendering.
 - Auto-provisioning the shim and broader VS Code CLI compatibility are deferred until live usage demonstrates they are needed.
 
-## Check log
+## Evidence log
 
 - 2026-07-20: patch `0012` implemented/exported; automated tests green; live deb1 OSC 52 request transport verified `/tmp`; VS Code Remote-SSH resolver launch verified. Launch code was then simplified to herdr's existing platform URL opener using VS Code's documented remote protocol URL.
 - 2026-07-20: renamed the Linux command from `code` to `hcode` so it cannot

@@ -1,16 +1,22 @@
-# i0002: Remote-attach latency improvements for high-RTT links
+# IV-0002: Remote-attach latency improvements for high-RTT links
 
-**Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4,
-W3), with cursor-reconciliation and input-packetization follow-ups in
-`0013`–`0014`; live deb1 verification and the W1 packet-capture verdict still
-pending
-**Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** patches `patches/herdr/0006-*` … `0011-*` and `0013-*` …
-`0014-*` (`0012` belongs to i0004) + the deb1 network-simulation harness below
-**Implementation base:** `v0.7.5` (`ef4c23f`), stacked on the i0001 series
-(0001–0005)
+## Record
 
-## Goal
+- **Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4,
+  W3), with cursor-reconciliation and input-packetization follow-ups in
+  `0013`–`0014`; live deb1 verification and the W1 packet-capture verdict
+  remain pending
+- **Upstream:** `checkouts/herdr`
+  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+- **Deliverables:** patches `patches/herdr/0006-*` through `0011-*` and
+  `0013-*` through `0014-*`, plus the deb1 network-simulation harness below
+- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on
+  [IV-0001](IV-0001-windows-remote.md)'s patches `0001`–`0005`
+- **Related initiatives:** [IV-0004](IV-0004-vscode-remote-open.md) owns patch
+  `0012`; [IV-0003](IV-0003-pi-predictive-echo.md) adapts pi to consume this
+  initiative's predictive echo
+
+## Purpose
 
 Make `herdr --remote` usable and pleasant on high-latency links (Asia ↔ US,
 ~200 ms RTT, occasional packet loss). Today every keystroke costs at least a
@@ -22,10 +28,10 @@ RTT, and hide the RTT itself where possible (predictive echo).
 
 **The remote server is the *official* Linux binary.** The launcher installs
 official assets from `https://herdr.dev/latest.json` (kept deliberately, see
-i0001 patch 0003). Therefore:
+IV-0001 patch `0003`). Therefore:
 
 - Server-side changes only help fork-vs-fork setups and are at most
-  defense-in-depth (i0001 patch 0004 set this precedent).
+  defense-in-depth (IV-0001 patch `0004` set this precedent).
 - The wire protocol (`src/protocol/wire.rs`, `CURRENT_PROTOCOL`) must not
   change. No new `ServerMessage`/`ClientMessage` variants, no field changes.
 - All improvements must live in the **client**, the **launcher/bridge**, or
@@ -58,7 +64,7 @@ Setup path (before the client starts), all in
 Happy path ≈ **5 sequential fresh connections + 1 persistent**. Windows
 OpenSSH has no ControlMaster, so each fresh connection pays TCP + kex + auth
 (~5–7 RTTs ≈ 1–1.5 s at 200 ms) → attach ≈ **6–9 s**. `HERDR_REMOTE_TIMING=1`
-(i0001 patch 0005) already labels each phase.
+(IV-0001 patch `0005`) already labels each phase.
 
 What already helps at high RTT (do not regress):
 
@@ -395,7 +401,7 @@ feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 - Not chasing sub-RTT for anything other than typing echo (W3); command
   output fundamentally arrives after 1 RTT.
 
-## Verification
+## Evidence and reproduction
 
 Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
 
@@ -423,12 +429,12 @@ Still pending (record results in the check log):
 - W1 packet capture (both directions) for the Nagle verdict.
 - `HERDR_REMOTE_TIMING=1` cold vs warm-cache attach timing.
 
-## Decisions & deferred
+## Decisions and deferred work
 
 - **Client-side only** — locked in by the official-server constraint; held
   throughout, no wire-protocol change in any patch.
 - Landed order W0 → W2 → W1 → W4 → W3 as patches `0006`–`0011`
-  (numbers as reserved); i0002 resumes at `0013`–`0014` after i0004 used
+  (numbers as reserved); IV-0002 resumes at `0013`–`0014` after IV-0004 used
   `0012`.
 - W1 landed inert-by-default ahead of its packet-capture verification (see
   workstream note); the capture decides the *recommendation*, not the code.
@@ -436,14 +442,15 @@ Still pending (record results in the check log):
   prediction contexts beyond plain-text typing (wide chars, backspace over
   committed text); a `--remote-no-cache` CLI flag (env var shipped
   instead); upstreaming (W0/W3 are platform-generic and may be worth
-  offering upstream once proven, same policy as i0001 patches 0002/0004).
+  offering upstream once proven, under the same policy as IV-0001 patches
+  `0002` and `0004`).
 - The shared 256-event queue, direct TCP Nagle behavior, and dense-frame model
   cost remain measurement hypotheses, not reasons for speculative transport
   changes. `HERDR_ECHO_TIMING` starts after its blocking send and ends at the
   next frame, so use packet capture or capture-to-stable-flush tracing before
   attributing any remaining delay.
 
-## Check log
+## Evidence log
 
 - 2026-07-19: patches `0006`–`0011` implemented and landed on `v0.7.4`;
   clippy + full test filters green; clean-room apply verified. Pending: W1

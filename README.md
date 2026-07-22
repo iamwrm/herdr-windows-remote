@@ -12,12 +12,12 @@ Remote-SSH. Fork builds do not self-update — update by downloading from Releas
 
 See [docs/repo.md](docs/repo.md) for the repo layout and workflow
 (plain clones in `checkouts/`, durable patches in `patches/` — no forks, no
-submodules), and [docs/i0001_windows-remote.md](docs/i0001_windows-remote.md)
-for the port itself: design, patch series, version-bump runbook, and
-retirement criteria. Additional initiatives cover
-[remote latency/predictive echo](docs/i0002_latency_improvements.md),
-[pi predictive-echo compatibility](docs/i0003_pi-predictive-echo.md), and
-[`hcode .` → local VS Code Remote-SSH](docs/i0004_vscode-remote-open.md).
+submodules), and
+[IV-0001](docs/IV-0001-windows-remote.md) for the port itself: design, patch
+series, version-bump runbook, and retirement criteria. Additional initiatives
+cover [remote latency/predictive echo](docs/IV-0002-latency-improvements.md),
+[pi predictive-echo compatibility](docs/IV-0003-pi-predictive-echo.md), and
+[`hcode .` → local VS Code Remote-SSH](docs/IV-0004-vscode-remote-open.md).
 
 This repo replaces the retired fork `iamwrm/herdr` (see its issue #1 for the
 original fork-era notes; everything durable now lives here).

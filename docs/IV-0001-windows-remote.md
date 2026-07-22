@@ -1,11 +1,19 @@
-# i0001: Native Windows `herdr --remote` support
+# IV-0001: Native Windows `herdr --remote` support
 
-**Status:** implemented and exported; shipped as prerelease Windows binaries
-**Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-**Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012, 0015, and 0016 under [i0004](i0004_vscode-remote-open.md) (`hcode .` → local VS Code Remote-SSH)
-**Implementation base:** upstream release tag `v0.7.5` (`ef4c23f`), pinned in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
+## Record
 
-## Goal
+- **Status:** implemented and exported; shipped as prerelease Windows binaries
+- **Upstream:** `checkouts/herdr`
+  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+- **Deliverables:** patches `0001`–`0005` in `patches/herdr/` and
+  `.github/workflows/release-windows.yml`
+- **Implementation base:** upstream release tag `v0.7.5` (`ef4c23f`), pinned
+  in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
+- **Consumers:** [IV-0002](IV-0002-latency-improvements.md) builds latency
+  improvements on this transport; [IV-0004](IV-0004-vscode-remote-open.md)
+  adds remote-to-local VS Code opening
+
+## Purpose
 
 `herdr --remote <ssh-target>` from the **native Windows binary**, which
 upstream ships as unsupported in the Windows beta ("Native Windows
@@ -159,7 +167,7 @@ labelled) for diagnosing slow attaches.
 - no upstreaming of the port itself (patches stay local per `docs/repo.md`);
   patches 0002 and 0004 are platform-generic and worth offering upstream
 
-## Verification performed (Windows client → Debian 13 VM)
+## Evidence and reproduction
 
 - attach, keystroke/output round trip, TUI rendering
 - remote server survives client loss; reattach restores scrollback + missed
@@ -283,7 +291,7 @@ Watch upstream for native Windows `--remote` support:
   `website/src/content/docs/windows-beta.mdx` dropping the `herdr --remote` row
 - upstream issue tracker for the Windows-beta remote roadmap
 
-**Check log** (update on every version bump):
+**Evidence log** (update on every version bump):
 
 - `v0.7.4` (2026-07-16): still unsupported — `src/` diff vs v0.7.3 is empty
   except the version bump; windows-beta docs still list `herdr --remote` as
