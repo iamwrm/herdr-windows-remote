@@ -41,7 +41,10 @@ jobs:
           $base = (Get-Content patches\herdr\BASE).Trim()
           $expectedCommit = (Get-Content patches\herdr\BASE_COMMIT).Trim()
           if ($env:GITHUB_REF -like 'refs/tags/*') {
-            $tagBase = $env:GITHUB_REF_NAME -replace '-win\.\d+$', ''
+            if ($env:GITHUB_REF_NAME -notmatch '^v\d+\.\d+\.\d+-win\.\d{2}$') {
+              throw "tag $env:GITHUB_REF_NAME must use vX.Y.Z-win.NN with a two-digit release counter"
+            }
+            $tagBase = $env:GITHUB_REF_NAME -replace '-win\.\d{2}$', ''
             if ($tagBase -ne $base) {
               throw "tag $env:GITHUB_REF_NAME does not match pinned base $base (patches/herdr/BASE)"
             }

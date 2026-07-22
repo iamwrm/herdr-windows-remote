@@ -186,14 +186,15 @@ steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 `cargo build --release --locked`) and publishes a prerelease with
 `herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.txt`.
 
-- **Trigger by tag:** `git tag vX.Y.Z-win.<n> && git push origin <tag>`.
+- **Trigger by tag:** `git tag vX.Y.Z-win.NN && git push origin <tag>`.
   The `vX.Y.Z` part must match `patches/herdr/BASE` (enforced by the
-  workflow).
+  workflow). `NN` starts at `01` for each new upstream version and is always
+  two digits so GitHub sorts numbered releases correctly.
 - **Trigger manually:** `gh workflow run release-windows.yml` → rolling
   `windows-remote-latest` prerelease.
-- Tag numbering continues the fork's counter: the fork shipped
-  `fork-v0.7.4-win.1`…`fork-v0.7.4-win.5`, so the first release from this
-  repo is `v0.7.4-win.6` (identical patch content to `fork-v0.7.4-win.5`).
+- Legacy `v0.7.4` tags continued the fork's unpadded counter. Starting with
+  `v0.7.5`, each upstream version has its own two-digit counter: `win.01`,
+  `win.02`, and so on.
 
 ### Update policy
 
@@ -254,7 +255,7 @@ git push origin master
 git fetch origin --prune --tags
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
-tag=vX.Y.Z-win.N  # N = highest existing win counter + 1
+tag=vX.Y.Z-win.NN  # NN = 01 for a new upstream version; otherwise increment that version's counter
 git tag "$tag"
 git push origin "$tag"
 gh run watch --exit-status <run-id>
