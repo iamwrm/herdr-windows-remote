@@ -1,7 +1,7 @@
-From 02ab748f7ec6ed0488ca8fd4b815e63efcb73467 Mon Sep 17 00:00:00 2001
+From e6f761b57ba76d047dfac625f4598177317ca0f7 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 15:28:14 +0800
-Subject: [PATCH 3/5] feat(fork): disable self-update and background version
+Subject: [PATCH 03/16] feat(fork): disable self-update and background version
  check
 
 This binary is the windows-remote fork; the updater compares against the
@@ -21,7 +21,7 @@ that has no native Windows --remote support.
  1 file changed, 22 insertions(+)
 
 diff --git a/src/update.rs b/src/update.rs
-index 98d3a7a..82fce39 100644
+index 9bb764e..63356e8 100644
 --- a/src/update.rs
 +++ b/src/update.rs
 @@ -24,6 +24,14 @@ use interprocess::local_socket::traits::Stream as _;

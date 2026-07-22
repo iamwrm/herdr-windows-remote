@@ -1,7 +1,7 @@
-From c2dc3657e7a10c166d1c385c08b00f997675951a Mon Sep 17 00:00:00 2001
+From 53cb1cddda58d9ea5b79c2e1279fa0958e9d2081 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 19:59:15 +0800
-Subject: [PATCH 5/5] feat(fork): add HERDR_REMOTE_TIMING for remote attach
+Subject: [PATCH 05/16] feat(fork): add HERDR_REMOTE_TIMING for remote attach
  phase diagnostics
 
 Set HERDR_REMOTE_TIMING=1 to print per-phase timing to stderr during
@@ -21,7 +21,7 @@ or a slow remote command (server status, version probe).
  2 files changed, 81 insertions(+), 33 deletions(-)
 
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index e39c1ff..0840ecd 100644
+index ffe9906..dc20501 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -28,6 +28,41 @@ pub(crate) const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;

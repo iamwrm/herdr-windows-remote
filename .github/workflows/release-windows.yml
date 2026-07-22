@@ -2,7 +2,8 @@ name: Release (Windows)
 
 # Builds the native Windows herdr binary with `--remote` support by cloning
 # upstream (ogulcancelik/herdr) at the release tag pinned in
-# patches/herdr/BASE, applying the patch series with `git am`, and publishing
+# patches/herdr/BASE, verifying its commit via BASE_COMMIT, applying the patch
+# series with `git am`, and publishing
 # the Windows executable and Linux hcode shim as GitHub release assets.
 
 on:
@@ -38,6 +39,7 @@ jobs:
         shell: pwsh
         run: |
           $base = (Get-Content patches\herdr\BASE).Trim()
+          $expectedCommit = (Get-Content patches\herdr\BASE_COMMIT).Trim()
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             $tagBase = $env:GITHUB_REF_NAME -replace '-win\.\d+$', ''
             if ($tagBase -ne $base) {
@@ -50,7 +52,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "failed to fetch upstream tag $base" }
           git -C checkouts/herdr checkout --detach FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { throw "failed to check out upstream tag $base" }
+          $actualCommit = (git -C checkouts/herdr rev-parse HEAD).Trim()
+          if ($actualCommit -ne $expectedCommit) {
+            throw "upstream tag $base resolved to $actualCommit, expected $expectedCommit (patches/herdr/BASE_COMMIT)"
+          }
           "UPSTREAM_BASE=$base" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
+          "UPSTREAM_COMMIT=$actualCommit" | Out-File -Encoding utf8 -Append $env:GITHUB_ENV
 
       - name: Apply patches
         shell: pwsh
@@ -107,6 +114,7 @@ jobs:
           Copy-Item extras\remote-bin\hcode hcode
           "repo_commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
           "upstream_base=$env:UPSTREAM_BASE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          "upstream_commit=$env:UPSTREAM_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "patched_commit=$env:PATCHED_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt

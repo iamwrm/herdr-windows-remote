@@ -1,7 +1,7 @@
-From 13bb74aab3c6e19c3b144ce1aec6aa6615668166 Mon Sep 17 00:00:00 2001
+From df18fde7d2014f7f4bb241b07809b433f4f3d24c Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:46:30 +0800
-Subject: [PATCH 09/11] perf(windows): remove 10ms poll from the remote bridge
+Subject: [PATCH 09/16] perf(windows): remove 10ms poll from the remote bridge
  keystroke pump
 
 The client->ssh pump polled PeekNamedPipe every 10ms because a blocking
@@ -24,10 +24,10 @@ Adds windows-sys Win32_System_IO for CancelIoEx and pump tests
  2 files changed, 132 insertions(+), 28 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
-index fff4350..308ea18 100644
+index e136312..e7da49a 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -54,6 +54,7 @@ windows-sys = { version = "0.61.2", features = [
+@@ -55,6 +55,7 @@ windows-sys = { version = "0.61.2", features = [
      "Win32_System_Diagnostics_ToolHelp",
      "Win32_System_Console",
      "Win32_System_JobObjects",

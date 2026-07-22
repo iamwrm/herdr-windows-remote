@@ -1,7 +1,7 @@
-From dc15a7b6ee3669a88c6315473847cac725c01708 Mon Sep 17 00:00:00 2001
+From 6e13ce334c4e133d3366c4e52c42551ae3168191 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Tue, 21 Jul 2026 15:17:03 +0800
-Subject: [PATCH] fix(fork): preserve VS Code windows for hcode opens
+Subject: [PATCH 16/16] fix(fork): preserve VS Code windows for hcode opens
 
 ---
  src/client/code_open.rs | 32 +++++++++++++++++++++++---------

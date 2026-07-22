@@ -7,7 +7,7 @@ pending
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 **Deliverable:** patches `patches/herdr/0006-*` … `0011-*` and `0013-*` …
 `0014-*` (`0012` belongs to i0004) + the deb1 network-simulation harness below
-**Implementation base:** `v0.7.4` (`50aaa2e`), stacked on the i0001 series
+**Implementation base:** `v0.7.5` (`ef4c23f`), stacked on the i0001 series
 (0001–0005)
 
 ## Goal
@@ -231,11 +231,13 @@ printable characters (and backspace) into a shell/editor.
   byte-for-byte.
 - **As landed (`0010`):** `src/client/screen_model.rs` — instead of a full
   libghostty-vt integration, a dedicated parser for `BlitEncoder`'s narrow
-  vocabulary (no scrolling, no relative motion; every cell write is
-  CUP-prefixed, so a printable run between escapes is exactly one cell).
-  Tracks symbols, plain-vs-styled pen, hyperlinks, cursor, and reports
-  touched cells. Validated by round-trip tests against real `BlitEncoder`
-  output (full + diff frames, wide chars, hyperlinks).
+  vocabulary (no scrolling or relative motion; cell runs start with CUP).
+  Upstream v0.7.5 may batch width-1 ASCII cells and append one non-ASCII cell
+  to the same run; the model replays the ASCII prefix cell-by-cell and the
+  remaining grapheme separately. It tracks symbols, plain-vs-styled pen,
+  hyperlinks, cursor, and touched cells. Round-trip tests cover real
+  `BlitEncoder` full and diff frames, contiguous and mixed runs, wide chars,
+  and hyperlinks.
 - **As landed (`0011`):** `src/client/predict.rs` — `remote.predictive_echo
   = "off"|"auto"|"always"` (default `auto`), env `HERDR_PREDICTIVE_ECHO`.
   Conservatism as shipped: width-1 printable chars only (±shift), max 8
@@ -409,9 +411,9 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: all patches through `0015` `git am` onto a fresh `v0.7.4` worktree and
-  reproduce the working tree exactly (only the fork-era CI workflow file,
-  deliberately outside the series, differs).
+- Clean-room: the complete 16-patch series `git am` applies to a fresh
+  `v0.7.5` worktree and reproduces the refreshed implementation tree exactly;
+  the fork-era CI workflow remains deliberately outside the series.
 
 Still pending (record results in the check log):
 
@@ -453,3 +455,11 @@ Still pending (record results in the check log):
   repair, atomic frame correction, contiguous protocol writes, and Windows
   console-event batching. Clippy, 164 client tests, 51 wire tests, and a
   clean-room 14-patch apply are green; live high-RTT retest pending.
+- 2026-07-22: refreshed the complete stack onto `v0.7.5` / protocol 17.
+  Upstream now batches adjacent terminal-diff cells, so patch `0010`'s screen
+  model was updated to replay contiguous ASCII and mixed ASCII/Unicode runs
+  correctly; regression tests cover both shapes. Clippy is clean, and the
+  filtered suites pass: remote 75, client 166, Windows 126, client transport 21,
+  config 128,
+  and wire 51. The 16-patch clean-room apply reproduces the implementation
+  tree; the nine known test-only unused-code/import warnings remain.

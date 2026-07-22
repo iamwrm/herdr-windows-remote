@@ -1,7 +1,7 @@
-From 3207f97e4f20a488b44824af2945517877a7649f Mon Sep 17 00:00:00 2001
+From e1226e8051f7f0bcbcf6dfa11a1ae6ebc287e2c3 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:18:20 +0800
-Subject: [PATCH 07/11] perf(remote): gather all setup probes in one ssh round
+Subject: [PATCH 07/16] perf(remote): gather all setup probes in one ssh round
  trip, cache verified path
 
 Attach previously ran 4-5 sequential ssh commands before the bridge could
@@ -26,9 +26,9 @@ ssh transport errors always propagate.
 Install/restart flows keep their existing live probes and prompts.
 ---
  src/remote.rs          |   1 +
- src/remote/launcher.rs | 321 ++++++++-----------------
- src/remote/probe.rs    | 514 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 615 insertions(+), 221 deletions(-)
+ src/remote/launcher.rs | 323 ++++++++------------------
+ src/remote/probe.rs    | 516 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 617 insertions(+), 223 deletions(-)
  create mode 100644 src/remote/probe.rs
 
 diff --git a/src/remote.rs b/src/remote.rs
@@ -44,7 +44,7 @@ index 6186d83..f6c395e 100644
  #[cfg(unix)]
  mod unix;
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index 0840ecd..c3e7190 100644
+index dc20501..05dc503 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -15,6 +15,7 @@ use serde::Deserialize;
@@ -202,7 +202,7 @@ index 0840ecd..c3e7190 100644
          stop_after_install_approved = confirm_remote_install_with_running_server(
              ssh,
              status_probe_herdr,
-@@ -685,139 +725,10 @@ fn prepare_remote_herdr(
+@@ -685,140 +725,10 @@ fn prepare_remote_herdr(
          remote_herdr,
          installed_or_replaced: true,
          stop_after_install_approved,
@@ -297,6 +297,7 @@ index 0840ecd..c3e7190 100644
 -    script.push_str(
 -        r#"if [ -n "$home" ]; then
 -    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
+-    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
 -    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
 -    emit "$home/.nix-profile/bin/herdr"
 -fi
@@ -343,7 +344,7 @@ index 0840ecd..c3e7190 100644
  fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<RemoteHerdr> {
      let path = path.trim();
      if !path.starts_with('/') {
-@@ -981,8 +892,20 @@ fn ensure_remote_server_ready(
+@@ -982,8 +892,20 @@ fn ensure_remote_server_ready(
      remote_binary_changed: bool,
      stop_after_install_approved: bool,
      live_handoff_enabled: bool,
@@ -365,7 +366,7 @@ index 0840ecd..c3e7190 100644
      let RemoteServerStatus::Running {
          version,
          protocol,
-@@ -1217,6 +1140,11 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
+@@ -1218,6 +1140,11 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
      serde_json::from_str(status).ok()
  }
  
@@ -377,7 +378,7 @@ index 0840ecd..c3e7190 100644
  fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatus> {
      let parsed: RemoteServerStatusJson = serde_json::from_str(status).map_err(|err| {
          io::Error::other(format!(
-@@ -1609,7 +1537,7 @@ fn reattach_command(
+@@ -1610,7 +1537,7 @@ fn reattach_command(
      command
  }
  
@@ -386,7 +387,7 @@ index 0840ecd..c3e7190 100644
      if !value.is_empty()
          && value.chars().all(|ch| {
              ch.is_ascii_alphanumeric()
-@@ -1625,7 +1553,7 @@ fn shell_quote(value: &str) -> String {
+@@ -1626,7 +1553,7 @@ fn shell_quote(value: &str) -> String {
      format!("'{}'", value.replace('\'', "'\\''"))
  }
  
@@ -395,7 +396,7 @@ index 0840ecd..c3e7190 100644
      let stderr = String::from_utf8_lossy(&output.stderr);
      let stderr = stderr.trim();
      if stderr.is_empty() {
-@@ -1987,8 +1915,8 @@ mod tests {
+@@ -1988,8 +1915,8 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -406,7 +407,7 @@ index 0840ecd..c3e7190 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2003,8 +1931,7 @@ mod tests {
+@@ -2004,8 +1931,7 @@ mod tests {
              arch: "x86_64",
          });
          let remote_herdr =
@@ -416,7 +417,7 @@ index 0840ecd..c3e7190 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2019,8 +1946,7 @@ mod tests {
+@@ -2020,8 +1946,7 @@ mod tests {
              arch: "aarch64",
          });
          let remote_herdr =
@@ -426,7 +427,7 @@ index 0840ecd..c3e7190 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2029,75 +1955,29 @@ mod tests {
+@@ -2030,76 +1955,29 @@ mod tests {
          assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
      }
  
@@ -488,6 +489,7 @@ index 0840ecd..c3e7190 100644
 -        assert!(
 -            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
 -        );
+-        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
 -        assert!(script.contains(
 -            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
 -        ));
@@ -513,7 +515,7 @@ index 0840ecd..c3e7190 100644
      #[test]
      fn remote_path_discovery_quotes_single_quotes_in_discovered_binary() {
          let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
-@@ -2105,8 +1985,7 @@ mod tests {
+@@ -2107,8 +1985,7 @@ mod tests {
              arch: "x86_64",
          });
          let remote_herdr =
@@ -523,7 +525,7 @@ index 0840ecd..c3e7190 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2120,7 +1999,7 @@ mod tests {
+@@ -2122,7 +1999,7 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -532,7 +534,7 @@ index 0840ecd..c3e7190 100644
  
          assert!(remote_herdr.is_none());
      }
-@@ -2131,7 +2010,7 @@ mod tests {
+@@ -2133,7 +2010,7 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -543,10 +545,10 @@ index 0840ecd..c3e7190 100644
      }
 diff --git a/src/remote/probe.rs b/src/remote/probe.rs
 new file mode 100644
-index 0000000..1075ba4
+index 0000000..5f06d92
 --- /dev/null
 +++ b/src/remote/probe.rs
-@@ -0,0 +1,514 @@
+@@ -0,0 +1,516 @@
 +//! Combined remote setup probe (i0002 W2).
 +//!
 +//! The launcher historically ran 4–5 sequential ssh commands before the
@@ -752,6 +754,7 @@ index 0000000..1075ba4
 +esac
 +if [ -n "${HOME:-}" ]; then
 +    probe "$HOME/.local/share/mise/installs/herdr/$version/bin/herdr" candidate
++    probe "$HOME/.local/share/mise/installs/herdr/$version/herdr" candidate
 +    probe "$HOME/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr" candidate
 +    probe "$HOME/.nix-profile/bin/herdr" candidate
 +fi
@@ -1011,6 +1014,7 @@ index 0000000..1075ba4
 +        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
 +        assert!(script
 +            .contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/bin/herdr\""));
++        assert!(script.contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/herdr\""));
 +        assert!(script.contains(
 +            "probe \"$HOME/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
 +        ));

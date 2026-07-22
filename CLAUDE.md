@@ -21,8 +21,9 @@ follow the release runbook in `docs/i0001_windows-remote.md`.
 - Preserve `fetch-depth: 5` (or greater) on the repository checkout. Release
   note generation requires up to five commits to be available locally.
 - Continue to fetch upstream herdr from the release tag in
-  `patches/herdr/BASE`, then apply `patches/herdr/*.patch` in lexical order.
-  Do not build from upstream `master`.
+  `patches/herdr/BASE`, verify its peeled commit against
+  `patches/herdr/BASE_COMMIT`, then apply `patches/herdr/*.patch` in lexical
+  order. Do not build from upstream `master`.
 - Avoid noisy but preventable Git warnings. In particular, fetch annotated
   upstream tags explicitly rather than shallow-cloning with `--branch`.
 - Before committing workflow changes, run:
@@ -86,7 +87,8 @@ After every numbered release:
 - View it by explicit tag (`gh release view <tag>`); the default lookup may
   omit prereleases.
 - Confirm the release target and `BUILD_INFO.txt` `repo_commit` equal
-  `git rev-parse <tag>`.
+  `git rev-parse <tag>`, and `BUILD_INFO.txt` `upstream_commit` equals
+  `patches/herdr/BASE_COMMIT`.
 - Confirm `herdr-windows-x86_64.exe`, `hcode`, and `BUILD_INFO.txt` are present.
 - Confirm the workflow conclusion is `success`, check-run annotations are
   empty, and logs contain no warning/deprecation messages.

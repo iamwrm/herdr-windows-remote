@@ -1,7 +1,7 @@
-From 030f37cde4326f81603cd4e4fb2e466745c6ede9 Mon Sep 17 00:00:00 2001
+From 065703eed7d30e70d57eab57f4f92056dc9807a1 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Wed, 15 Jul 2026 19:13:59 +0800
-Subject: [PATCH 1/5] feat(windows): support herdr --remote from the native
+Subject: [PATCH 01/16] feat(windows): support herdr --remote from the native
  Windows binary
 
 Port the remote thin-client launcher to Windows:
@@ -31,19 +31,19 @@ scrollback restore.
  src/main.rs            |    1 -
  src/platform/mod.rs    |    4 +-
  src/remote.rs          |  156 +-
- src/remote/launcher.rs | 2528 +++++++++++++++++++++++++++++++
- src/remote/unix.rs     | 3250 +++++-----------------------------------
+ src/remote/launcher.rs | 2530 +++++++++++++++++++++++++++++++
+ src/remote/unix.rs     | 3252 +++++-----------------------------------
  src/remote/windows.rs  |  366 +++++
  src/update.rs          |    1 -
- 9 files changed, 3303 insertions(+), 3016 deletions(-)
+ 9 files changed, 3305 insertions(+), 3018 deletions(-)
  create mode 100644 src/remote/launcher.rs
  create mode 100644 src/remote/windows.rs
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 90a73ec..73b4009 100644
+index 011de93..be4e5dc 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -659,7 +659,6 @@ fn requested_render_encoding() -> RenderEncoding {
+@@ -663,7 +663,6 @@ fn requested_render_encoding() -> RenderEncoding {
      }
  }
  
@@ -51,7 +51,7 @@ index 90a73ec..73b4009 100644
  fn is_remote_client_process() -> bool {
      std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
  }
-@@ -672,11 +671,9 @@ fn is_remote_client_process() -> bool {
+@@ -676,11 +675,9 @@ fn is_remote_client_process() -> bool {
  /// window; on a high-latency link that easily exceeds 5s, so it gets a far
  /// larger budget. See issue #753.
  const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -95,7 +95,7 @@ index c293a27..ce164b0 100644
  
      let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/main.rs b/src/main.rs
-index 1e44b05..8bd2d57 100644
+index a73423b..7befae9 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -58,7 +58,6 @@ mod agent_resume;
@@ -107,10 +107,10 @@ index 1e44b05..8bd2d57 100644
  mod cli;
  mod client;
 diff --git a/src/platform/mod.rs b/src/platform/mod.rs
-index e396966..ef09330 100644
+index fbde21b..8647ef1 100644
 --- a/src/platform/mod.rs
 +++ b/src/platform/mod.rs
-@@ -43,7 +43,9 @@ pub(crate) struct PlatformCapabilities {
+@@ -53,7 +53,9 @@ pub(crate) struct PlatformCapabilities {
  pub(crate) const fn capabilities() -> PlatformCapabilities {
      PlatformCapabilities {
          live_handoff: cfg!(unix),
@@ -119,8 +119,8 @@ index e396966..ef09330 100644
 +        // ssh stdio); Unix has it natively.
 +        remote_attach: cfg!(any(unix, windows)),
          direct_terminal_attach: cfg!(unix),
+         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
      }
- }
 diff --git a/src/remote.rs b/src/remote.rs
 index ce4ca91..6186d83 100644
 --- a/src/remote.rs
@@ -293,10 +293,10 @@ index ce4ca91..6186d83 100644
      if is_remote_auth_error(err) {
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
 new file mode 100644
-index 0000000..e39c1ff
+index 0000000..ffe9906
 --- /dev/null
 +++ b/src/remote/launcher.rs
-@@ -0,0 +1,2528 @@
+@@ -0,0 +1,2530 @@
 +//! Remote thin-client launcher over SSH command stdio.
 +//!
 +//! Platform-neutral: the pieces that differ between Unix and Windows (the
@@ -1030,6 +1030,7 @@ index 0000000..e39c1ff
 +    script.push_str(
 +        r#"if [ -n "$home" ]; then
 +    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
++    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
 +    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
 +    emit "$home/.nix-profile/bin/herdr"
 +fi
@@ -1657,7 +1658,7 @@ index 0000000..e39c1ff
 +
 +    let dir = private_download_dir(&asset_key)?;
 +    let path = dir.join("herdr.tmp");
-+    let status = Command::new("curl")
++    let status = crate::noninteractive_process::curl_command()
 +        .args(["-sfL", "--max-time", "120", "-o"])
 +        .arg(&path)
 +        .arg(&asset.url)
@@ -1681,7 +1682,7 @@ index 0000000..e39c1ff
 +}
 +
 +fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
-+    let output = Command::new("curl")
++    let output = crate::noninteractive_process::curl_command()
 +        .args([
 +            "-sfL",
 +            "--retry",
@@ -2331,6 +2332,7 @@ index 0000000..e39c1ff
 +        assert!(
 +            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
 +        );
++        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
 +        assert!(script.contains(
 +            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
 +        ));
@@ -2826,7 +2828,7 @@ index 0000000..e39c1ff
 +    }
 +}
 diff --git a/src/remote/unix.rs b/src/remote/unix.rs
-index 7544585..70fe163 100644
+index 813091b..70fe163 100644
 --- a/src/remote/unix.rs
 +++ b/src/remote/unix.rs
 @@ -1,194 +1,87 @@
@@ -3082,7 +3084,7 @@ index 7544585..70fe163 100644
  }
  
  pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
-@@ -238,2765 +131,408 @@ fn ensure_remote_server_running() -> io::Result<()> {
+@@ -238,2767 +131,408 @@ fn ensure_remote_server_running() -> io::Result<()> {
      crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
  }
  
@@ -3823,6 +3825,7 @@ index 7544585..70fe163 100644
 -    script.push_str(
 -        r#"if [ -n "$home" ]; then
 -    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
+-    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
 -    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
 -    emit "$home/.nix-profile/bin/herdr"
 -fi
@@ -4450,7 +4453,7 @@ index 7544585..70fe163 100644
 -
 -    let dir = private_download_dir(&asset_key)?;
 -    let path = dir.join("herdr.tmp");
--    let status = Command::new("curl")
+-    let status = crate::noninteractive_process::curl_command()
 -        .args(["-sfL", "--max-time", "120", "-o"])
 -        .arg(&path)
 -        .arg(&asset.url)
@@ -4474,7 +4477,7 @@ index 7544585..70fe163 100644
 -}
 -
 -fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
--    let output = Command::new("curl")
+-    let output = crate::noninteractive_process::curl_command()
 -        .args([
 -            "-sfL",
 -            "--retry",
@@ -5520,6 +5523,7 @@ index 7544585..70fe163 100644
 -        assert!(
 -            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
 -        );
+-        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
 -        assert!(script.contains(
 -            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
 -        ));
@@ -6175,7 +6179,7 @@ index 7544585..70fe163 100644
      fn remote_env_lock() -> &'static std::sync::Mutex<()> {
          static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
          LOCK.get_or_init(|| std::sync::Mutex::new(()))
-@@ -3080,20 +616,4 @@ mod tests {
+@@ -3082,20 +616,4 @@ mod tests {
              "expected hashed fallback, got {filename}"
          );
      }
@@ -6569,7 +6573,7 @@ index 0000000..69e9699
 +    }
 +}
 diff --git a/src/update.rs b/src/update.rs
-index 8ef7784..98d3a7a 100644
+index eac917b..9bb764e 100644
 --- a/src/update.rs
 +++ b/src/update.rs
 @@ -1815,7 +1815,6 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {

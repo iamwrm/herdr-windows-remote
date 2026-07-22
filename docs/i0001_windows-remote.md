@@ -3,7 +3,7 @@
 **Status:** implemented and exported; shipped as prerelease Windows binaries
 **Upstream:** `checkouts/herdr` ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 **Deliverable:** five-patch series in `patches/herdr/` (0001–0005) + `.github/workflows/release-windows.yml`; the series continues at 0006–0011 and 0013–0014 under [i0002](i0002_latency_improvements.md) (latency improvements) and at 0012, 0015, and 0016 under [i0004](i0004_vscode-remote-open.md) (`hcode .` → local VS Code Remote-SSH)
-**Implementation base:** upstream release tag `v0.7.4` (`50aaa2e`), pinned in `patches/herdr/BASE`
+**Implementation base:** upstream release tag `v0.7.5` (`ef4c23f`), pinned in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
 
 ## Goal
 
@@ -144,14 +144,15 @@ labelled) for diagnosing slow attaches.
 | herdr | `src/client/input/windows_vti.rs`, `src/client/input.rs` | win32-input-mode paste fix; OSC 10/11 theme forwarding |
 | herdr | `src/pane/terminal.rs` | inverse-cell fallback rendering |
 | herdr | `src/update.rs` | `FORK_BUILD` self-update disable |
-| this repo | `patches/herdr/0001..0005-*.patch`, `patches/herdr/BASE` | durable patch series + pinned base |
-| this repo | `.github/workflows/release-windows.yml` | clone upstream at `BASE` → `git am` → build → release |
+| this repo | `patches/herdr/0001..0005-*.patch`, `patches/herdr/BASE*` | durable patch series + pinned release tag/commit |
+| this repo | `.github/workflows/release-windows.yml` | fetch `BASE`, verify `BASE_COMMIT` → `git am` → build → release |
 
 ## Known limitations / non-goals
 
-- no ssh multiplexing (setup makes ~4–6 ssh connections; slower, needs
-  agent-loaded keys)
-- keystroke pump adds ≤10 ms poll latency
+- no ssh multiplexing on Windows; the happy path uses one combined setup probe
+  plus the persistent bridge, and any additional path still opens fresh ssh
+  connections (keep your key in `ssh-agent`)
+- the bridge pump is event-driven, but normal ssh/TCP transport latency remains
 - `--handoff` untested from Windows
 - `remote-client-bridge` still stubbed on Windows (Windows hosts can't be
   `--remote` *targets* — not needed, the target is Linux)
@@ -171,15 +172,17 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: all five patches apply with `git am` to a fresh worktree at
-  `v0.7.4` and reproduce the exact fork tree (minus the CI workflow)
+- clean-room: the complete 16-patch series applies with `git am` to a fresh
+  worktree at `v0.7.5` and reproduces the implementation tree exactly; the
+  obsolete fork CI workflow remains intentionally outside the series
 
 ## Handoff
 
 ### Release workflow
 
-`.github/workflows/release-windows.yml` builds `x86_64-pc-windows-msvc` with
-upstream's pinned steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
+`.github/workflows/release-windows.yml` verifies the `BASE` tag resolves to
+`BASE_COMMIT`, then builds `x86_64-pc-windows-msvc` with upstream's pinned
+steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 `cargo build --release --locked`) and publishes a prerelease with
 `herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.txt`.
 
@@ -245,8 +248,15 @@ Publish:
 ```bash
 git format-patch vX.Y.Z -o ../../patches/herdr/     # after deleting the old patches
 echo vX.Y.Z > ../../patches/herdr/BASE
-cd ../.. && git add patches && git commit -m "bump base to vX.Y.Z"
-git tag vX.Y.Z-win.1 && git push origin master vX.Y.Z-win.1
+git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
+cd ../.. && git add patches docs && git commit -m "bump base to vX.Y.Z"
+git push origin master
+git fetch origin --prune --tags
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+tag=vX.Y.Z-win.N  # N = highest existing win counter + 1
+git tag "$tag"
+git push origin "$tag"
 gh run watch --exit-status <run-id>
 ```
 
@@ -277,6 +287,11 @@ Watch upstream for native Windows `--remote` support:
 - `v0.7.4` (2026-07-16): still unsupported — `src/` diff vs v0.7.3 is empty
   except the version bump; windows-beta docs still list `herdr --remote` as
   unsupported
+- `v0.7.5` (2026-07-22): still unsupported — Windows beta docs still list
+  native `herdr --remote` as unsupported. Upstream protocol advanced from 16
+  to 17 and matches `https://herdr.dev/latest.json`; the patch stack was
+  refreshed onto the release tag, preserving upstream's new mise install path
+  discovery and hidden-console curl spawning
 
 Once upstream supports it: switch back to official binaries
 (`irm https://herdr.dev/install.ps1 | iex`), delete this repo's releases/tags,

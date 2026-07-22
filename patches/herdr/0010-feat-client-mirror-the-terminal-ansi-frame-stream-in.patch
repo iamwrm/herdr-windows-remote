@@ -1,7 +1,7 @@
-From c881fe15ff6e1b3821a55caba2aab286465912cb Mon Sep 17 00:00:00 2001
+From 14bec97adf6f4be845b82681d03c694194afa97a Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:52:11 +0800
-Subject: [PATCH 10/11] feat(client): mirror the terminal-ansi frame stream in
+Subject: [PATCH 10/16] feat(client): mirror the terminal-ansi frame stream in
  a screen model
 
 Predictive local echo (i0002 W3) needs the terminal-ansi client to know
@@ -22,12 +22,12 @@ and diff frames, wide chars, hyperlinks, hidden cursor). Not wired into
 the client loop yet; the prediction engine lands separately.
 ---
  src/client/mod.rs          |   1 +
- src/client/screen_model.rs | 475 +++++++++++++++++++++++++++++++++++++
- 2 files changed, 476 insertions(+)
+ src/client/screen_model.rs | 528 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 529 insertions(+)
  create mode 100644 src/client/screen_model.rs
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 94e30e2..4de1f2c 100644
+index bba011b..7869ca3 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -14,6 +14,7 @@
@@ -40,10 +40,10 @@ index 94e30e2..4de1f2c 100644
  use std::io::{self, BufRead, Write as _};
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
 new file mode 100644
-index 0000000..4b0ba4a
+index 0000000..c8d454f
 --- /dev/null
 +++ b/src/client/screen_model.rs
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,528 @@
 +//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
 +//!
 +//! Terminal-ansi clients normally blit server frame bytes to stdout without
@@ -52,11 +52,10 @@ index 0000000..4b0ba4a
 +//! received `TerminalFrame` into a cell grid.
 +//!
 +//! The frame stream is produced exclusively by `protocol::render_ansi::
-+//! BlitEncoder`, whose output vocabulary is small and, crucially, contains
-+//! **no scrolling and no relative cursor motion**: every cell write is
-+//! preceded by an absolute `CUP`, so any run of printable text between two
-+//! escape sequences is exactly one cell's grapheme cluster. The parser below
-+//! handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
++//! BlitEncoder`, whose output vocabulary is small and contains **no scrolling
++//! and no relative cursor motion**. Cell runs begin at an absolute `CUP`;
++//! a width-1 ASCII cell may let the following cell continue inline. The parser
++//! below handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
 +//! visibility, `?2026 h/l` sync markers, DECSCUSR, OSC (hyperlinks,
 +//! clipboard) and APC (Kitty graphics) passthrough — and ignores everything
 +//! else. Round-trip tests validate the model against `BlitEncoder` output of
@@ -266,8 +265,9 @@ index 0000000..4b0ba4a
 +        }
 +    }
 +
-+    /// Consumes one printable run. The encoder emits a CUP before every cell,
-+    /// so the whole run is a single cell's grapheme cluster.
++    /// Consumes one printable run. The encoder batches a leading sequence of
++    /// width-1 ASCII cells and may append one non-ASCII grapheme without
++    /// another CUP because inline eligibility is decided by the previous cell.
 +    fn apply_text_run(
 +        &mut self,
 +        bytes: &[u8],
@@ -278,8 +278,17 @@ index 0000000..4b0ba4a
 +        while end < bytes.len() && bytes[end] != 0x1b && bytes[end] >= 0x20 && bytes[end] != 0x7f {
 +            end += 1;
 +        }
-+        let symbol = String::from_utf8_lossy(&bytes[start..end]).into_owned();
-+        self.write_symbol(symbol, touched);
++        let run = &bytes[start..end];
++        let ascii_prefix_len = run.iter().take_while(|byte| byte.is_ascii()).count();
++        for byte in &run[..ascii_prefix_len] {
++            self.write_symbol(char::from(*byte).to_string(), touched);
++        }
++        if ascii_prefix_len < run.len() {
++            self.write_symbol(
++                String::from_utf8_lossy(&run[ascii_prefix_len..]).into_owned(),
++                touched,
++            );
++        }
 +        end
 +    }
 +
@@ -422,6 +431,50 @@ index 0000000..4b0ba4a
 +
 +        let model = replay(&[first, second.clone()]);
 +        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn contiguous_ascii_diff_updates_each_cell() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![plain_cell("a"), plain_cell("b"), plain_cell("c"), plain_cell(" ")],
++            (3, 0),
++        );
++        let model = replay(&[first, second.clone()]);
++
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn ascii_prefix_and_wide_cell_in_one_run_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let mut second_cells = vec![plain_cell(" "); 4];
++        second_cells[0] = plain_cell("a");
++        second_cells[1] = plain_cell("你");
++        second_cells[2] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("a你"),
++            "test must exercise one mixed printable run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
 +    }
 +
 +    #[test]

@@ -1,7 +1,7 @@
-From 0429549ab23558f2820d2b162dd24d50a2aa79c8 Mon Sep 17 00:00:00 2001
+From 2bc8c99e1597b5dd051be172c529327789c9c545 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 17:20:13 +0800
-Subject: [PATCH 13/14] fix(client): reconcile predictive echo on cursor-only
+Subject: [PATCH 13/16] fix(client): reconcile predictive echo on cursor-only
  frames
 
 ---
@@ -11,10 +11,10 @@ Subject: [PATCH 13/14] fix(client): reconcile predictive echo on cursor-only
  3 files changed, 558 insertions(+), 114 deletions(-)
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 5f9aef4..497e6e9 100644
+index 135da3a..6c80bc0 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -1495,9 +1495,11 @@ async fn run_client_loop(
+@@ -1499,9 +1499,11 @@ async fn run_client_loop(
                      }
                      continue;
                  }
@@ -29,7 +29,7 @@ index 5f9aef4..497e6e9 100644
                  let msg = ClientMessage::Input { data };
                  if let Err(e) = write_to_server(&mut write_stream, &msg) {
                      return Err(ClientError::ConnectionLost(e));
-@@ -1519,9 +1521,11 @@ async fn run_client_loop(
+@@ -1523,9 +1525,11 @@ async fn run_client_loop(
                  ) {
                      state.request_full_redraw();
                  }
@@ -44,7 +44,7 @@ index 5f9aef4..497e6e9 100644
                  let probe_input = events.iter().any(echo_timing::is_key_or_paste_event);
                  let msg = ClientMessage::InputEvents { events };
                  if let Err(e) = write_to_server(&mut write_stream, &msg) {
-@@ -1543,9 +1547,11 @@ async fn run_client_loop(
+@@ -1547,9 +1551,11 @@ async fn run_client_loop(
              }
              ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                  state.reported_size = (new_cols, new_rows);
@@ -59,7 +59,7 @@ index 5f9aef4..497e6e9 100644
                  let msg = ClientMessage::Resize {
                      cols: new_cols,
                      rows: new_rows,
-@@ -1586,13 +1592,17 @@ async fn run_client_loop(
+@@ -1590,13 +1596,17 @@ async fn run_client_loop(
                      if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
                          record_received_kitty_graphics(&frame.bytes);
                      }
@@ -83,7 +83,7 @@ index 5f9aef4..497e6e9 100644
                  }
                  ServerMessage::Graphics { bytes } => {
                      if state.kitty_graphics_enabled {
-@@ -1665,7 +1675,13 @@ async fn run_client_loop(
+@@ -1669,7 +1679,13 @@ async fn run_client_loop(
                      "server closed connection",
                  )));
              }
@@ -98,7 +98,7 @@ index 5f9aef4..497e6e9 100644
          }
      }
  
-@@ -2028,6 +2044,73 @@ fn write_window_title(title: Option<&str>) {
+@@ -2032,6 +2048,73 @@ fn write_window_title(title: Option<&str>) {
  // Frame output
  // ---------------------------------------------------------------------------
  
@@ -172,7 +172,7 @@ index 5f9aef4..497e6e9 100644
  fn write_encoded_frame_with_graphics(
      mut writer: impl io::Write,
      encoded: &[u8],
-@@ -2439,6 +2522,51 @@ mod tests {
+@@ -2443,6 +2526,51 @@ mod tests {
          assert_eq!(output, b"text");
      }
  
@@ -948,10 +948,10 @@ index d4474ce..9ca1289 100644
      }
  }
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
-index 6432df0..53cf304 100644
+index 7018447..5714992 100644
 --- a/src/client/screen_model.rs
 +++ b/src/client/screen_model.rs
-@@ -450,6 +450,28 @@ mod tests {
+@@ -503,6 +503,28 @@ mod tests {
          assert_eq!(touched, vec![(2, 0)], "diff frame touches only the change");
      }
  

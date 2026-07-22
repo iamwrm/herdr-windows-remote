@@ -7,7 +7,7 @@ deb1 request transport verification complete
 **Deliverable:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
 `patches/herdr/0016-*`, [`extras/remote-bin/hcode`](../extras/remote-bin/hcode),
 and the `hcode` release asset
-**Implementation base:** `v0.7.4` (`50aaa2e`), stacked on patches `0001`–`0011`
+**Implementation base:** `v0.7.5` (`ef4c23f`), stacked on patches `0001`–`0011`
 
 ## Goal
 
@@ -187,17 +187,16 @@ This is intentionally not a general remote-to-local command execution mechanism.
 Completed on Windows with Zig 0.15.2:
 
 - `cargo clippy --bin herdr -- -D warnings` — clean;
-- `cargo test --bin herdr client::` — 148 passed after the platform URL-opener refactor;
+- `cargo test --bin herdr client::` — 166 passed;
 - `cargo test --bin herdr remote::` — 75 passed;
-- `cargo test --bin herdr windows_` — 121 passed;
-- `cargo test --bin herdr server::client_transport::tests` — 19 passed;
-- `cargo test --bin herdr config::` — 121 passed;
+- `cargo test --bin herdr windows_` — 126 passed;
+- `cargo test --bin herdr server::client_transport::tests` — 21 passed;
+- `cargo test --bin herdr config::` — 128 passed;
 - focused `client::code_open::tests` — 15 passed after patch `0016`, including URL encoding, folder/file new-window fallbacks, validation/rate limiting, and disabled-request consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all 16 patches applied with `git am` to a fresh `v0.7.4`
-  worktree; `src/` exactly matches the implementation checkout (the only
-  whole-tree difference is the known fork-era CI workflow intentionally
-  excluded from the series);
+- clean-room: all 16 patches applied with `git am` to a fresh `v0.7.5`
+  worktree and exactly match the implementation checkout; the known fork-era
+  CI workflow is intentionally excluded from both;
 - `git diff --check` — clean.
 
 Test binaries report nine pre-existing test-only unused-code/import warnings; production clippy with warnings denied is clean.

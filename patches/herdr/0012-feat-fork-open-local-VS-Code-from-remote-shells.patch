@@ -1,7 +1,7 @@
-From 49626b315051609cc8c9beaecfcc1e892bae28d5 Mon Sep 17 00:00:00 2001
+From 3a6b080fcf9a92cebfb3c0618186554c97693eed Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 13:40:45 +0800
-Subject: [PATCH] feat(fork): open local VS Code from remote shells
+Subject: [PATCH 12/16] feat(fork): open local VS Code from remote shells
 
 ---
  src/client/code_open.rs | 419 ++++++++++++++++++++++++++++++++++++++++
@@ -438,7 +438,7 @@ index 0000000..14a593c
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 9d3432b..5f9aef4 100644
+index 6b1f767..135da3a 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,6 +12,7 @@
@@ -449,7 +449,7 @@ index 9d3432b..5f9aef4 100644
  mod echo_timing;
  mod input;
  mod predict;
-@@ -57,6 +58,9 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
+@@ -58,6 +59,9 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
  struct ClientLoopConfig {
      /// `remote.predictive_echo` setting ("off" | "auto" | "always").
      predictive_echo: String,
@@ -459,7 +459,7 @@ index 9d3432b..5f9aef4 100644
      sound_config: crate::config::SoundConfig,
      mouse_scroll_lines: usize,
      redraw_on_focus_gained: bool,
-@@ -1132,6 +1136,7 @@ fn run_client_with_mode(
+@@ -1136,6 +1140,7 @@ fn run_client_with_mode(
          loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
      let loop_config = ClientLoopConfig {
          predictive_echo: loaded_config.config.remote.predictive_echo.clone(),
@@ -467,7 +467,7 @@ index 9d3432b..5f9aef4 100644
          sound_config: loaded_config.config.ui.sound,
          mouse_scroll_lines,
          redraw_on_focus_gained,
-@@ -1304,6 +1309,10 @@ async fn run_client_loop(
+@@ -1308,6 +1313,10 @@ async fn run_client_loop(
          None
      };
  
@@ -478,7 +478,7 @@ index 9d3432b..5f9aef4 100644
      let mut state = ClientState {
          blit_encoder: render_ansi::BlitEncoder::new(),
          mouse_capture_active: config.mouse_capture_active,
-@@ -1604,8 +1613,15 @@ async fn run_client_loop(
+@@ -1608,8 +1617,15 @@ async fn run_client_loop(
                      handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                  }
                  ServerMessage::Clipboard { data } => {
@@ -497,10 +497,10 @@ index 9d3432b..5f9aef4 100644
                  ServerMessage::WindowTitle { title } => {
                      write_window_title(title.as_deref());
 diff --git a/src/config/model.rs b/src/config/model.rs
-index beec62e..1fe281b 100644
+index 5e61fc9..552213b 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -874,6 +874,12 @@ pub struct RemoteConfig {
+@@ -878,6 +878,12 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
@@ -513,7 +513,7 @@ index beec62e..1fe281b 100644
  }
  
  impl Default for RemoteConfig {
-@@ -882,6 +888,7 @@ impl Default for RemoteConfig {
+@@ -886,6 +892,7 @@ impl Default for RemoteConfig {
              manage_ssh_config: true,
              tcp_relay: false,
              predictive_echo: "auto".to_string(),
@@ -521,7 +521,7 @@ index beec62e..1fe281b 100644
          }
      }
  }
-@@ -1541,6 +1548,20 @@ mouse_scroll_lines = 0
+@@ -1573,6 +1580,20 @@ mouse_scroll_lines = 0
          assert!(toml::from_str::<Config>(toml).is_err());
      }
  
@@ -555,7 +555,7 @@ index 6f5de59..b632a6e 100644
  pub(crate) use tcp_relay::run_remote_tcp_relay;
  
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index e4853b9..730e0ce 100644
+index 627dbc6..fb90fe2 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -68,6 +68,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";

@@ -1,7 +1,7 @@
-From c9cdd3fc40ef95f21aa90b2d257e47dfd32c8121 Mon Sep 17 00:00:00 2001
+From 191d6ff43b04b557f292fe21e2ec0b6fdc667cef Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:09:55 +0800
-Subject: [PATCH 06/11] feat(fork): add HERDR_ECHO_TIMING keystroke-echo
+Subject: [PATCH 06/16] feat(fork): add HERDR_ECHO_TIMING keystroke-echo
  latency probe
 
 Env-gated client-side probe measuring input-to-frame echo latency for
@@ -229,7 +229,7 @@ index 0000000..476f39a
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 6f9d7b8..94e30e2 100644
+index 6b6c621..bba011b 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,6 +12,7 @@
@@ -240,7 +240,7 @@ index 6f9d7b8..94e30e2 100644
  mod input;
  
  use std::collections::HashSet;
-@@ -1301,6 +1302,7 @@ async fn run_client_loop(
+@@ -1305,6 +1306,7 @@ async fn run_client_loop(
          draw_host_cursor,
      };
      debug!(?negotiated_encoding, "client render encoding active");
@@ -248,7 +248,7 @@ index 6f9d7b8..94e30e2 100644
      let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
  
      // Channel for events from the stdin, resize, and server reader threads.
-@@ -1471,6 +1473,7 @@ async fn run_client_loop(
+@@ -1475,6 +1477,7 @@ async fn run_client_loop(
                  if let Err(e) = write_to_server(&mut write_stream, &msg) {
                      return Err(ClientError::ConnectionLost(e));
                  }
@@ -256,7 +256,7 @@ index 6f9d7b8..94e30e2 100644
              }
              #[cfg(windows)]
              ClientLoopEvent::StdinEvents(events) => {
-@@ -1487,10 +1490,14 @@ async fn run_client_loop(
+@@ -1491,10 +1494,14 @@ async fn run_client_loop(
                  ) {
                      state.request_full_redraw();
                  }
@@ -271,7 +271,7 @@ index 6f9d7b8..94e30e2 100644
              }
              #[cfg(windows)]
              ClientLoopEvent::StdinThemeReport(data) => {
-@@ -1538,6 +1545,7 @@ async fn run_client_loop(
+@@ -1542,6 +1549,7 @@ async fn run_client_loop(
                          write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                      let _ = stdout.flush();
                      state.blit_encoder.commit(frame_data, encoded);
@@ -279,7 +279,7 @@ index 6f9d7b8..94e30e2 100644
                  }
                  ServerMessage::Terminal(frame) => {
                      if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
-@@ -1546,6 +1554,7 @@ async fn run_client_loop(
+@@ -1550,6 +1558,7 @@ async fn run_client_loop(
                      let mut stdout = io::stdout();
                      let _ = stdout.write_all(&frame.bytes);
                      let _ = stdout.flush();

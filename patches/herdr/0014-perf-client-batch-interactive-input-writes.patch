@@ -1,7 +1,7 @@
-From 981ebaad09aa97ad9ac72351eb5e43152d66605b Mon Sep 17 00:00:00 2001
+From ef0051a294707ead77b3eb36d9157ba226b2e01f Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 17:20:20 +0800
-Subject: [PATCH 14/14] perf(client): batch interactive input writes
+Subject: [PATCH 14/16] perf(client): batch interactive input writes
 
 ---
  src/client/input/windows_vti.rs | 37 +++++++++++++++++++++++---
@@ -9,7 +9,7 @@ Subject: [PATCH 14/14] perf(client): batch interactive input writes
  2 files changed, 75 insertions(+), 9 deletions(-)
 
 diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
-index 66a1623..d044979 100644
+index 296bb91..d1cdde7 100644
 --- a/src/client/input/windows_vti.rs
 +++ b/src/client/input/windows_vti.rs
 @@ -67,12 +67,14 @@ fn process_platform_input_items(
@@ -31,7 +31,7 @@ index 66a1623..d044979 100644
  }
  
  #[cfg(windows)]
-@@ -1059,6 +1061,33 @@ fn windows_input_trace_enabled() -> bool {
+@@ -1068,6 +1070,33 @@ fn windows_input_trace_enabled() -> bool {
  mod tests {
      use super::*;
  
@@ -66,7 +66,7 @@ index 66a1623..d044979 100644
          WindowsInputRecord::Key(WindowsKeyRecord {
              key_down: true,
 diff --git a/src/protocol/wire.rs b/src/protocol/wire.rs
-index e31f8ff..d5fd799 100644
+index 9cc2924..3c7eabb 100644
 --- a/src/protocol/wire.rs
 +++ b/src/protocol/wire.rs
 @@ -819,19 +819,23 @@ impl From<io::Error> for FramingError {

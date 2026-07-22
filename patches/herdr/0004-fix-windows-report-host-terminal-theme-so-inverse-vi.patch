@@ -1,8 +1,8 @@
-From e90fbcc9cef28ffd613c2e23d4b4c1f26c1d0226 Mon Sep 17 00:00:00 2001
+From f5f9f12dc0d080938aa53b86aa591376651a1346 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 17:57:44 +0800
-Subject: [PATCH 4/5] fix(windows): report host terminal theme so inverse-video
- cells render with real colors
+Subject: [PATCH 04/16] fix(windows): report host terminal theme so
+ inverse-video cells render with real colors
 
 TUIs that draw their cursor as reverse video over default colors (pi,
 and anything else using SGR 7 with a hidden native cursor) showed a
@@ -41,13 +41,13 @@ host scheme's colors (#CCCCCC/#0C0C0C for Campbell) instead of
 white-on-black, confirmed by screenshot pixel sampling.
 ---
  src/client/input.rs             |  12 +++
- src/client/input/windows_vti.rs | 107 +++++++++++++++++++++++++
+ src/client/input/windows_vti.rs | 108 +++++++++++++++++++++++++
  src/client/mod.rs               |  34 ++++++--
  src/pane/terminal.rs            | 136 +++++++++++++++++++++++++++++---
- 4 files changed, 272 insertions(+), 17 deletions(-)
+ 4 files changed, 273 insertions(+), 17 deletions(-)
 
 diff --git a/src/client/input.rs b/src/client/input.rs
-index a49c431..ff27a24 100644
+index 1d55754..f8d6414 100644
 --- a/src/client/input.rs
 +++ b/src/client/input.rs
 @@ -26,6 +26,18 @@ use super::ClientLoopEvent;
@@ -70,7 +70,7 @@ index a49c431..ff27a24 100644
  // Stdin reader thread
  // ---------------------------------------------------------------------------
 diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
-index 89ed707..66a1623 100644
+index 2a74902..296bb91 100644
 --- a/src/client/input/windows_vti.rs
 +++ b/src/client/input/windows_vti.rs
 @@ -36,7 +36,29 @@ pub(super) fn raw_console_reader_loop(
@@ -103,7 +103,7 @@ index 89ed707..66a1623 100644
  }
  
  #[cfg(windows)]
-@@ -195,6 +217,15 @@ struct WindowsInputMapper {
+@@ -194,6 +216,15 @@ struct WindowsInputMapper {
  struct WindowsInputPump {
      framer: crate::raw_input::RawInputFramer,
      paste_from_win32_key_records: bool,
@@ -118,8 +118,16 @@ index 89ed707..66a1623 100644
 +    requery: bool,
  }
  
- #[derive(Clone, Debug, PartialEq, Eq)]
-@@ -300,9 +331,45 @@ impl WindowsInputPump {
+ impl Default for WindowsInputPump {
+@@ -201,6 +232,7 @@ impl Default for WindowsInputPump {
+         Self {
+             framer: crate::raw_input::RawInputFramer::for_host_input(),
+             paste_from_win32_key_records: false,
++            theme_reports: ThemeReportOutbox::default(),
+         }
+     }
+ }
+@@ -308,9 +340,45 @@ impl WindowsInputPump {
          {
              self.paste_from_win32_key_records = false;
          }
@@ -165,7 +173,7 @@ index 89ed707..66a1623 100644
      fn raw_events_to_client_events(
          events: Vec<crate::raw_input::RawInputEvent>,
      ) -> Vec<crate::protocol::ClientInputEvent> {
-@@ -1168,6 +1235,46 @@ mod tests {
+@@ -1176,6 +1244,46 @@ mod tests {
          .collect()
      }
  
@@ -213,10 +221,10 @@ index 89ed707..66a1623 100644
      fn vti_bracketed_paste_records_emit_single_paste() {
          let records = "\x1b[200~alpha\rbravo\rcharlie\x1b[201~"
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 73b4009..6f9d7b8 100644
+index be4e5dc..6b6c621 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -799,6 +799,12 @@ enum ClientLoopEvent {
+@@ -803,6 +803,12 @@ enum ClientLoopEvent {
      /// Structured input events from platforms without Unix-style stdin bytes.
      #[cfg(windows)]
      StdinEvents(Vec<crate::protocol::ClientInputEvent>),
@@ -229,7 +237,7 @@ index 73b4009..6f9d7b8 100644
      /// Terminal resize detected.
      Resize(u16, u16, u32, u32),
      /// Server message received.
-@@ -1486,6 +1492,16 @@ async fn run_client_loop(
+@@ -1490,6 +1496,16 @@ async fn run_client_loop(
                      return Err(ClientError::ConnectionLost(e));
                  }
              }
@@ -246,7 +254,7 @@ index 73b4009..6f9d7b8 100644
              ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                  state.reported_size = (new_cols, new_rows);
                  let msg = ClientMessage::Resize {
-@@ -2111,7 +2127,14 @@ fn query_host_terminal_theme() {
+@@ -2115,7 +2131,14 @@ fn query_host_terminal_theme() {
  }
  
  fn should_query_host_terminal_theme() -> bool {
@@ -262,7 +270,7 @@ index 73b4009..6f9d7b8 100644
  }
  
  fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
-@@ -2422,16 +2445,13 @@ mod tests {
+@@ -2426,16 +2449,13 @@ mod tests {
      }
  
      #[test]
@@ -283,10 +291,10 @@ index 73b4009..6f9d7b8 100644
      }
  
 diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
-index 06cdea3..1c3c353 100644
+index 2c83f8f..e10e90d 100644
 --- a/src/pane/terminal.rs
 +++ b/src/pane/terminal.rs
-@@ -1759,8 +1759,12 @@ impl GhosttyPaneTerminal {
+@@ -1778,8 +1778,12 @@ impl GhosttyPaneTerminal {
              .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
          let default_fg = colors
              .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
@@ -301,7 +309,7 @@ index 06cdea3..1c3c353 100644
          let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
  
          let mut row_iterator = match crate::ghostty::RowIterator::new() {
-@@ -2018,8 +2022,12 @@ fn ghostty_collect_dirty_patch(
+@@ -2037,8 +2041,12 @@ fn ghostty_collect_dirty_patch(
          .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
      let default_fg = colors
          .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
@@ -316,7 +324,7 @@ index 06cdea3..1c3c353 100644
      let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
  
      let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
-@@ -2583,19 +2591,35 @@ fn ghostty_cell_style(
+@@ -2601,19 +2609,35 @@ fn ghostty_cell_style(
      if basic.style.invisible {
          fg = bg.or(default_bg);
      }
@@ -358,7 +366,7 @@ index 06cdea3..1c3c353 100644
      }
  
      let mut style = ghostty_default_style(fg, bg);
-@@ -2621,10 +2645,40 @@ fn ghostty_cell_style(
+@@ -2639,10 +2663,40 @@ fn ghostty_cell_style(
      if basic.style.strikethrough {
          modifiers |= Modifier::CROSSED_OUT;
      }
@@ -399,7 +407,7 @@ index 06cdea3..1c3c353 100644
  #[derive(Debug)]
  enum OrderedPtyResponseEvent {
      DefaultColor(DefaultColorTrackedEvent),
-@@ -5302,6 +5356,68 @@ mod tests {
+@@ -5602,6 +5656,68 @@ mod tests {
          assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
      }
  
