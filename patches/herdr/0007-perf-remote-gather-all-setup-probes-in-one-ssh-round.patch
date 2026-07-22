@@ -1,4 +1,4 @@
-From e1226e8051f7f0bcbcf6dfa11a1ae6ebc287e2c3 Mon Sep 17 00:00:00 2001
+From 999a63069b871bb88c7f4ec5237007f31011e765 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:18:20 +0800
 Subject: [PATCH 07/16] perf(remote): gather all setup probes in one ssh round
@@ -26,9 +26,9 @@ ssh transport errors always propagate.
 Install/restart flows keep their existing live probes and prompts.
 ---
  src/remote.rs          |   1 +
- src/remote/launcher.rs | 323 ++++++++------------------
- src/remote/probe.rs    | 516 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 617 insertions(+), 223 deletions(-)
+ src/remote/launcher.rs | 323 +++++++---------------
+ src/remote/probe.rs    | 596 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 697 insertions(+), 223 deletions(-)
  create mode 100644 src/remote/probe.rs
 
 diff --git a/src/remote.rs b/src/remote.rs
@@ -545,10 +545,10 @@ index dc20501..05dc503 100644
      }
 diff --git a/src/remote/probe.rs b/src/remote/probe.rs
 new file mode 100644
-index 0000000..5f06d92
+index 0000000..dcbc6a3
 --- /dev/null
 +++ b/src/remote/probe.rs
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,596 @@
 +//! Combined remote setup probe (i0002 W2).
 +//!
 +//! The launcher historically ran 4–5 sequential ssh commands before the
@@ -567,6 +567,7 @@ index 0000000..5f06d92
 +use std::path::PathBuf;
 +
 +use serde::{Deserialize, Serialize};
++use sha2::{Digest as _, Sha256};
 +
 +use super::launcher::{
 +    client_status_protocol, command_failed, current_version, sanitize_path_component, shell_quote,
@@ -647,14 +648,8 @@ index 0000000..5f06d92
 +pub(crate) fn probe_remote(ssh: &RemoteSsh) -> io::Result<RemoteProbe> {
 +    if let Some(cached) = load_cache(ssh.target()) {
 +        let output = ssh.sh_output(&fast_probe_script(&cached.path))?;
-+        if output.status.success() {
-+            let mut probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
-+            if probe.complete && probe.matching_candidate().is_some() {
-+                probe.platform = RemotePlatform::from_ids(&cached.os, &cached.arch);
-+                if probe.platform.is_some() {
-+                    return Ok(probe);
-+                }
-+            }
++        if let Some(probe) = cached_probe_from_output(&output, &cached)? {
++            return Ok(probe);
 +        }
 +        remove_cache(ssh.target());
 +    }
@@ -670,6 +665,22 @@ index 0000000..5f06d92
 +        ));
 +    }
 +    Ok(probe)
++}
++
++fn cached_probe_from_output(
++    output: &std::process::Output,
++    cached: &ProbeCacheEntry,
++) -> io::Result<Option<RemoteProbe>> {
++    if !output.status.success() {
++        return Err(command_failed("cached remote probe failed", output));
++    }
++
++    let mut probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
++    if !probe.complete || probe.matching_candidate().is_none() {
++        return Ok(None);
++    }
++    probe.platform = RemotePlatform::from_ids(&cached.os, &cached.arch);
++    Ok(probe.platform.is_some().then_some(probe))
 +}
 +
 +/// Shared shell prelude: the `probe` function runs one binary and emits its
@@ -864,7 +875,9 @@ index 0000000..5f06d92
 +}
 +
 +fn cache_file(target: &str) -> PathBuf {
-+    cache_dir().join(format!("{}.json", sanitize_path_component(target)))
++    let readable_target = sanitize_path_component(target);
++    let target_digest = format!("{:x}", Sha256::digest(target.as_bytes()));
++    cache_dir().join(format!("{readable_target}-{target_digest}.json"))
 +}
 +
 +fn load_cache(target: &str) -> Option<ProbeCacheEntry> {
@@ -1006,6 +1019,46 @@ index 0000000..5f06d92
 +        assert!(!no_status.matches_current());
 +    }
 +
++    fn test_cache_entry() -> ProbeCacheEntry {
++        ProbeCacheEntry {
++            herdr_version: current_version(),
++            path: "/usr/bin/herdr".to_string(),
++            os: "linux".to_string(),
++            arch: "x86_64".to_string(),
++        }
++    }
++
++    fn process_output(command: &str) -> std::process::Output {
++        #[cfg(windows)]
++        let output = std::process::Command::new("cmd")
++            .args(["/D", "/C", command])
++            .output();
++        #[cfg(unix)]
++        let output = std::process::Command::new("sh")
++            .args(["-c", command])
++            .output();
++        output.expect("run test child")
++    }
++
++    #[test]
++    fn cached_probe_transport_failure_propagates_without_fallback() {
++        let output = process_output("exit 255");
++        let error = cached_probe_from_output(&output, &test_cache_entry())
++            .expect_err("ssh-style transport exit must fail");
++        assert!(error.to_string().contains("cached remote probe failed"));
++    }
++
++    #[test]
++    fn successful_stale_cached_probe_requests_full_fallback() {
++        let output = process_output("exit 0");
++        assert!(
++            cached_probe_from_output(&output, &test_cache_entry())
++                .expect("successful probe is parseable")
++                .is_none(),
++            "complete validation failure must fall back to the full probe"
++        );
++    }
++
 +    #[test]
 +    fn full_probe_script_covers_known_install_locations() {
 +        let script = full_probe_script();
@@ -1058,11 +1111,38 @@ index 0000000..5f06d92
 +        assert_eq!(parsed, entry);
 +    }
 +
++    fn cache_file_name(target: &str) -> String {
++        cache_file(target)
++            .file_name()
++            .and_then(|name| name.to_str())
++            .expect("UTF-8 cache filename")
++            .to_string()
++    }
++
 +    #[test]
-+    fn cache_file_name_is_sanitized_per_target() {
-+        let file = cache_file("user@host:22");
-+        let name = file.file_name().and_then(|s| s.to_str()).unwrap_or("");
-+        assert_eq!(name, "user-host-22.json");
++    fn cache_file_name_is_readable_deterministic_and_bounded() {
++        let name = cache_file_name("user@host:22");
++        assert_eq!(name, cache_file_name("user@host:22"));
++        assert!(name.starts_with("user-host-22-"));
++        assert!(name.ends_with(".json"));
++        assert_eq!(name.len(), "user-host-22-".len() + 64 + ".json".len());
++        assert!(name.len() <= 102);
++    }
++
++    #[test]
++    fn cache_file_hashes_the_complete_unsanitized_target() {
++        assert_ne!(
++            cache_file_name("user@host:22"),
++            cache_file_name("user-host:22"),
++            "targets with the same sanitized form must not collide"
++        );
++
++        let shared_prefix = "a".repeat(40);
++        assert_ne!(
++            cache_file_name(&format!("{shared_prefix}-first.example")),
++            cache_file_name(&format!("{shared_prefix}-second.example")),
++            "targets truncated to the same readable prefix must not collide"
++        );
 +    }
 +}
 -- 

@@ -1,4 +1,4 @@
-From 3a6b080fcf9a92cebfb3c0618186554c97693eed Mon Sep 17 00:00:00 2001
+From a2bc55d22d1d2fe81ceb8b27f83ca7c7a36cabea Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 13:40:45 +0800
 Subject: [PATCH 12/16] feat(fork): open local VS Code from remote shells
@@ -7,9 +7,10 @@ Subject: [PATCH 12/16] feat(fork): open local VS Code from remote shells
  src/client/code_open.rs | 419 ++++++++++++++++++++++++++++++++++++++++
  src/client/mod.rs       |  20 +-
  src/config/model.rs     |  21 ++
+ src/main.rs             |   3 +
  src/remote.rs           |   1 +
  src/remote/launcher.rs  |  15 +-
- 5 files changed, 473 insertions(+), 3 deletions(-)
+ 6 files changed, 476 insertions(+), 3 deletions(-)
  create mode 100644 src/client/code_open.rs
 
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
@@ -497,10 +498,10 @@ index 6b1f767..135da3a 100644
                  ServerMessage::WindowTitle { title } => {
                      write_window_title(title.as_deref());
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 5e61fc9..552213b 100644
+index 7843d64..2e67d21 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -878,6 +878,12 @@ pub struct RemoteConfig {
+@@ -880,6 +880,12 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
@@ -513,7 +514,7 @@ index 5e61fc9..552213b 100644
  }
  
  impl Default for RemoteConfig {
-@@ -886,6 +892,7 @@ impl Default for RemoteConfig {
+@@ -888,6 +894,7 @@ impl Default for RemoteConfig {
              manage_ssh_config: true,
              tcp_relay: false,
              predictive_echo: "auto".to_string(),
@@ -521,7 +522,7 @@ index 5e61fc9..552213b 100644
          }
      }
  }
-@@ -1573,6 +1580,20 @@ mouse_scroll_lines = 0
+@@ -1575,6 +1582,20 @@ mouse_scroll_lines = 0
          assert!(toml::from_str::<Config>(toml).is_err());
      }
  
@@ -542,6 +543,27 @@ index 5e61fc9..552213b 100644
      #[test]
      fn toast_config_parses() {
          let toml = r#"
+diff --git a/src/main.rs b/src/main.rs
+index b68ca5a..03583bc 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -393,6 +393,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # Predictive local echo for remote terminal attach: "off", "auto", or "always".
+ # Auto displays predictions only after observing enough network latency.
+ # predictive_echo = "auto"
++# Allow the remote `code` shim to open local VS Code Remote-SSH windows.
++# code_open = true
+ 
+ [experimental]
+ # Allow launching herdr from inside a herdr-managed pane.
+@@ -876,6 +878,7 @@ mod tests {
+         assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
+         assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
+         assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
++        assert!(DEFAULT_CONFIG.contains("# code_open = true"));
+     }
+ 
+     #[test]
 diff --git a/src/remote.rs b/src/remote.rs
 index 6f5de59..b632a6e 100644
 --- a/src/remote.rs

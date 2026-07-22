@@ -2,7 +2,8 @@
 
 ## Record
 
-- **Status:** implemented and exported; shipped as prerelease Windows binaries
+- **Status:** current 16-patch `v0.7.5` refresh implemented and exported but
+  unreleased; the earlier `v0.7.5` stack shipped as `v0.7.5-win.01`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 - **Deliverables:** patches `0001`–`0005` in `patches/herdr/` and
@@ -43,9 +44,9 @@ pointed at that socket. Only a thin platform layer was Unix-only.
 - `src/remote/windows.rs` (new): the actual port
   - bridge socket is a **named pipe** served through `crate::ipc` (same
     transport the Windows client already speaks for local attach)
-  - named pipes have no half-close ⇒ the client→ssh pump polls with
-    `PeekNamedPipe` (like `ipc::poll_local_stream_read`) instead of blocking
-    in `read`, so the whole pipe can be dropped (client-observable) once ssh dies
+  - named pipes have no half-close ⇒ the client→ssh pump uses a blocking read
+    for immediate forwarding; when ssh dies, shutdown cancels the in-flight
+    read with `CancelIoEx`, then drops the whole pipe so the client observes loss
   - shutdown wake: the throwaway connection that unblocks the blocking
     `accept` must **stay open until the accept thread joins** — interprocess
     clears already-disconnected clients as "empty connections"
@@ -148,7 +149,7 @@ labelled) for diagnosing slow attaches.
 | herdr | `src/remote/launcher.rs` | **new** — platform-neutral launcher (from `unix.rs`) |
 | herdr | `src/remote/unix.rs` | rewritten small — Unix platform bits only |
 | herdr | `src/remote/windows.rs` | **new** — named-pipe bridge, ssh keepalive flags |
-| herdr | `src/remote.rs`, `src/main.rs`, `src/platform/mod.rs`, `src/ipc.rs`, `src/client/mod.rs` | un-gates, `remote_attach` capability, ipc visibility |
+| herdr | `src/remote.rs`, `src/main.rs`, `src/platform/mod.rs`, `src/ipc.rs`, `src/client/mod.rs` | un-gates, `remote_attach` capability, generated cross-platform ssh guidance |
 | herdr | `src/client/input/windows_vti.rs`, `src/client/input.rs` | win32-input-mode paste fix; OSC 10/11 theme forwarding |
 | herdr | `src/pane/terminal.rs` | inverse-cell fallback rendering |
 | herdr | `src/update.rs` | `FORK_BUILD` self-update disable |
@@ -234,10 +235,17 @@ Then validate (Windows; needs Zig ≥ 0.15.2 via `ZIG=<path>` for the vendored
 libghostty-vt):
 
 ```bash
-cargo clippy --bin herdr -- -D warnings
-cargo test --bin herdr remote::
-cargo test --bin herdr windows_
-cargo test --bin herdr server::client_transport::tests
+cargo clippy --locked --bin herdr -- -D warnings
+cargo test --locked --bin herdr remote::
+cargo test --locked --bin herdr client::
+cargo test --locked --bin herdr windows_
+cargo test --locked --bin herdr server::client_transport::tests
+cargo test --locked --bin herdr config::
+cargo test --locked --bin herdr protocol::wire::tests
+cargo test --locked --bin herdr fork_self_update_error_points_to_current_releases
+cargo test --locked --bin herdr default_config_
+RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" \
+  cargo doc --locked --no-deps --document-private-items
 # do NOT run --all-targets: the tests/ integration suite is Unix-only upstream
 ```
 
@@ -255,10 +263,20 @@ promptly.
 Publish:
 
 ```bash
-git format-patch vX.Y.Z -o ../../patches/herdr/     # after deleting the old patches
+rm ../../patches/herdr/00*.patch
+git format-patch vX.Y.Z -o ../../patches/herdr/
 echo vX.Y.Z > ../../patches/herdr/BASE
 git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
-cd ../.. && git add patches docs && git commit -m "bump base to vX.Y.Z"
+cd ../..
+test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 16
+tmp=$(mktemp -d)
+git -C checkouts/herdr worktree add --detach "$tmp" vX.Y.Z
+git -C "$tmp" am "$PWD"/patches/herdr/*.patch
+test "$(git -C "$tmp" rev-parse 'HEAD^{tree}')" = \
+  "$(git -C checkouts/herdr rev-parse 'HEAD^{tree}')"
+git -C checkouts/herdr worktree remove --force "$tmp"
+git diff --check
+git add patches docs && git commit -m "bump base to vX.Y.Z"
 git push origin master
 git fetch origin --prune --tags
 test -z "$(git status --porcelain)"
@@ -275,8 +293,8 @@ Also update the [check log](#when-to-retire) below.
 
 If upstream touched the remote code: upstream changes to `src/remote/unix.rs`
 belong in `launcher.rs` (shared logic) or the new `unix.rs` (platform bits);
-also watch `crate::ipc` (`windows_named_pipe_available` was made `pub(crate)`
-+ `&LocalStream` here) and the `#[cfg]` gates this series removed (`checksum`,
+also watch the blocking named-pipe pump and its `CancelIoEx` shutdown in
+`remote/windows.rs`, plus the `#[cfg]` gates this series removed (`checksum`,
 `is_package_manager_managed_exe_path`, remote handshake timeout). Upstream
 churn in the updater (`src/update.rs`) is the most likely conflict site for
 the `FORK_BUILD` gate — verify it survives every bump.

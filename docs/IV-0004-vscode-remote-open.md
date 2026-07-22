@@ -2,9 +2,10 @@
 
 ## Record
 
-- **Status:** implemented in patches `0012`, `0015`, and `0016`; remote
-  command renamed to `hcode` and shipped as a release artifact; automated
-  tests and live deb1 request-transport verification complete
+- **Status:** implemented in patches `0012`, `0015`, and `0016`; `hcode`
+  shipped in `v0.7.5-win.01`, while the current refreshed patch export is
+  unreleased; automated tests and live deb1 request-transport verification
+  complete
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 - **Deliverables:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
@@ -195,8 +196,8 @@ This is intentionally not a general remote-to-local command execution mechanism.
 Completed on Windows with Zig 0.15.2:
 
 - `cargo clippy --bin herdr -- -D warnings` — clean;
-- `cargo test --bin herdr client::` — 166 passed;
-- `cargo test --bin herdr remote::` — 75 passed;
+- `cargo test --bin herdr client::` — 170 passed;
+- `cargo test --bin herdr remote::` — 76 passed;
 - `cargo test --bin herdr windows_` — 126 passed;
 - `cargo test --bin herdr server::client_transport::tests` — 21 passed;
 - `cargo test --bin herdr config::` — 128 passed;

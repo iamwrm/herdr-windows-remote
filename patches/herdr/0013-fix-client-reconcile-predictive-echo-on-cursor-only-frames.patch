@@ -1,14 +1,14 @@
-From 2bc8c99e1597b5dd051be172c529327789c9c545 Mon Sep 17 00:00:00 2001
+From cd9ed50b8c2fc0e2a6b72ee6abcc6c97df06b3da Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 17:20:13 +0800
 Subject: [PATCH 13/16] fix(client): reconcile predictive echo on cursor-only
  frames
 
 ---
- src/client/mod.rs          | 160 ++++++++++--
- src/client/predict.rs      | 490 +++++++++++++++++++++++++++++--------
+ src/client/mod.rs          | 160 +++++++++-
+ src/client/predict.rs      | 633 ++++++++++++++++++++++++++++++-------
  src/client/screen_model.rs |  22 ++
- 3 files changed, 558 insertions(+), 114 deletions(-)
+ 3 files changed, 685 insertions(+), 130 deletions(-)
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
 index 135da3a..6c80bc0 100644
@@ -225,7 +225,7 @@ index 135da3a..6c80bc0 100644
      fn terminal_frame_kitty_detection_matches_apc_prefix() {
          assert!(contains_kitty_graphics_bytes(b"text\x1b_Ga=p;\x1b\\"));
 diff --git a/src/client/predict.rs b/src/client/predict.rs
-index d4474ce..9ca1289 100644
+index d4474ce..531469c 100644
 --- a/src/client/predict.rs
 +++ b/src/client/predict.rs
 @@ -6,9 +6,10 @@
@@ -242,7 +242,7 @@ index d4474ce..9ca1289 100644
  //! - the server writes something else there → all outstanding predictions
  //!   are repainted from the [`ScreenModel`] (the server's truth) — this is
  //!   why the model exists: the server diffs against *its* idea of the
-@@ -76,13 +77,23 @@ struct Prediction {
+@@ -76,15 +77,25 @@ struct Prediction {
      x: u16,
      y: u16,
      ch: char,
@@ -264,16 +264,22 @@ index d4474ce..9ca1289 100644
 +    /// stale cursor.
 +    blocked_until_frame: bool,
      display_unlocked: bool,
-     confirmed: u64,
+-    confirmed: u64,
++    slow_confirmed: u64,
      touched_scratch: Vec<(u16, u16)>,
-@@ -98,6 +109,7 @@ impl Predictor {
+ }
+ 
+@@ -98,8 +109,9 @@ impl Predictor {
          Some(Self {
              model: ScreenModel::new(),
              pending: VecDeque::new(),
 +            blocked_until_frame: false,
              display_unlocked: mode == PredictiveEchoMode::Always,
-             confirmed: 0,
+-            confirmed: 0,
++            slow_confirmed: 0,
              touched_scratch: Vec::new(),
+         })
+     }
 @@ -109,11 +121,11 @@ impl Predictor {
      pub(crate) fn on_input_events(
          &mut self,
@@ -288,7 +294,7 @@ index d4474ce..9ca1289 100644
          for event in events {
              match event {
                  ClientInputEvent::Key {
-@@ -122,51 +134,55 @@ impl Predictor {
+@@ -122,51 +134,60 @@ impl Predictor {
                      kind: ClientKeyKind::Press | ClientKeyKind::Repeat,
                  } => match code {
                      ClientKeyCode::Char(ch) if modifiers & !SHIFT == 0 => {
@@ -303,7 +309,12 @@ index d4474ce..9ca1289 100644
 +                    _ => self.on_other_input(&mut out),
                  },
 -                ClientInputEvent::Paste { .. } => self.on_other_input(out),
-+                ClientInputEvent::Paste { .. } => self.on_other_input(&mut out),
++                ClientInputEvent::Paste { .. } | ClientInputEvent::Mouse { .. } => {
++                    self.on_other_input(&mut out);
++                }
++                // Key releases do not act on the remote application and must
++                // not interrupt a prediction chain. Focus notifications are
++                // likewise harmless to the modeled cursor.
                  _ => {}
              }
          }
@@ -358,7 +369,7 @@ index d4474ce..9ca1289 100644
              return;
          }
          let (x, y) = self.insertion_point();
-@@ -177,6 +193,7 @@ impl Predictor {
+@@ -177,6 +198,7 @@ impl Predictor {
              || !self.cell_is_plain(x, y)
              || !self.cell_is_plain(x + 1, y)
          {
@@ -366,7 +377,7 @@ index d4474ce..9ca1289 100644
              return;
          }
  
-@@ -188,20 +205,21 @@ impl Predictor {
+@@ -188,20 +210,21 @@ impl Predictor {
                  y + 1,
                  x + 1
              );
@@ -390,7 +401,7 @@ index d4474ce..9ca1289 100644
              return;
          };
          if prediction.drawn {
-@@ -212,75 +230,142 @@ impl Predictor {
+@@ -212,75 +235,156 @@ impl Predictor {
                  row = prediction.y + 1,
                  col = prediction.x + 1,
              );
@@ -426,11 +437,25 @@ index d4474ce..9ca1289 100644
 +    pub(crate) fn on_frame(&mut self, frame: &TerminalFrame) -> Vec<u8> {
 +        let mut out = Vec::new();
          self.model.ensure_size(frame.width, frame.height);
++        if frame.full {
++            self.model.begin_full_frame();
++        }
          let mut touched = std::mem::take(&mut self.touched_scratch);
          touched.clear();
          self.model.apply(&frame.bytes, &mut touched);
-+        self.blocked_until_frame = false;
  
++        if !self.model.prediction_safe() {
++            if frame.full {
++                self.pending.clear();
++            } else {
++                self.stop_predicting_until_frame(&mut out);
++            }
++            self.blocked_until_frame = true;
++            self.touched_scratch = touched;
++            return out;
++        }
++        self.blocked_until_frame = false;
++
          if frame.full {
              // The redraw repainted every cell; the screen is server truth.
              self.pending.clear();
@@ -462,7 +487,7 @@ index d4474ce..9ca1289 100644
 +            }
 +            if !cell_touched && !cursor_passed {
 +                continue;
-+            }
+             }
 +            let matches = model
 +                .cell(prediction.x, prediction.y)
 +                .is_some_and(|cell| cell.symbol.chars().eq(std::iter::once(prediction.ch)));
@@ -470,7 +495,7 @@ index d4474ce..9ca1289 100644
 +                prediction.observed = true;
 +            } else {
 +                observed_mismatch = true;
-             }
++            }
 +        }
 +
 +        // A hidden or row-jumped server cursor is not a safe continuation of
@@ -493,6 +518,10 @@ index d4474ce..9ca1289 100644
 +        // behind that space.
 +        while self.pending.front().is_some_and(|front| front.observed) {
              let front = self.pending.pop_front().expect("front exists");
+-            self.confirmed += 1;
+-            if front.sent_at.elapsed() >= AUTO_MIN_LATENCY && self.confirmed >= AUTO_MIN_CONFIRMED
+-            {
+-                self.display_unlocked = true;
 +            if front.drawn {
 +                // A cursor-only acknowledgement did not repaint the local
 +                // underline. Explicitly restore the now-confirmed cell.
@@ -505,12 +534,11 @@ index d4474ce..9ca1289 100644
 +                );
 +                repainted_confirmation = true;
 +            }
-             self.confirmed += 1;
--            if front.sent_at.elapsed() >= AUTO_MIN_LATENCY && self.confirmed >= AUTO_MIN_CONFIRMED
-+            if now.saturating_duration_since(front.sent_at) >= AUTO_MIN_LATENCY
-+                && self.confirmed >= AUTO_MIN_CONFIRMED
-             {
-                 self.display_unlocked = true;
++            if now.saturating_duration_since(front.sent_at) >= AUTO_MIN_LATENCY {
++                self.slow_confirmed += 1;
++                if self.slow_confirmed >= AUTO_MIN_CONFIRMED {
++                    self.display_unlocked = true;
++                }
              }
          }
  
@@ -571,7 +599,7 @@ index d4474ce..9ca1289 100644
      }
  
      fn insertion_point(&self) -> (u16, u16) {
-@@ -294,12 +379,6 @@ impl Predictor {
+@@ -294,12 +398,6 @@ impl Predictor {
          self.model.cell(x, y).is_some_and(|cell| cell.plain)
      }
  
@@ -584,7 +612,7 @@ index d4474ce..9ca1289 100644
      fn model_symbol(&self, x: u16, y: u16) -> String {
          match self.model.cell(x, y) {
              Some(cell) if !cell.symbol.is_empty() => cell.symbol.clone(),
-@@ -327,29 +406,17 @@ impl Predictor {
+@@ -327,29 +425,17 @@ impl Predictor {
          if wrote {
              let (x, y) = self.model.cursor();
              let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
@@ -621,7 +649,7 @@ index d4474ce..9ca1289 100644
      }
  }
  
-@@ -399,6 +466,28 @@ mod tests {
+@@ -399,6 +485,28 @@ mod tests {
          }
      }
  
@@ -650,7 +678,7 @@ index d4474ce..9ca1289 100644
      /// Drives frames through a real `BlitEncoder` into the predictor.
      struct Harness {
          encoder: BlitEncoder,
-@@ -426,9 +515,7 @@ mod tests {
+@@ -426,9 +534,7 @@ mod tests {
                  bytes: encoded.bytes.clone(),
              };
              self.encoder.commit(frame.clone(), encoded);
@@ -661,7 +689,15 @@ index d4474ce..9ca1289 100644
          }
      }
  
-@@ -501,6 +588,20 @@ mod tests {
+@@ -481,7 +587,6 @@ mod tests {
+         // Server echo: `l` appears at (2,0), cursor advances.
+         let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("l"))], (3, 0)));
+         assert!(harness.predictor.pending.is_empty(), "confirmed");
+-        assert_eq!(harness.predictor.confirmed, 1);
+         assert!(out.is_empty(), "no repaint needed: {out:?}");
+     }
+ 
+@@ -501,6 +606,20 @@ mod tests {
          assert!(out.contains(PLAIN_SGR), "plain pen: {out:?}");
      }
  
@@ -682,7 +718,7 @@ index d4474ce..9ca1289 100644
      #[test]
      fn typeahead_predictions_are_redrawn_and_cursor_reanchored() {
          let mut harness = Harness::new(PredictiveEchoMode::Always);
-@@ -512,14 +613,172 @@ mod tests {
+@@ -512,8 +631,10 @@ mod tests {
          let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("a"))], (3, 0)));
          let out = String::from_utf8(out).expect("utf8");
          assert_eq!(harness.predictor.pending.len(), 1);
@@ -695,10 +731,12 @@ index d4474ce..9ca1289 100644
          assert!(
              out.ends_with("\x1b[1;5H"),
              "cursor re-anchored past prediction: {out:?}"
-         );
+@@ -521,31 +642,230 @@ mod tests {
      }
  
-+    #[test]
+     #[test]
+-    fn auto_mode_dark_launches_then_unlocks_after_confirmations() {
+-        let mut harness = Harness::new(PredictiveEchoMode::Auto);
 +    fn cursor_only_update_confirms_space_over_blank_cell() {
 +        let mut harness = Harness::new(PredictiveEchoMode::Always);
 +        harness.feed(&prompt_frame(&[], (2, 0)));
@@ -771,7 +809,7 @@ index d4474ce..9ca1289 100644
 +    #[test]
 +    fn cursor_progress_unblocks_predictions_behind_unchanged_space() {
 +        let mut harness = Harness::new(PredictiveEchoMode::Always);
-+        harness.feed(&prompt_frame(&[], (2, 0)));
+         harness.feed(&prompt_frame(&[], (2, 0)));
 +        harness.predictor.on_char(' ', &mut Vec::new());
 +        harness.predictor.on_char('d', &mut Vec::new());
 +        harness.predictor.on_char('e', &mut Vec::new());
@@ -793,15 +831,23 @@ index d4474ce..9ca1289 100644
 +        let mut harness = Harness::new(PredictiveEchoMode::Always);
 +        harness.feed(&prompt_frame(&[(4, 0, styled_cell("~"))], (2, 0)));
 +        harness.predictor.on_char('a', &mut Vec::new());
-+
-+        let mut out = Vec::new();
+ 
+         let mut out = Vec::new();
+-        harness.predictor.on_char('a', &mut out);
+-        assert!(out.is_empty(), "auto must not draw yet");
+-        assert_eq!(harness.predictor.pending.len(), 1, "still tracked");
 +        // `b` would push into the styled cell, so it cannot be represented by
 +        // this prediction chain.
 +        harness.predictor.on_char('b', &mut out);
 +        assert!(harness.predictor.pending.is_empty(), "chain flushed");
 +        assert!(harness.predictor.blocked_until_frame);
 +        assert!(!out.is_empty(), "drawn a restored to server truth");
-+
+ 
+-        // Two confirmations slower than AUTO_MIN_LATENCY unlock drawing.
+-        std::thread::sleep(AUTO_MIN_LATENCY + Duration::from_millis(20));
+-        harness.feed(&prompt_frame(&[(2, 0, plain_cell("a"))], (3, 0)));
+-        harness.predictor.on_char('b', &mut Vec::new());
+-        std::thread::sleep(AUTO_MIN_LATENCY + Duration::from_millis(20));
 +        let mut blocked_out = Vec::new();
 +        harness.predictor.on_char('c', &mut blocked_out);
 +        assert!(blocked_out.is_empty(), "no stale second chain");
@@ -854,46 +900,156 @@ index d4474ce..9ca1289 100644
 +        assert!(!out.is_empty(), "expired prediction repainted");
 +    }
 +
-     #[test]
-     fn auto_mode_dark_launches_then_unlocks_after_confirmations() {
-         let mut harness = Harness::new(PredictiveEchoMode::Auto);
-@@ -531,15 +790,32 @@ mod tests {
-         assert_eq!(harness.predictor.pending.len(), 1, "still tracked");
- 
-         // Two confirmations slower than AUTO_MIN_LATENCY unlock drawing.
--        std::thread::sleep(AUTO_MIN_LATENCY + Duration::from_millis(20));
-+        harness
++    fn confirm_auto_prediction(harness: &mut Harness, confirmed_text: &str, slow: bool) {
++        let ch = confirmed_text.chars().next_back().expect("non-empty text");
++        harness.predictor.on_char(ch, &mut Vec::new());
++        let pending = harness
 +            .predictor
 +            .pending
 +            .front_mut()
-+            .expect("a pending")
-+            .sent_at = Instant::now()
-+            .checked_sub(AUTO_MIN_LATENCY + Duration::from_millis(1))
-+            .expect("past");
-         harness.feed(&prompt_frame(&[(2, 0, plain_cell("a"))], (3, 0)));
-         harness.predictor.on_char('b', &mut Vec::new());
--        std::thread::sleep(AUTO_MIN_LATENCY + Duration::from_millis(20));
-+        harness
-+            .predictor
-+            .pending
-+            .front_mut()
-+            .expect("b pending")
-+            .sent_at = Instant::now()
-+            .checked_sub(AUTO_MIN_LATENCY + Duration::from_millis(1))
-+            .expect("past");
++            .expect("pending prediction");
++        pending.sent_at = if slow {
++            Instant::now()
++                .checked_sub(AUTO_MIN_LATENCY + Duration::from_millis(1))
++                .expect("past")
++        } else {
++            Instant::now()
++                .checked_add(AUTO_MIN_LATENCY)
++                .expect("future")
++        };
++        let cells = confirmed_text
++            .chars()
++            .enumerate()
++            .map(|(offset, ch)| (2 + offset as u16, 0, plain_cell(&ch.to_string())))
++            .collect::<Vec<_>>();
          harness.feed(&prompt_frame(
-             &[(2, 0, plain_cell("a")), (3, 0, plain_cell("b"))],
-             (4, 0),
+-            &[(2, 0, plain_cell("a")), (3, 0, plain_cell("b"))],
+-            (4, 0),
++            &cells,
++            (2 + confirmed_text.chars().count() as u16, 0),
          ));
 -        assert!(harness.predictor.display_unlocked, "unlocked after 2 slow confirms");
-+        assert!(
-+            harness.predictor.display_unlocked,
-+            "unlocked after 2 slow confirms"
-+        );
++    }
++
++    #[test]
++    fn auto_mode_dark_launches_then_unlocks_after_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        assert!(!harness.predictor.display_unlocked);
++        confirm_auto_prediction(&mut harness, "ab", true);
++        assert!(harness.predictor.display_unlocked);
  
          let mut out = Vec::new();
          harness.predictor.on_char('c', &mut out);
-@@ -601,22 +877,36 @@ mod tests {
+         assert!(!out.is_empty(), "draws once unlocked");
+     }
+ 
++    #[test]
++    fn auto_mode_does_not_count_fast_fast_slow_as_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", false);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(!harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 1);
++    }
++
++    #[test]
++    fn auto_mode_counts_nonconsecutive_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 2);
++    }
++
+     #[test]
+     fn styled_cells_and_hidden_cursor_are_not_predicted() {
+         let mut harness = Harness::new(PredictiveEchoMode::Always);
+@@ -586,6 +906,73 @@ mod tests {
+         assert!(out.is_empty());
+     }
+ 
++    #[cfg(windows)]
++    fn key_event(
++        ch: char,
++        kind: crate::protocol::ClientKeyKind,
++    ) -> crate::protocol::ClientInputEvent {
++        crate::protocol::ClientInputEvent::Key {
++            code: crate::protocol::ClientKeyCode::Char(ch),
++            modifiers: 0,
++            kind,
++        }
++    }
++
++    #[cfg(windows)]
++    fn mouse_event(kind: crate::protocol::ClientMouseKind) -> crate::protocol::ClientInputEvent {
++        crate::protocol::ClientInputEvent::Mouse {
++            kind,
++            column: 4,
++            row: 1,
++            modifiers: 0,
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_click_flushes_and_blocks_later_key_in_same_batch() {
++        use crate::protocol::{ClientKeyKind, ClientMouseButton, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.predictor.on_input_events(&[
++            mouse_event(ClientMouseKind::Down(ClientMouseButton::Left)),
++            key_event('b', ClientKeyKind::Press),
++        ]);
++        assert!(!out.is_empty(), "drawn prediction must be repainted");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++
++        harness.feed(&prompt_frame(&[], (4, 0)));
++        harness
++            .predictor
++            .on_input_events(&[key_event('c', ClientKeyKind::Press)]);
++        assert_eq!(harness.predictor.pending.len(), 1, "fresh frame recovers");
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_scroll_blocks_prediction_but_key_release_does_not() {
++        use crate::protocol::{ClientKeyKind, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_input_events(&[
++            key_event('x', ClientKeyKind::Release),
++            key_event('a', ClientKeyKind::Press),
++        ]);
++        assert_eq!(harness.predictor.pending.len(), 1, "release is harmless");
++
++        let out = harness
++            .predictor
++            .on_input_events(&[mouse_event(ClientMouseKind::ScrollDown)]);
++        assert!(!out.is_empty(), "scroll repaints drawn prediction");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++    }
++
+     #[test]
+     fn other_keys_flush_drawn_predictions() {
+         let mut harness = Harness::new(PredictiveEchoMode::Always);
+@@ -601,22 +988,36 @@ mod tests {
      }
  
      #[test]
@@ -935,7 +1091,7 @@ index d4474ce..9ca1289 100644
              height: 1,
              cursor: Some(CursorState {
                  x: 0,
-@@ -631,6 +921,10 @@ mod tests {
+@@ -631,6 +1032,10 @@ mod tests {
          for _ in 0..MAX_PENDING + 3 {
              harness.predictor.on_char('x', &mut Vec::new());
          }
@@ -948,10 +1104,10 @@ index d4474ce..9ca1289 100644
      }
  }
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
-index 7018447..5714992 100644
+index 24792b0..27dc588 100644
 --- a/src/client/screen_model.rs
 +++ b/src/client/screen_model.rs
-@@ -503,6 +503,28 @@ mod tests {
+@@ -615,6 +615,28 @@ mod tests {
          assert_eq!(touched, vec![(2, 0)], "diff frame touches only the change");
      }
  

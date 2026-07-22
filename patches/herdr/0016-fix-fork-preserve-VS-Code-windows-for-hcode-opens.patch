@@ -1,4 +1,4 @@
-From 6e13ce334c4e133d3366c4e52c42551ae3168191 Mon Sep 17 00:00:00 2001
+From 9e591f7ccb2edff5058e4c71019db6d2412b5de4 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Tue, 21 Jul 2026 15:17:03 +0800
 Subject: [PATCH 16/16] fix(fork): preserve VS Code windows for hcode opens

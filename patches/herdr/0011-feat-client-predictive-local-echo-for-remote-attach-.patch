@@ -1,4 +1,4 @@
-From 0f057402ab99e2cd83c829f9717e6d508bd136be Mon Sep 17 00:00:00 2001
+From 693161ffc525a9eeea9c8884bc4f3c57a1dca8f2 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 13:00:10 +0800
 Subject: [PATCH 11/16] feat(client): predictive local echo for remote attach
@@ -33,7 +33,8 @@ change; works against official Linux servers.
  src/client/predict.rs      | 636 +++++++++++++++++++++++++++++++++++++
  src/client/screen_model.rs |   4 -
  src/config/model.rs        |   7 +
- 4 files changed, 671 insertions(+), 4 deletions(-)
+ src/main.rs                |   4 +
+ 5 files changed, 675 insertions(+), 4 deletions(-)
  create mode 100644 src/client/predict.rs
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
@@ -767,10 +768,10 @@ index 0000000..d4474ce
 +    }
 +}
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
-index c8d454f..7018447 100644
+index 936636b..24792b0 100644
 --- a/src/client/screen_model.rs
 +++ b/src/client/screen_model.rs
-@@ -15,10 +15,6 @@
+@@ -16,10 +16,6 @@
  //! else. Round-trip tests validate the model against `BlitEncoder` output of
  //! reference frames.
  
@@ -782,10 +783,10 @@ index c8d454f..7018447 100644
  const PLAIN_SGR_PARAMS: &str = "0;39;49";
  
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 2e462b0..5e61fc9 100644
+index d67d4e5..7843d64 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -872,6 +872,12 @@ pub struct RemoteConfig {
+@@ -874,6 +874,12 @@ pub struct RemoteConfig {
      /// Overrides any ProxyCommand/ProxyJump from your ssh config for the
      /// target, so it is opt-in. Requires manage_ssh_config. Default: false.
      pub tcp_relay: bool,
@@ -798,7 +799,7 @@ index 2e462b0..5e61fc9 100644
  }
  
  impl Default for RemoteConfig {
-@@ -879,6 +885,7 @@ impl Default for RemoteConfig {
+@@ -881,6 +887,7 @@ impl Default for RemoteConfig {
          Self {
              manage_ssh_config: true,
              tcp_relay: false,
@@ -806,6 +807,28 @@ index 2e462b0..5e61fc9 100644
          }
      }
  }
+diff --git a/src/main.rs b/src/main.rs
+index 6989615..b68ca5a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -390,6 +390,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # ProxyJump/ProxyCommand in user config, so leave it off for proxied targets.
+ # Requires manage_ssh_config = true.
+ # tcp_relay = false
++# Predictive local echo for remote terminal attach: "off", "auto", or "always".
++# Auto displays predictions only after observing enough network latency.
++# predictive_echo = "auto"
+ 
+ [experimental]
+ # Allow launching herdr from inside a herdr-managed pane.
+@@ -872,6 +875,7 @@ mod tests {
+         assert!(DEFAULT_CONFIG.contains("provides no connection reuse"));
+         assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
+         assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
++        assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
+     }
+ 
+     #[test]
 -- 
 2.52.0.windows.1
 

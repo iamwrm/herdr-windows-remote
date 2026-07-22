@@ -1,4 +1,4 @@
-From 065703eed7d30e70d57eab57f4f92056dc9807a1 Mon Sep 17 00:00:00 2001
+From f6a3ff353e3d2bc633c0ff86fba6dd4be698469d Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Wed, 15 Jul 2026 19:13:59 +0800
 Subject: [PATCH 01/16] feat(windows): support herdr --remote from the native
@@ -28,14 +28,14 @@ scrollback restore.
 ---
  src/client/mod.rs      |    3 -
  src/ipc.rs             |   10 +-
- src/main.rs            |    1 -
+ src/main.rs            |   25 +-
  src/platform/mod.rs    |    4 +-
  src/remote.rs          |  156 +-
  src/remote/launcher.rs | 2530 +++++++++++++++++++++++++++++++
  src/remote/unix.rs     | 3252 +++++-----------------------------------
  src/remote/windows.rs  |  366 +++++
  src/update.rs          |    1 -
- 9 files changed, 3305 insertions(+), 3018 deletions(-)
+ 9 files changed, 3321 insertions(+), 3026 deletions(-)
  create mode 100644 src/remote/launcher.rs
  create mode 100644 src/remote/windows.rs
 
@@ -95,7 +95,7 @@ index c293a27..ce164b0 100644
  
      let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/main.rs b/src/main.rs
-index a73423b..7befae9 100644
+index a73423b..26dc62a 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -58,7 +58,6 @@ mod agent_resume;
@@ -106,6 +106,44 @@ index a73423b..7befae9 100644
  mod checksum;
  mod cli;
  mod client;
+@@ -377,14 +376,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # resume_agents_on_restore = true
+ 
+ [remote]
+-# Whether herdr manages the ssh config used for `herdr --remote`.
+-# When true (default), herdr runs remote ssh through a generated config that
+-# includes your ~/.ssh/config first and adds ServerAliveInterval/
+-# ServerAliveCountMax as fallbacks (so any keepalive values you set yourself
+-# still win) to survive idle network/NAT timeouts. Herdr also uses a private
+-# per-attach OpenSSH control socket to reuse the first authenticated connection.
+-# Set false to run plain ssh against your ssh config unchanged — this does not
+-# force keepalive or multiplexing off, it only stops herdr from adding its own.
++# Whether herdr manages ssh options used for `herdr --remote`.
++# On Unix, true (default) uses a generated config that includes ~/.ssh/config,
++# adds fallback keepalives (user values still win), and creates a private
++# per-attach ControlMaster socket to reuse the authenticated connection.
++# On Windows, true writes no config and provides no connection reuse; it adds
++# command-line keepalives that override ServerAlive* values in user config.
++# Set false to use ssh config unchanged without herdr's additions.
+ # manage_ssh_config = true
+ 
+ [experimental]
+@@ -844,6 +842,15 @@ fn main() -> io::Result<()> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn default_config_explains_platform_specific_remote_behavior() {
++        assert!(DEFAULT_CONFIG.contains("On Unix, true (default) uses a generated config"));
++        assert!(DEFAULT_CONFIG.contains("user values still win"));
++        assert!(DEFAULT_CONFIG.contains("On Windows, true writes no config"));
++        assert!(DEFAULT_CONFIG.contains("provides no connection reuse"));
++        assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
++    }
++
+     #[test]
+     fn nested_herdr_blocks_when_env_is_set() {
+         let config = config::Config::default();
 diff --git a/src/platform/mod.rs b/src/platform/mod.rs
 index fbde21b..8647ef1 100644
 --- a/src/platform/mod.rs

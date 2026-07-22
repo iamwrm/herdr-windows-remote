@@ -1,4 +1,4 @@
-From 14bec97adf6f4be845b82681d03c694194afa97a Mon Sep 17 00:00:00 2001
+From dddab5a25f65e58f991c146618ca4135e8c81a6b Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:52:11 +0800
 Subject: [PATCH 10/16] feat(client): mirror the terminal-ansi frame stream in
@@ -10,22 +10,50 @@ unstyled. New src/client/screen_model.rs replays received TerminalFrame
 bytes into a cell grid.
 
 The frame stream comes exclusively from BlitEncoder, whose vocabulary is
-small and has no scrolling or relative cursor motion - every cell write is
-preceded by an absolute CUP, so a printable run between escapes is exactly
-one cell's grapheme cluster. The parser covers CUP, SGR (tracking only
-plain-vs-styled pen), 2J, ?25h/l, ?2026 sync, DECSCUSR, OSC 8 hyperlinks
-(cells under a link are not plain), OSC 52 and Kitty APC passthrough.
-apply() reports touched cells for prediction reconciliation.
+small and has no scrolling or relative cursor motion. Cell runs begin at
+an absolute CUP, but adjacent cells can continue inline. Split printable
+runs at Unicode extended grapheme boundaries so ASCII-leading decomposed
+clusters remain one modeled cell. The parser also covers SGR (tracking
+only plain-vs-styled pen), 2J, ?25h/l, ?2026 sync, DECSCUSR, OSC 8
+hyperlinks, OSC 52, and Kitty APC passthrough. apply() reports touched
+cells for prediction reconciliation.
 
-Round-trip tests validate the model against real BlitEncoder output (full
-and diff frames, wide chars, hyperlinks, hidden cursor). Not wired into
-the client loop yet; the prediction engine lands separately.
+Round-trip tests validate the model against real BlitEncoder full and diff
+output, including contiguous ASCII, ASCII-prefix decomposed graphemes,
+wide chars, hyperlinks, and hidden cursors. Not wired into the client loop
+yet; the prediction engine lands separately.
 ---
+ Cargo.lock                 |   1 +
+ Cargo.toml                 |   1 +
  src/client/mod.rs          |   1 +
- src/client/screen_model.rs | 528 +++++++++++++++++++++++++++++++++++++
- 2 files changed, 529 insertions(+)
+ src/client/screen_model.rs | 640 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 643 insertions(+)
  create mode 100644 src/client/screen_model.rs
 
+diff --git a/Cargo.lock b/Cargo.lock
+index 6cfdbd0..a46b096 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -607,6 +607,7 @@ dependencies = [
+  "toml",
+  "tracing",
+  "tracing-subscriber",
++ "unicode-segmentation",
+  "unicode-width",
+  "windows-sys",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index e7da49a..fee594d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,6 +41,7 @@ toml = "0.8"
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ unicode-width = "0.2"
++unicode-segmentation = "1.12"
+ schemars = { version = "1.2.1", features = ["derive"] }
+ 
+ [patch.crates-io]
 diff --git a/src/client/mod.rs b/src/client/mod.rs
 index bba011b..7869ca3 100644
 --- a/src/client/mod.rs
@@ -40,10 +68,10 @@ index bba011b..7869ca3 100644
  use std::io::{self, BufRead, Write as _};
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
 new file mode 100644
-index 0000000..c8d454f
+index 0000000..936636b
 --- /dev/null
 +++ b/src/client/screen_model.rs
-@@ -0,0 +1,528 @@
+@@ -0,0 +1,640 @@
 +//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
 +//!
 +//! Terminal-ansi clients normally blit server frame bytes to stdout without
@@ -54,8 +82,9 @@ index 0000000..c8d454f
 +//! The frame stream is produced exclusively by `protocol::render_ansi::
 +//! BlitEncoder`, whose output vocabulary is small and contains **no scrolling
 +//! and no relative cursor motion**. Cell runs begin at an absolute `CUP`;
-+//! a width-1 ASCII cell may let the following cell continue inline. The parser
-+//! below handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
++//! a width-1 cell may let the following cell continue inline. Printable runs
++//! are split at Unicode extended grapheme boundaries before updating cells.
++//! The parser below handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
 +//! visibility, `?2026 h/l` sync markers, DECSCUSR, OSC (hyperlinks,
 +//! clipboard) and APC (Kitty graphics) passthrough — and ignores everything
 +//! else. Round-trip tests validate the model against `BlitEncoder` output of
@@ -106,6 +135,9 @@ index 0000000..c8d454f
 +    pen_plain: bool,
 +    /// Whether an OSC 8 hyperlink is currently open.
 +    hyperlink_open: bool,
++    /// False after standalone zero-width output, whose host-terminal cell
++    /// effect cannot be represented safely for prediction reconciliation.
++    prediction_safe: bool,
 +}
 +
 +impl ScreenModel {
@@ -118,6 +150,7 @@ index 0000000..c8d454f
 +            cursor_visible: false,
 +            pen_plain: false,
 +            hyperlink_open: false,
++            prediction_safe: true,
 +        }
 +    }
 +
@@ -130,6 +163,17 @@ index 0000000..c8d454f
 +        self.cells = vec![ModelCell::blank(); width as usize * height as usize];
 +        self.cursor = (0, 0);
 +        self.cursor_visible = false;
++        self.prediction_safe = true;
++    }
++
++    /// A full frame replaces prior screen truth, so it can recover from an
++    /// earlier unmodelable zero-width write unless this frame contains one too.
++    pub(crate) fn begin_full_frame(&mut self) {
++        self.prediction_safe = true;
++    }
++
++    pub(crate) fn prediction_safe(&self) -> bool {
++        self.prediction_safe
 +    }
 +
 +    pub(crate) fn cursor(&self) -> (u16, u16) {
@@ -265,9 +309,10 @@ index 0000000..c8d454f
 +        }
 +    }
 +
-+    /// Consumes one printable run. The encoder batches a leading sequence of
-+    /// width-1 ASCII cells and may append one non-ASCII grapheme without
-+    /// another CUP because inline eligibility is decided by the previous cell.
++    /// Consumes one printable run. The encoder may batch adjacent cells
++    /// without another CUP because inline eligibility is decided by the
++    /// previous cell. Split the run at extended grapheme boundaries so an
++    /// ASCII base plus combining marks remains one modeled cell.
 +    fn apply_text_run(
 +        &mut self,
 +        bytes: &[u8],
@@ -278,16 +323,11 @@ index 0000000..c8d454f
 +        while end < bytes.len() && bytes[end] != 0x1b && bytes[end] >= 0x20 && bytes[end] != 0x7f {
 +            end += 1;
 +        }
-+        let run = &bytes[start..end];
-+        let ascii_prefix_len = run.iter().take_while(|byte| byte.is_ascii()).count();
-+        for byte in &run[..ascii_prefix_len] {
-+            self.write_symbol(char::from(*byte).to_string(), touched);
-+        }
-+        if ascii_prefix_len < run.len() {
-+            self.write_symbol(
-+                String::from_utf8_lossy(&run[ascii_prefix_len..]).into_owned(),
-+                touched,
-+            );
++        use unicode_segmentation::UnicodeSegmentation as _;
++
++        let run = String::from_utf8_lossy(&bytes[start..end]);
++        for grapheme in run.graphemes(true) {
++            self.write_symbol(grapheme.to_string(), touched);
 +        }
 +        end
 +    }
@@ -299,7 +339,14 @@ index 0000000..c8d454f
 +        if x >= self.width || y >= self.height {
 +            return;
 +        }
-+        let width = symbol.width().max(1) as u16;
++        let width = symbol.width() as u16;
++        if width == 0 {
++            // BlitEncoder emits this grapheme without advancing the cursor.
++            // A host terminal may attach it to a preceding glyph, so neither
++            // a destination cell nor prediction reconciliation is knowable.
++            self.prediction_safe = false;
++            return;
++        }
 +        let plain = self.pen_plain && !self.hyperlink_open;
 +        let index = y as usize * self.width as usize + x as usize;
 +        self.cells[index] = ModelCell { symbol, plain };
@@ -445,6 +492,99 @@ index 0000000..c8d454f
 +        let model = replay(&[first, second.clone()]);
 +
 +        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn decomposed_grapheme_full_frame_occupies_one_cell() {
++        let reference = frame(
++            3,
++            1,
++            vec![plain_cell("e\u{301}"), plain_cell("!"), plain_cell(" ")],
++            (2, 0),
++        );
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert_model_matches(&model, &reference);
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "e\u{301}");
++        assert_eq!(model.cell(1, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn ascii_prefix_and_decomposed_grapheme_diff_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell("a"),
++                plain_cell("e\u{301}"),
++                plain_cell("!"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("ae\u{301}"),
++            "test must exercise one ASCII-leading decomposed run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
++    }
++
++    fn zero_width_diff(symbol: &str) -> (ScreenModel, Vec<(u16, u16)>) {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell(" "),
++                plain_cell(symbol),
++                plain_cell("x"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.begin_full_frame();
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++        (model, touched)
++    }
++
++    #[test]
++    fn combining_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{301}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
++    }
++
++    #[test]
++    fn zwj_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{200d}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
 +    }
 +
 +    #[test]

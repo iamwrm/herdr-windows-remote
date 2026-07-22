@@ -1,4 +1,4 @@
-From df18fde7d2014f7f4bb241b07809b433f4f3d24c Mon Sep 17 00:00:00 2001
+From 8f657f062688024b43b437d8a68c6434639344f2 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:46:30 +0800
 Subject: [PATCH 09/16] perf(windows): remove 10ms poll from the remote bridge
@@ -20,8 +20,9 @@ Adds windows-sys Win32_System_IO for CancelIoEx and pump tests
 (forward + close, cancel-while-blocked).
 ---
  Cargo.toml            |   1 +
+ src/ipc.rs            |   8 +--
  src/remote/windows.rs | 159 ++++++++++++++++++++++++++++++++++--------
- 2 files changed, 132 insertions(+), 28 deletions(-)
+ 3 files changed, 135 insertions(+), 33 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
 index e136312..e7da49a 100644
@@ -35,8 +36,28 @@ index e136312..e7da49a 100644
      "Win32_System_Kernel",
      "Win32_System_Memory",
      "Win32_System_Ole",
+diff --git a/src/ipc.rs b/src/ipc.rs
+index ce164b0..abb3549 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -181,12 +181,10 @@ fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
+     Ok(windows_named_pipe_available(&*stream)?.is_none())
+ }
+ 
+-/// Returns the number of bytes available to read without blocking, or `None`
+-/// when the peer has closed the pipe. Shared with the remote-attach bridge,
+-/// whose client pump must poll instead of blocking in `read` (named pipes
+-/// cannot be half-closed or shut down from another thread).
++/// Returns the number of bytes available to the IPC poller without blocking,
++/// or `None` when the peer has closed the pipe.
+ #[cfg(windows)]
+-pub(crate) fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
++fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
+     use std::os::windows::io::{AsHandle, AsRawHandle};
+ 
+     let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
-index fdeaa9e..e7541be 100644
+index fdeaa9e..50a630c 100644
 --- a/src/remote/windows.rs
 +++ b/src/remote/windows.rs
 @@ -15,10 +15,12 @@
@@ -64,9 +85,9 @@ index fdeaa9e..e7541be 100644
 -/// request. Only waited out when the client is idle; pending input is drained
 -/// before sleeping again.
 -const CLIENT_READ_POLL: Duration = Duration::from_millis(10);
-+/// Backoff between `CancelSynchronousIo` retries while waiting for the pump
-+/// thread to observe its stop flag (the cancel is a no-op when the thread is
-+/// momentarily between blocking reads).
++/// Backoff between `CancelIoEx` retries while waiting for the pump thread to
++/// observe its stop flag (the cancel is a no-op when the thread is momentarily
++/// between blocking reads).
 +const CANCEL_RETRY: Duration = Duration::from_millis(1);
  
  /// Windows has no ssh connection multiplexing, so the "managed" options are
@@ -91,7 +112,7 @@ index fdeaa9e..e7541be 100644
 -/// stop request (ssh died) is honored even while the client is idle.
 +/// Pumps client bytes into ssh's stdin with plain blocking reads. When the
 +/// ssh transport dies, `bridge_connection` sets `stop` and cancels the
-+/// in-flight read with [`cancel_synchronous_io_until_finished`]; keystrokes
++/// in-flight read with [`cancel_blocking_pipe_read`]; keystrokes
 +/// are otherwise forwarded the moment they arrive, with no poll latency.
  fn pump_client_to_ssh(
      stream: &LocalStream,
@@ -153,8 +174,8 @@ index fdeaa9e..e7541be 100644
 +
 +    let LocalStream::NamedPipe(pipe) = stream;
 +    while !thread.is_finished() {
-+        // Returns ERROR_NOT_FOUND when no I/O is in flight at this instant;
-+        // harmless, retry until the stop flag is observed.
++        // CancelIoEx returns ERROR_NOT_FOUND when no I/O is in flight at
++        // this instant; harmless, retry until the stop flag is observed.
 +        let _ = unsafe {
 +            windows_sys::Win32::System::IO::CancelIoEx(
 +                pipe.as_handle().as_raw_handle(),

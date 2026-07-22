@@ -1,4 +1,4 @@
-From 53cb1cddda58d9ea5b79c2e1279fa0958e9d2081 Mon Sep 17 00:00:00 2001
+From 97afcdeb3327dc5792289ec086b13358c71cab45 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 19:59:15 +0800
 Subject: [PATCH 05/16] feat(fork): add HERDR_REMOTE_TIMING for remote attach

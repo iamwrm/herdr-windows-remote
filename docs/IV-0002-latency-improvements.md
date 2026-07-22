@@ -2,9 +2,9 @@
 
 ## Record
 
-- **Status:** implemented — patches `0006`–`0011` landed (W0, W2, W1, W4,
-  W3), with cursor-reconciliation and input-packetization follow-ups in
-  `0013`–`0014`; live deb1 verification and the W1 packet-capture verdict
+- **Status:** implemented and exported in the current 16-patch `v0.7.5`
+  refresh, but that refresh is unreleased; an earlier stack shipped in
+  `v0.7.5-win.01`; live deb1 verification and the W1 packet-capture verdict
   remain pending
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
@@ -41,7 +41,7 @@ IV-0001 patch `0003`). Therefore:
 
 ```
 keystroke → herdr client (thin, terminal-ansi) → named pipe
-  → pump_client_to_ssh (PeekNamedPipe, 10 ms poll)   [src/remote/windows.rs]
+  → pump_client_to_ssh (blocking read; CancelIoEx at shutdown) [src/remote/windows.rs]
   → ssh -T stdin ──~RTT/2──→ remote-client-bridge → server socket
   → server event loop → PTY → app echoes → server renders
   → BlitEncoder diff [src/server/render_stream.rs]
@@ -54,17 +54,13 @@ Setup path (before the client starts), all in
 
 | Step | Function | ssh connections (Windows, no mux) |
 |---|---|---|
-| platform probe | `detect_remote_platform` (`uname`) | 1 |
-| PATH probe | `remote_binary_on_path_any` (`command -v herdr`) | 1 |
-| known-path scan | `remote_binary_candidates` script | 1 |
-| version/protocol check | `remote_binary_matches` (per candidate, ≥1) | 1+ |
-| server status | `ensure_remote_server_ready` → `remote_server_status` | 1 |
+| combined setup probe | `probe::probe_remote` (platform, PATH/candidates, version/protocol, server status) | 1 |
 | bridge | `SshStdioBridge` (persistent) | 1 |
 
-Happy path ≈ **5 sequential fresh connections + 1 persistent**. Windows
-OpenSSH has no ControlMaster, so each fresh connection pays TCP + kex + auth
-(~5–7 RTTs ≈ 1–1.5 s at 200 ms) → attach ≈ **6–9 s**. `HERDR_REMOTE_TIMING=1`
-(IV-0001 patch `0005`) already labels each phase.
+The cold happy path is **1 probe connection + 1 persistent bridge**. A warm
+cache uses the same single probe connection but verifies only the cached path.
+Windows OpenSSH has no ControlMaster, so these remain fresh authenticated
+connections; `HERDR_REMOTE_TIMING=1` (IV-0001 patch `0005`) labels each phase.
 
 What already helps at high RTT (do not regress):
 
@@ -184,9 +180,10 @@ entirely on reattach.
   `ensure_remote_server_ready` consumes the probed status and only does a
   live round trip when the blob had none (fresh install). Happy path is
   **1+1** connections (better than the 2+1 projected: the server-status
-  probe folded in too). Cache (`state_dir()/remote-probe-cache/<target>.json`)
-  also stores the platform, so warm reattaches skip `uname` and the
-  login-shell spawn. Deviation: the kill switch is env
+  probe folded in too). Cache entries use a readable sanitized target prefix
+  plus the SHA-256 of the complete, unsanitized target, preventing punctuation
+  and truncation collisions; each entry also stores the platform, so warm
+  reattaches skip `uname` and the login-shell spawn. Deviation: the kill switch is env
   `HERDR_REMOTE_NO_CACHE=1`, not a `--remote-no-cache` flag.
 
 ### W3 — predictive local echo, mosh-style (patches `0010` + `0011`, landed)
@@ -238,12 +235,12 @@ printable characters (and backspace) into a shell/editor.
 - **As landed (`0010`):** `src/client/screen_model.rs` — instead of a full
   libghostty-vt integration, a dedicated parser for `BlitEncoder`'s narrow
   vocabulary (no scrolling or relative motion; cell runs start with CUP).
-  Upstream v0.7.5 may batch width-1 ASCII cells and append one non-ASCII cell
-  to the same run; the model replays the ASCII prefix cell-by-cell and the
-  remaining grapheme separately. It tracks symbols, plain-vs-styled pen,
-  hyperlinks, cursor, and touched cells. Round-trip tests cover real
-  `BlitEncoder` full and diff frames, contiguous and mixed runs, wide chars,
-  and hyperlinks.
+  Upstream v0.7.5 may batch adjacent cells into one printable run, so the model
+  splits every run at Unicode extended grapheme boundaries. ASCII-leading
+  decomposed clusters such as `e` plus a combining acute accent remain one
+  cell. It tracks symbols, plain-vs-styled pen, hyperlinks, cursor, and touched
+  cells. Round-trip tests cover real `BlitEncoder` full and diff frames,
+  contiguous ASCII-prefix/decomposed runs, wide chars, and hyperlinks.
 - **As landed (`0011`):** `src/client/predict.rs` — `remote.predictive_echo
   = "off"|"auto"|"always"` (default `auto`), env `HERDR_PREDICTIVE_ECHO`.
   Conservatism as shipped: width-1 printable chars only (±shift), max 8
@@ -269,9 +266,11 @@ Patch `0013` makes observations cumulative and accepts same-row authoritative
 cursor progress as acknowledgement when the modeled symbol matches.
 Cursor-only confirmations explicitly remove their local underline. Matching
 server writes remove overlays even while an older prediction is pending;
-mismatches preserve the server's styling. Unsafe/untracked input, hidden or
-cross-row cursors, capacity exhaustion, resize, and timeout now flush and
-suspend prediction until a fresh frame. The 100 ms client timer enforces the
+mismatches preserve the server's styling. Unsafe/untracked input, actionable
+Windows mouse input (including a mouse event before a later key in one batch),
+hidden or cross-row cursors, capacity exhaustion, resize, and timeout now flush
+and suspend prediction until a fresh frame; harmless key releases remain
+ignored. The 100 ms client timer enforces the
 existing 5 s timeout even when no more frames arrive. Frame corrections are
 buffered, inserted before synchronized-output ends, and replace Linux's stale
 post-sync IME cursor repeat, producing one atomic stdout flush instead of a
@@ -385,8 +384,8 @@ feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 | W0 echo probe | `0006` | `src/client/echo_timing.rs` (new), `src/client/mod.rs` |
 | W2 batched probes + cache | `0007` | `src/remote/probe.rs` (new), `src/remote/launcher.rs` (probe funcs replaced), `src/remote.rs` |
 | W1 tcp relay | `0008` | `src/remote/tcp_relay.rs` (new), `src/remote/windows.rs`, `src/remote/unix.rs` (signature parity), `src/main.rs`, `src/config/model.rs` |
-| W4 blocking pump + CancelIoEx | `0009` | `src/remote/windows.rs`, `Cargo.toml` (`Win32_System_IO`) |
-| W3 screen model | `0010` | `src/client/screen_model.rs` (new), `src/client/mod.rs` |
+| W4 blocking pump + CancelIoEx | `0009` | `src/remote/windows.rs`, `src/ipc.rs`, `Cargo.toml` (`Win32_System_IO`) |
+| W3 screen model | `0010` | `src/client/screen_model.rs` (new), `src/client/mod.rs`, `Cargo.toml`, `Cargo.lock` |
 | W3 prediction | `0011` | `src/client/predict.rs` (new), `src/client/mod.rs`, `src/config/model.rs` |
 | W3 cursor reconciliation | `0013` | `src/client/predict.rs`, `src/client/screen_model.rs`, `src/client/mod.rs` |
 | Input packetization | `0014` | `src/protocol/wire.rs`, `src/client/input/windows_vti.rs` |
@@ -466,7 +465,9 @@ Still pending (record results in the check log):
   Upstream now batches adjacent terminal-diff cells, so patch `0010`'s screen
   model was updated to replay contiguous ASCII and mixed ASCII/Unicode runs
   correctly; regression tests cover both shapes. Clippy is clean, and the
-  filtered suites pass: remote 75, client 166, Windows 126, client transport 21,
-  config 128,
-  and wire 51. The 16-patch clean-room apply reproduces the implementation
+  filtered suites pass: remote 76, client 170, Windows 126, client transport 21,
+  config 128, and wire 51. After review remediation, focused remote-probe
+  (12), screen-model (16), predictor (27), updater (1), and generated-config
+  (2) regressions pass; private-item rustdoc has no broken intra-doc links.
+  The regenerated 16-patch clean-room apply reproduces the implementation
   tree; the nine known test-only unused-code/import warnings remain.

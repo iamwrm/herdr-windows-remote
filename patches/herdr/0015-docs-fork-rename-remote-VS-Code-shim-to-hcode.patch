@@ -1,4 +1,4 @@
-From 26a2f3438e63263e0b8b4d638639fafbf7b22893 Mon Sep 17 00:00:00 2001
+From 7c3affdefd796c8fe463f5bc3de24e8acbff8da3 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 19:08:15 +0800
 Subject: [PATCH 15/16] docs(fork): rename remote VS Code shim to hcode
@@ -7,8 +7,9 @@ Subject: [PATCH 15/16] docs(fork): rename remote VS Code shim to hcode
  src/client/code_open.rs | 4 ++--
  src/client/mod.rs       | 6 +++---
  src/config/model.rs     | 4 ++--
+ src/main.rs             | 2 +-
  src/remote/launcher.rs  | 2 +-
- 4 files changed, 8 insertions(+), 8 deletions(-)
+ 5 files changed, 9 insertions(+), 9 deletions(-)
 
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
 index 14a593c..30312eb 100644
@@ -56,10 +57,10 @@ index 6c80bc0..a18c794 100644
                      let handled = code_open
                          .as_mut()
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 552213b..afe01c7 100644
+index 2e67d21..6925c6f 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -878,8 +878,8 @@ pub struct RemoteConfig {
+@@ -880,8 +880,8 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
@@ -70,6 +71,19 @@ index 552213b..afe01c7 100644
      /// `herdr --remote`). The client only ever launches VS Code with
      /// `vscode://vscode-remote/ssh-remote+<target>` URLs for the current
      /// attach target. Env override: `HERDR_REMOTE_CODE_OPEN=1|0`. Default: true.
+diff --git a/src/main.rs b/src/main.rs
+index 03583bc..028541b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -393,7 +393,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # Predictive local echo for remote terminal attach: "off", "auto", or "always".
+ # Auto displays predictions only after observing enough network latency.
+ # predictive_echo = "auto"
+-# Allow the remote `code` shim to open local VS Code Remote-SSH windows.
++# Allow the remote `hcode` shim to open local VS Code Remote-SSH windows.
+ # code_open = true
+ 
+ [experimental]
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
 index fb90fe2..67a31ed 100644
 --- a/src/remote/launcher.rs
