@@ -115,17 +115,38 @@ jobs:
         run: |
           Copy-Item checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe herdr-windows-x86_64.exe
           Copy-Item extras\remote-bin\hcode hcode
-          "repo_commit=$env:GITHUB_SHA" | Out-File -Encoding utf8 BUILD_INFO.txt
-          "upstream_base=$env:UPSTREAM_BASE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "upstream_commit=$env:UPSTREAM_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "patched_commit=$env:PATCHED_COMMIT" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "target=x86_64-pc-windows-msvc" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
-          "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           $binaryHash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.exe).Hash.ToLowerInvariant()
-          "sha256=$binaryHash  herdr-windows-x86_64.exe" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
           $hcodeHash = (Get-FileHash -Algorithm SHA256 hcode).Hash.ToLowerInvariant()
-          "sha256=$hcodeHash  hcode" | Out-File -Encoding utf8 -Append BUILD_INFO.txt
+          # BUILD_INFO ships as HTML so the release asset renders in the
+          # browser instead of forcing a download; gh release upload derives
+          # the text/html content type from the .html extension. Keep the
+          # key=value lines inside <pre> grep-able for release verification.
+          $buildInfoLines = @(
+            "repo_commit=$env:GITHUB_SHA"
+            "upstream_base=$env:UPSTREAM_BASE"
+            "upstream_commit=$env:UPSTREAM_COMMIT"
+            "patched_commit=$env:PATCHED_COMMIT"
+            "target=x86_64-pc-windows-msvc"
+            "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE"
+            "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD"
+            "sha256=$binaryHash  herdr-windows-x86_64.exe"
+            "sha256=$hcodeHash  hcode"
+          )
+          @"
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <title>herdr Windows build info</title>
+          </head>
+          <body>
+          <h1>herdr Windows build info</h1>
+          <pre>
+          $($buildInfoLines -join "`n")
+          </pre>
+          </body>
+          </html>
+          "@ | Out-File -Encoding utf8 BUILD_INFO.html
 
       - name: Publish release
         shell: pwsh
@@ -150,7 +171,7 @@ jobs:
 
           $commitLines
 
-          See BUILD_INFO.txt for the upstream and patched commits and artifact SHA-256 checksums.
+          See [BUILD_INFO.html](https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/BUILD_INFO.html) for the upstream and patched commits and artifact SHA-256 checksums (renders in the browser, no download needed).
           "@ | Out-File -Encoding utf8 RELEASE_NOTES.md
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
@@ -167,4 +188,8 @@ jobs:
               --title "herdr $tag (Windows --remote)" `
               --notes-file RELEASE_NOTES.md
           }
-          gh release upload $tag herdr-windows-x86_64.exe hcode BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --clobber
+          # Remove a stale BUILD_INFO.txt left by earlier runs of the rolling
+          # prerelease; --clobber only replaces same-named assets.
+          gh release delete-asset $tag BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --yes *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Host "no stale BUILD_INFO.txt asset to remove" }
+          gh release upload $tag herdr-windows-x86_64.exe hcode BUILD_INFO.html --repo $env:GITHUB_REPOSITORY --clobber

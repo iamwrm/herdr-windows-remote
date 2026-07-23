@@ -195,7 +195,8 @@ labelled) for diagnosing slow attaches.
 `BASE_COMMIT`, then builds `x86_64-pc-windows-msvc` with upstream's pinned
 steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 `cargo build --release --locked`) and publishes a prerelease with
-`herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.txt`.
+`herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.html`
+(shipped as HTML so the asset renders in the browser without downloading).
 
 - **Trigger by tag:** `git tag vX.Y.Z-win.NN && git push origin <tag>`.
   The `vX.Y.Z` part must match `patches/herdr/BASE` (enforced by the

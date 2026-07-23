@@ -77,7 +77,7 @@ refreshed patches.
 peeled tag against `BASE_COMMIT`, applies the patch series with `git am`, and
 builds `x86_64-pc-windows-msvc` with upstream's
 pinned steps, and publishes a prerelease with `herdr-windows-x86_64.exe`, the
-Linux `hcode` shim, and `BUILD_INFO.txt` (repo/upstream/patched commits and
+Linux `hcode` shim, and `BUILD_INFO.html` (repo/upstream/patched commits and
 artifact SHA-256 checksums).
 
 - **Trigger by tag:** `git tag vX.Y.Z-win.NN && git push origin <tag>` →
