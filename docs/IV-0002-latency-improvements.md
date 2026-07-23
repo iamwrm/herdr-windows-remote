@@ -2,7 +2,7 @@
 
 ## Record
 
-- **Status:** implemented and exported in the current 16-patch `v0.7.5`
+- **Status:** implemented and exported in the current 17-patch `v0.7.5`
   refresh, but that refresh is unreleased; an earlier stack shipped in
   `v0.7.5-win.01`; live deb1 verification and the W1 packet-capture verdict
   remain pending
@@ -416,7 +416,7 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: the complete 16-patch series `git am` applies to a fresh
+- Clean-room: the complete 17-patch series `git am` applies to a fresh
   `v0.7.5` worktree and reproduces the refreshed implementation tree exactly;
   the fork-era CI workflow remains deliberately outside the series.
 

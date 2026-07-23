@@ -1,7 +1,7 @@
 From 7c3affdefd796c8fe463f5bc3de24e8acbff8da3 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 19:08:15 +0800
-Subject: [PATCH 15/16] docs(fork): rename remote VS Code shim to hcode
+Subject: [PATCH 15/17] docs(fork): rename remote VS Code shim to hcode
 
 ---
  src/client/code_open.rs | 4 ++--

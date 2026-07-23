@@ -1,7 +1,7 @@
 From 97afcdeb3327dc5792289ec086b13358c71cab45 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 19:59:15 +0800
-Subject: [PATCH 05/16] feat(fork): add HERDR_REMOTE_TIMING for remote attach
+Subject: [PATCH 05/17] feat(fork): add HERDR_REMOTE_TIMING for remote attach
  phase diagnostics
 
 Set HERDR_REMOTE_TIMING=1 to print per-phase timing to stderr during

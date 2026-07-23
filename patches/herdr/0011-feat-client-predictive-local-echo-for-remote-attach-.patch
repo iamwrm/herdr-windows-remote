@@ -1,7 +1,7 @@
 From 693161ffc525a9eeea9c8884bc4f3c57a1dca8f2 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 13:00:10 +0800
-Subject: [PATCH 11/16] feat(client): predictive local echo for remote attach
+Subject: [PATCH 11/17] feat(client): predictive local echo for remote attach
  (mosh-style)
 
 On a 200ms link every keystroke waits a full round trip before echoing.

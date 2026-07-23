@@ -1,7 +1,7 @@
 From 052f8d72e730fb3d70f00575c85df4fcc97b4926 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 17:57:44 +0800
-Subject: [PATCH 04/16] fix(windows): report host terminal theme so
+Subject: [PATCH 04/17] fix(windows): report host terminal theme so
  inverse-video cells render with real colors
 
 TUIs that draw their cursor as reverse video over default colors (pi,

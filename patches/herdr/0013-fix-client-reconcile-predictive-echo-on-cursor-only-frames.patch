@@ -1,7 +1,7 @@
 From cd9ed50b8c2fc0e2a6b72ee6abcc6c97df06b3da Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 17:20:13 +0800
-Subject: [PATCH 13/16] fix(client): reconcile predictive echo on cursor-only
+Subject: [PATCH 13/17] fix(client): reconcile predictive echo on cursor-only
  frames
 
 ---

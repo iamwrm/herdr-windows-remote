@@ -1,7 +1,7 @@
 From 999a63069b871bb88c7f4ec5237007f31011e765 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:18:20 +0800
-Subject: [PATCH 07/16] perf(remote): gather all setup probes in one ssh round
+Subject: [PATCH 07/17] perf(remote): gather all setup probes in one ssh round
  trip, cache verified path
 
 Attach previously ran 4-5 sequential ssh commands before the bridge could

@@ -1,7 +1,7 @@
 From fc107e477ec2888503f0df0b29b4c516f7c5d028 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:22:23 +0800
-Subject: [PATCH 08/16] feat(windows): opt-in TCP_NODELAY ProxyCommand relay
+Subject: [PATCH 08/17] feat(windows): opt-in TCP_NODELAY ProxyCommand relay
  for --remote
 
 OpenSSH sets TCP_NODELAY only on interactive (tty) sessions; the remote

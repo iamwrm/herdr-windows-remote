@@ -1,7 +1,7 @@
 From 583080f71a4cfb9fcb91d4199bf1ba6580063ca7 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 15:28:14 +0800
-Subject: [PATCH 03/16] feat(fork): disable self-update and background version
+Subject: [PATCH 03/17] feat(fork): disable self-update and background version
  check
 
 This binary is the windows-remote fork; the updater compares against the

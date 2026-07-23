@@ -2,7 +2,7 @@
 
 ## Record
 
-- **Status:** current 16-patch `v0.7.5` refresh implemented and exported but
+- **Status:** current 17-patch `v0.7.5` refresh implemented and exported but
   unreleased; the earlier `v0.7.5` stack shipped as `v0.7.5-win.01`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
@@ -12,7 +12,9 @@
   in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
 - **Consumers:** [IV-0002](IV-0002-latency-improvements.md) builds latency
   improvements on this transport; [IV-0004](IV-0004-vscode-remote-open.md)
-  adds remote-to-local VS Code opening
+  adds remote-to-local VS Code opening;
+  [IV-0005](IV-0005-windows-system-notifications.md) delivers system toast
+  notifications on the Windows client
 
 ## Purpose
 
@@ -181,7 +183,7 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: the complete 16-patch series applies with `git am` to a fresh
+- clean-room: the complete 17-patch series applies with `git am` to a fresh
   worktree at `v0.7.5` and reproduces the implementation tree exactly; the
   obsolete fork CI workflow remains intentionally outside the series
 
@@ -268,7 +270,7 @@ git format-patch vX.Y.Z -o ../../patches/herdr/
 echo vX.Y.Z > ../../patches/herdr/BASE
 git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
 cd ../..
-test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 16
+test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 17
 tmp=$(mktemp -d)
 git -C checkouts/herdr worktree add --detach "$tmp" vX.Y.Z
 git -C "$tmp" am "$PWD"/patches/herdr/*.patch

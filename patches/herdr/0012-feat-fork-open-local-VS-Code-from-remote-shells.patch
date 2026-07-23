@@ -1,7 +1,7 @@
 From a2bc55d22d1d2fe81ceb8b27f83ca7c7a36cabea Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Mon, 20 Jul 2026 13:40:45 +0800
-Subject: [PATCH 12/16] feat(fork): open local VS Code from remote shells
+Subject: [PATCH 12/17] feat(fork): open local VS Code from remote shells
 
 ---
  src/client/code_open.rs | 419 ++++++++++++++++++++++++++++++++++++++++

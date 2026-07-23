@@ -1,7 +1,7 @@
 From 92531d80addb49a2b8f3a64e031708479a4d0701 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Thu, 16 Jul 2026 14:56:33 +0800
-Subject: [PATCH 02/16] fix(windows): stop leaking win32-input-mode Enter
+Subject: [PATCH 02/17] fix(windows): stop leaking win32-input-mode Enter
  sequences into pastes
 
 Multi-line pastes into a remote (Linux) pane inserted literal

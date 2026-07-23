@@ -1,7 +1,7 @@
 From d705efa322035cd854b64f08299ab4074e896233 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:09:55 +0800
-Subject: [PATCH 06/16] feat(fork): add HERDR_ECHO_TIMING keystroke-echo
+Subject: [PATCH 06/17] feat(fork): add HERDR_ECHO_TIMING keystroke-echo
  latency probe
 
 Env-gated client-side probe measuring input-to-frame echo latency for

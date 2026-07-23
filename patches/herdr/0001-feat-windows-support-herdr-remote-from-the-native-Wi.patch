@@ -1,7 +1,7 @@
 From f6a3ff353e3d2bc633c0ff86fba6dd4be698469d Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Wed, 15 Jul 2026 19:13:59 +0800
-Subject: [PATCH 01/16] feat(windows): support herdr --remote from the native
+Subject: [PATCH 01/17] feat(windows): support herdr --remote from the native
  Windows binary
 
 Port the remote thin-client launcher to Windows:

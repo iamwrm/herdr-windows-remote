@@ -1,7 +1,7 @@
 From 8f657f062688024b43b437d8a68c6434639344f2 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:46:30 +0800
-Subject: [PATCH 09/16] perf(windows): remove 10ms poll from the remote bridge
+Subject: [PATCH 09/17] perf(windows): remove 10ms poll from the remote bridge
  keystroke pump
 
 The client->ssh pump polled PeekNamedPipe every 10ms because a blocking

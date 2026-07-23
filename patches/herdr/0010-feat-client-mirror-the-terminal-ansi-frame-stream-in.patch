@@ -1,7 +1,7 @@
 From dddab5a25f65e58f991c146618ca4135e8c81a6b Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 19 Jul 2026 12:52:11 +0800
-Subject: [PATCH 10/16] feat(client): mirror the terminal-ansi frame stream in
+Subject: [PATCH 10/17] feat(client): mirror the terminal-ansi frame stream in
  a screen model
 
 Predictive local echo (i0002 W3) needs the terminal-ansi client to know
