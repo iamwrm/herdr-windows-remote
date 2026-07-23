@@ -148,6 +148,16 @@ jobs:
           </html>
           "@ | Out-File -Encoding utf8 BUILD_INFO.html
 
+      # Direct (unzipped) upload so the run page serves the HTML for
+      # in-browser viewing; with archive: false the artifact name comes from
+      # the file name and the name parameter is ignored. Release assets, by
+      # contrast, always force a download on their direct URL.
+      - name: Upload BUILD_INFO artifact for browser preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: BUILD_INFO.html
+          archive: false
+
       - name: Publish release
         shell: pwsh
         env:
