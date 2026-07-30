@@ -12,9 +12,11 @@
   `0013-*` through `0014-*`, plus the deb1 network-simulation harness below
 - **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on
   [IV-0001](IV-0001-windows-remote.md)'s patches `0001`–`0005`
-- **Related initiatives:** [IV-0004](IV-0004-vscode-remote-open.md) owns patch
-  `0012`; [IV-0003](IV-0003-pi-predictive-echo.md) adapts pi to consume this
-  initiative's predictive echo
+- **Child consumer integration:** [IV-0003](IV-0003-pi-predictive-echo.md)
+  adapts pi's input prompt to consume W3 predictive echo; read it only when
+  working on pi compatibility
+- **Related initiative:** [IV-0004](IV-0004-vscode-remote-open.md) owns patch
+  `0012`
 
 ## Purpose
 
@@ -251,6 +253,14 @@ printable characters (and backspace) into a shell/editor.
   Typed-ahead predictions surviving a frame are re-drawn and the host
   cursor re-anchored past them. Active only for remote full-app
   terminal-ansi clients.
+
+#### Child consumer integration: pi
+
+Pi's stock input prompt hides the hardware cursor and styles its software
+caret, so it cannot pass W3's safety gates. The pi-side rendering adapter,
+installation instructions, and independent upstream retirement path live in
+[IV-0003](IV-0003-pi-predictive-echo.md). This initiative continues to own
+all predictor and reconciliation behavior.
 
 ### W3 follow-up — cursor-only reconciliation and input batching (patches `0013`–`0014`)
 

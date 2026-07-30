@@ -1,23 +1,25 @@
-# IV-0003: Predictive echo inside pi's input prompt
+# IV-0003: Pi input-prompt compatibility for IV-0002 predictive echo
 
 ## Record
 
-- **Status:** proof of concept implemented and deployed to deb1; live typing
-  exposed an untouched-space reconciliation bug, fixed in herdr patch `0013`;
-  high-RTT retest pending
+- **Status:** proof of concept implemented and deployed to deb1; high-RTT
+  retest of the parent predictor remains pending
+- **Role:** child consumer-integration document of
+  [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed),
+  not an independent predictive-echo implementation
 - **Upstream:** [earendil-works/pi](https://github.com/earendil-works/pi)
   (`pi-tui`) — no herdr or pi-core changes
 - **Deliverable:**
   [`extras/pi-extensions/predictive-echo-cursor.ts`](../extras/pi-extensions/predictive-echo-cursor.ts),
   installed on the machine running pi (the herdr server)
-- **Dependency:** [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed)
-  provides herdr client predictive echo and cursor-only reconciliation
 
 ## Purpose
 
-herdr's predictive echo works in vim but not in pi's input prompt. Make
-typing into pi over a 200 ms link feel local, without weakening the
-predictor's safety gates.
+Adapt pi's input-prompt rendering so the predictive echo owned by
+[IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed)
+works over a 200 ms link without weakening its safety gates. This child owns
+only the pi extension, its deployment, and its pi-upstream retirement path;
+the parent owns prediction, reconciliation, and transport behavior.
 
 ## Root cause
 
@@ -64,10 +66,9 @@ The extension therefore:
 
 Typeahead works precisely because the block is *gone*: normal character
 echoes touch only their typed cells, so still-pending predictions to the
-right are not falsely invalidated. A space typed over an already blank cell
-is the exception—it produces cursor movement without a cell write. Herdr
-patch `0013` now treats same-row authoritative cursor progress as cumulative
-acknowledgement and explicitly removes the space's local underline.
+right are not falsely invalidated. The parent initiative owns acknowledgement
+and reconciliation, including unchanged-space and cursor-only frames; see its
+[W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching-patches-00130014).
 
 Side benefit independent of herdr: fixes pi's double-cursor when users
 enable `showHardwareCursor` manually (hardware cursor + software block at
@@ -91,12 +92,13 @@ the same cell today).
 - Escape-level check over a pty: with the extension active and text in the
   editor, pi's output contains `ESC[?25h` (cursor shown) and **zero**
   `ESC[7m` sequences — both predictor gates confirmed passable.
-- A live typing test reproduced a stuck underline/cursor with `abc def`:
-  the unchanged space blocked later FIFO confirmations and pi's separate
-  cursor-position write arrived as a cursor-only frame.
-- Herdr patch `0013` now covers the exact content-then-cursor frame sequence;
-  live retest through `herdr --remote deb1` at 200 ms netem remains pending
-  (record in the [IV-0002 evidence log](IV-0002-latency-improvements.md#evidence-log)).
+- Live typing proved the extension reaches the predictor and exposed a herdr
+  reconciliation defect. Its root cause, fix, and regression coverage are
+  recorded in the parent's
+  [W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching-patches-00130014).
+- Live retest through `herdr --remote deb1` at 200 ms netem remains pending;
+  the authoritative status belongs in the
+  [IV-0002 evidence log](IV-0002-latency-improvements.md#evidence-log).
 
 ## Install
 
@@ -130,6 +132,6 @@ the same pattern as [IV-0001's retirement criteria](IV-0001-windows-remote.md#wh
 
 - 2026-07-19: PoC built and deployed against pi 0.80.10; escape-level
   verification green; live 200 ms typing test pending.
-- 2026-07-20: live typing reproduced the `abc def` stuck-cursor defect.
-  Root cause was client reconciliation of unchanged spaces, not the extension;
-  patch `0013` adds cursor-only acknowledgement and regression coverage.
+- 2026-07-20: live typing proved the extension reached the predictor and
+  exposed a client reconciliation defect rather than an extension defect.
+  Implementation details and regression evidence are owned by IV-0002 W3.
