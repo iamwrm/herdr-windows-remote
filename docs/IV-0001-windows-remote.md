@@ -2,8 +2,8 @@
 
 ## Record
 
-- **Status:** current 17-patch `v0.7.5` refresh implemented and exported but
-  unreleased; the earlier `v0.7.5` stack shipped as `v0.7.5-win.01`
+- **Status:** current 17-patch `v0.7.5` refresh released as
+  `v0.7.5-win.04`; earlier `v0.7.5` stacks shipped as `v0.7.5-win.01`–`.03`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 - **Deliverables:** patches `0001`–`0005` in `patches/herdr/` and
