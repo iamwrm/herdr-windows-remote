@@ -3,7 +3,7 @@
 ## Record
 
 - **Status:** implemented and exported as patch `0017`; released in
-  `v0.7.5-win.04`
+  `v0.7.5-win.05`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
 - **Deliverables:** `patches/herdr/0017-*`
@@ -12,8 +12,8 @@
 - **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
   Windows remote client that receives forwarded notifications
 - **History:** `v0.7.5-win.02` and `v0.7.5-win.03` used an interim
-  `uv` + Python `windows-toasts` helper; `v0.7.5-win.04` replaces it with
-  WinRT compiled into `herdr.exe`
+  `uv` + Python `windows-toasts` helper; `v0.7.5-win.04` replaced it with
+  WinRT compiled into `herdr.exe`; `v0.7.5-win.05` adds layered diagnostic UI
 
 ## Purpose
 
@@ -74,15 +74,69 @@ XmlDocument (ToastGeneric content)
   installation, or machine-wide configuration.
 - The call is local and synchronous. There is no process spawn, interpreter,
   package resolution, first-use download, network access, or cold-cache delay.
-- WinRT errors are converted to `std::io::Error` and handled by the existing
-  client notification logging path.
+- WinRT errors retain the exact failing stage and HRESULT before conversion to
+  `std::io::Error` and the existing client notification logging path.
+- Each attempt reads both `ToastNotifier.Setting()` and
+  `SHQueryUserNotificationState()`. These distinguish application/user/policy
+  disablement from shell suppression such as a locked session, presentation
+  mode, full-screen activity, or quiet time.
 - `windows = 0.62.2` is Windows-target-only and locked in `Cargo.lock`; the
   Linux server and remote protocol are unchanged.
 
 The notifier API accepting a toast does not guarantee that Windows displayed
-it. Windows can still suppress notifications through user settings, Focus
-Assist/Do Not Disturb, or policy; this is normal OS behavior and requires no
-protocol acknowledgement.
+it. Windows can still suppress notifications after `Show()` returns success;
+the diagnostic mode below exposes the relevant state without changing the
+remote protocol.
+
+## Layered diagnostic UI
+
+Set the environment variable before launching the Windows binary:
+
+```powershell
+$env:HERDR_WINDOWS_TOAST_DEBUG = "1"
+.\herdr-windows-x86_64.exe --remote <ssh-target>
+```
+
+The mode uses topmost dialogs from the local `herdr.exe` process and is
+strictly opt-in:
+
+1. A startup dialog confirms that the thin Windows client inherited the debug
+   flag and completed its connection/terminal setup.
+2. After dismissing it, trigger a notification in a remote pane:
+
+   ```bash
+   herdr notification show "test" --body "hello"
+   ```
+
+3. A result dialog confirms that the Windows system-toast backend was invoked.
+   For a remote session, this proves the Linux server forwarded
+   `NotifyKind::SystemToast` to the Windows client. It then reports:
+   - the failing WinRT stage and HRESULT, or `ToastNotifier.Show` success;
+   - `ToastNotifier.Setting` (`Enabled`, disabled for application/user/policy,
+     or disabled by manifest);
+   - the Windows shell state (`AcceptsNotifications`, `UserNotPresent`,
+     `Busy`, full-screen, presentation mode, quiet time, or app mode);
+   - the exact client log path.
+
+Interpretation:
+
+- startup dialog only, no result dialog → the Linux server did not forward a
+  `SystemToast` to this foreground client (check the remote config/delivery
+  layer);
+- a WinRT stage/HRESULT failure → the result dialog identifies the native API
+  layer;
+- disabled notifier setting → Windows disabled this notifier;
+- shell state other than `AcceptsNotifications` → Windows is suppressing the
+  popup at the shell layer;
+- setting `Enabled`, shell `AcceptsNotifications`, and `Show` success but no
+  popup → portable application identity is the likely remaining layer.
+
+Dialogs intentionally block the client while open. Disable the mode after the
+single diagnostic run:
+
+```powershell
+Remove-Item Env:HERDR_WINDOWS_TOAST_DEBUG
+```
 
 ## Requirements and assumptions
 
@@ -112,7 +166,7 @@ protocol acknowledgement.
 Completed on Windows with Rust 1.96.1 and Zig 0.15.2:
 
 - `cargo clippy --locked --bin herdr -- -D warnings` — clean;
-- `cargo test --locked --bin herdr windows_` — 128 passed, 1 intentionally
+- `cargo test --locked --bin herdr windows_` — 133 passed, 1 intentionally
   ignored live-toast test;
 - `cargo test --locked --bin herdr client::` — 174 passed;
 - `cargo test --locked --bin herdr config::` — 128 passed;
@@ -125,10 +179,11 @@ Completed on Windows with Rust 1.96.1 and Zig 0.15.2:
   x86_64-pc-windows-msvc` — clean;
 - DOM tests verify exact title/body round trips including `<`, `>`, and `&`,
   and verify omission of absent/empty bodies;
-- explicit ignored-test run
-  `cargo test --locked --bin herdr windows_native_toast_smoke -- --ignored`
-  submitted a real toast successfully from a non-elevated, medium-integrity
-  process;
+- explicit ignored-test run with `HERDR_WINDOWS_TOAST_DEBUG=1` submitted a
+  real toast from a non-elevated, medium-integrity process and displayed the
+  diagnostic UI; it reported notifier setting `Enabled`, shell state
+  `UserNotPresent`, and successful `Show()`, correctly locating suppression in
+  the locked/unavailable Windows shell session;
 - the release binary contains none of the old `windows-toasts`, `uv run`, or
   embedded Python-helper strings;
 - clean-room patch application reproduces the implementation tree exactly.
@@ -147,6 +202,9 @@ background agent finish.
 - Do not add registration or installation as an implicit side effect of
   showing a toast. Any future identity setup must remain explicit and
   per-user.
+- Keep `HERDR_WINDOWS_TOAST_DEBUG` opt-in and client-local. Do not add a new
+  protocol message: remote sessions must remain compatible with official Linux
+  servers.
 - The Windows test that launches PowerShell shares the integration environment
   lock because integration tests temporarily replace process-global `PATH`;
   retain that serialization so the `windows_` filter remains parallel-safe.

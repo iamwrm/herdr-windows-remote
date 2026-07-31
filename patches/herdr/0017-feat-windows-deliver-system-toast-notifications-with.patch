@@ -1,4 +1,4 @@
-From b9ed56423f01d7481a982b923812951fdb6cd061 Mon Sep 17 00:00:00 2001
+From 3e706b953f3b83da01a6b4b2bef904b2fd88e3dd Mon Sep 17 00:00:00 2001
 From: clean-room <clean-room@example.invalid>
 Date: Thu, 23 Jul 2026 16:40:20 +0800
 Subject: [PATCH 17/17] feat(windows): deliver system toast notifications with
@@ -12,14 +12,17 @@ ToastNotificationManager under the per-user herdr app ID. This keeps
 notification text as data and removes the uv, Python, windows-toasts,
 helper-process, network, and elevation requirements.
 
-Add focused DOM tests plus an ignored real-notification smoke test, and
-serialize the existing PATH-sensitive Windows shell test with the shared
-environment lock.
+Add opt-in HERDR_WINDOWS_TOAST_DEBUG dialogs that confirm client startup and
+SystemToast receipt, identify the failing WinRT stage and HRESULT, and report
+both ToastNotifier.Setting and the Windows shell notification state. Also add
+focused tests and serialize the existing PATH-sensitive Windows shell test
+with the shared environment lock.
 ---
- Cargo.lock              | 105 +++++++++++++++++++++++++++++++++++++++
+ Cargo.lock              | 105 ++++++++++
  Cargo.toml              |   1 +
- src/platform/windows.rs | 106 +++++++++++++++++++++++++++++++++++++++-
- 3 files changed, 210 insertions(+), 2 deletions(-)
+ src/client/mod.rs       |   3 +
+ src/platform/windows.rs | 455 +++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 561 insertions(+), 3 deletions(-)
 
 diff --git a/Cargo.lock b/Cargo.lock
 index a46b096..e935077 100644
@@ -169,8 +172,22 @@ index fee594d..1aaedf6 100644
  windows-sys = { version = "0.61.2", features = [
      "Wdk_System_Threading",
      "Win32_Foundation",
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index a18c794..bbd2d81 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -1211,6 +1211,9 @@ fn run_client_with_mode(
+         err
+     })?;
+ 
++    #[cfg(windows)]
++    crate::platform::show_windows_toast_debug_ready();
++
+     // Install a panic hook to restore the terminal on panic (same as monolithic).
+     let panic_resets_modify_other_keys = terminal_guard.reset_modify_other_keys;
+     let panic_resets_host_color_scheme_reports = terminal_guard.reset_host_color_scheme_reports;
 diff --git a/src/platform/windows.rs b/src/platform/windows.rs
-index 317ac49..cfdcd6b 100644
+index 317ac49..bd6f3ce 100644
 --- a/src/platform/windows.rs
 +++ b/src/platform/windows.rs
 @@ -8,6 +8,11 @@ use std::{
@@ -180,34 +197,301 @@ index 317ac49..cfdcd6b 100644
 +use windows::{
 +    core::HSTRING,
 +    Data::Xml::Dom::{XmlDocument, XmlElement},
-+    UI::Notifications::{ToastNotification, ToastNotificationManager},
++    UI::Notifications::{NotificationSetting, ToastNotification, ToastNotificationManager},
 +};
  use windows_sys::{
      Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
      Win32::{
-@@ -666,8 +671,57 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
+@@ -34,7 +39,17 @@ use windows_sys::{
+                 PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+             },
+         },
+-        UI::Shell::{CommandLineToArgvW, ShellExecuteW},
++        UI::{
++            Shell::{
++                CommandLineToArgvW, SHQueryUserNotificationState, ShellExecuteW,
++                QUERY_USER_NOTIFICATION_STATE, QUNS_ACCEPTS_NOTIFICATIONS, QUNS_APP, QUNS_BUSY,
++                QUNS_NOT_PRESENT, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
++                QUNS_RUNNING_D3D_FULL_SCREEN,
++            },
++            WindowsAndMessaging::{
++                MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
++            },
++        },
+     },
+ };
+ 
+@@ -666,8 +681,305 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
      None
  }
  
 -pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::Result<bool> {
 -    Ok(false)
 +const WINDOWS_TOAST_APP_ID: &str = "herdr";
++const WINDOWS_TOAST_DEBUG_ENV_VAR: &str = "HERDR_WINDOWS_TOAST_DEBUG";
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum WindowsToastStage {
++    BuildDocument,
++    CreateNotification,
++    CreateNotifier,
++    ReadSetting,
++    Show,
++}
++
++impl WindowsToastStage {
++    fn label(self) -> &'static str {
++        match self {
++            Self::BuildDocument => "build WinRT XML document",
++            Self::CreateNotification => "create ToastNotification",
++            Self::CreateNotifier => "create ToastNotifier for app ID 'herdr'",
++            Self::ReadSetting => "read ToastNotifier.Setting",
++            Self::Show => "call ToastNotifier.Show",
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++enum WindowsShellNotificationState {
++    Value(QUERY_USER_NOTIFICATION_STATE),
++    QueryFailed(u32),
++}
++
++#[derive(Debug, Clone, Copy)]
++struct WindowsToastOutcome {
++    setting: NotificationSetting,
++    shell_state: WindowsShellNotificationState,
++}
++
++#[derive(Debug)]
++struct WindowsToastError {
++    stage: WindowsToastStage,
++    source: windows::core::Error,
++}
++
++impl WindowsToastError {
++    fn new(stage: WindowsToastStage, source: windows::core::Error) -> Self {
++        Self { stage, source }
++    }
++
++    fn hresult(&self) -> u32 {
++        self.source.code().0 as u32
++    }
++}
++
++impl std::fmt::Display for WindowsToastError {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            formatter,
++            "{} failed (HRESULT 0x{:08X}): {}",
++            self.stage.label(),
++            self.hresult(),
++            self.source.message()
++        )
++    }
++}
++
++impl std::error::Error for WindowsToastError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.source)
++    }
++}
 +
 +/// Show a native Windows toast through the current user's WinRT notification
 +/// service. This uses no helper process, external runtime, registration, or
 +/// elevated operation.
 +pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
-+    show_windows_toast(title, body)
-+        .map(|()| true)
++    let result = show_windows_toast(title, body);
++    if windows_toast_debug_enabled() {
++        match &result {
++            Ok(outcome) => tracing::info!(
++                event = "windows.toast.diagnostic",
++                outcome = "winrt_show_returned_success",
++                notification_setting = windows_notification_setting_label(outcome.setting),
++                shell_state = windows_shell_notification_state_label(outcome.shell_state),
++                "Windows system toast diagnostic"
++            ),
++            Err(err) => tracing::warn!(
++                event = "windows.toast.diagnostic",
++                outcome = "winrt_error",
++                stage = err.stage.label(),
++                hresult = format_args!("0x{:08X}", err.hresult()),
++                error = %err.source.message(),
++                "Windows system toast diagnostic"
++            ),
++        }
++        show_windows_toast_debug_dialog(&windows_toast_debug_report(title, body, &result));
++    }
++
++    result
++        .map(|_| true)
 +        .map_err(|err| std::io::Error::other(err.to_string()))
 +}
 +
-+fn show_windows_toast(title: &str, body: Option<&str>) -> windows::core::Result<()> {
-+    let document = build_windows_toast_document(title, body)?;
-+    let notification = ToastNotification::CreateToastNotification(&document)?;
++fn show_windows_toast(
++    title: &str,
++    body: Option<&str>,
++) -> Result<WindowsToastOutcome, WindowsToastError> {
++    let document = build_windows_toast_document(title, body)
++        .map_err(|err| WindowsToastError::new(WindowsToastStage::BuildDocument, err))?;
++    let notification = ToastNotification::CreateToastNotification(&document)
++        .map_err(|err| WindowsToastError::new(WindowsToastStage::CreateNotification, err))?;
 +    let notifier =
-+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(WINDOWS_TOAST_APP_ID))?;
-+    notifier.Show(&notification)
++        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(WINDOWS_TOAST_APP_ID))
++            .map_err(|err| WindowsToastError::new(WindowsToastStage::CreateNotifier, err))?;
++    let setting = notifier
++        .Setting()
++        .map_err(|err| WindowsToastError::new(WindowsToastStage::ReadSetting, err))?;
++    let shell_state = query_windows_shell_notification_state();
++    notifier
++        .Show(&notification)
++        .map_err(|err| WindowsToastError::new(WindowsToastStage::Show, err))?;
++    Ok(WindowsToastOutcome {
++        setting,
++        shell_state,
++    })
++}
++
++fn query_windows_shell_notification_state() -> WindowsShellNotificationState {
++    let mut state = 0;
++    let result = unsafe { SHQueryUserNotificationState(&mut state) };
++    if result >= 0 {
++        WindowsShellNotificationState::Value(state)
++    } else {
++        WindowsShellNotificationState::QueryFailed(result as u32)
++    }
++}
++
++fn windows_notification_setting_label(setting: NotificationSetting) -> &'static str {
++    if setting == NotificationSetting::Enabled {
++        "Enabled"
++    } else if setting == NotificationSetting::DisabledForApplication {
++        "DisabledForApplication"
++    } else if setting == NotificationSetting::DisabledForUser {
++        "DisabledForUser"
++    } else if setting == NotificationSetting::DisabledByGroupPolicy {
++        "DisabledByGroupPolicy"
++    } else if setting == NotificationSetting::DisabledByManifest {
++        "DisabledByManifest"
++    } else {
++        "Unknown"
++    }
++}
++
++fn windows_shell_notification_state_label(state: WindowsShellNotificationState) -> &'static str {
++    match state {
++        WindowsShellNotificationState::Value(QUNS_ACCEPTS_NOTIFICATIONS) => "AcceptsNotifications",
++        WindowsShellNotificationState::Value(QUNS_NOT_PRESENT) => "UserNotPresent",
++        WindowsShellNotificationState::Value(QUNS_BUSY) => "Busy",
++        WindowsShellNotificationState::Value(QUNS_RUNNING_D3D_FULL_SCREEN) => {
++            "RunningD3dFullScreen"
++        }
++        WindowsShellNotificationState::Value(QUNS_PRESENTATION_MODE) => "PresentationMode",
++        WindowsShellNotificationState::Value(QUNS_QUIET_TIME) => "QuietTime",
++        WindowsShellNotificationState::Value(QUNS_APP) => "App",
++        WindowsShellNotificationState::Value(_) => "Unknown",
++        WindowsShellNotificationState::QueryFailed(_) => "QueryFailed",
++    }
++}
++
++pub(crate) fn show_windows_toast_debug_ready() {
++    if !windows_toast_debug_enabled() {
++        return;
++    }
++
++    tracing::info!(
++        event = "windows.toast.diagnostic",
++        outcome = "client_ready",
++        "Windows system toast diagnostics enabled"
++    );
++    show_windows_toast_debug_dialog(
++        "Windows notification diagnostics are active.\r\n\r\n\
++         The Herdr client started and inherited HERDR_WINDOWS_TOAST_DEBUG. \
++         Dismiss this dialog, then trigger a system notification.\r\n\r\n\
++         If no second dialog appears, the remote server did not send a \
++         SystemToast to this Windows client.",
++    );
++}
++
++fn windows_toast_debug_enabled() -> bool {
++    windows_toast_debug_enabled_from_value(
++        std::env::var(WINDOWS_TOAST_DEBUG_ENV_VAR).ok().as_deref(),
++    )
++}
++
++fn windows_toast_debug_enabled_from_value(value: Option<&str>) -> bool {
++    value
++        .map(|value| {
++            matches!(
++                value.trim().to_ascii_lowercase().as_str(),
++                "1" | "true" | "yes" | "on"
++            )
++        })
++        .unwrap_or(false)
++}
++
++fn windows_toast_debug_report(
++    title: &str,
++    body: Option<&str>,
++    result: &Result<WindowsToastOutcome, WindowsToastError>,
++) -> String {
++    let body = body.filter(|body| !body.is_empty()).unwrap_or("<none>");
++    let log_path = crate::session::data_dir().join("herdr-client.log");
++    let outcome = match result {
++        Ok(outcome) => {
++            let setting = windows_notification_setting_label(outcome.setting);
++            let shell_state = windows_shell_notification_state_label(outcome.shell_state);
++            let shell_state_value = match outcome.shell_state {
++                WindowsShellNotificationState::Value(value) => value.to_string(),
++                WindowsShellNotificationState::QueryFailed(hresult) => {
++                    format!("HRESULT 0x{hresult:08X}")
++                }
++            };
++            format!(
++                "WinRT notification setting: {setting} ({}).\r\n\
++                 Windows shell state: {shell_state} ({shell_state_value}).\r\n\
++                 ToastNotifier.Show returned success.\r\n\r\n\
++                 If the setting is not Enabled, that setting is the failure layer. \
++                 If the shell does not accept notifications, Windows is suppressing popups. \
++                 If both permit notifications but no toast appeared, portable app identity is the likely layer.",
++                outcome.setting.0
++            )
++        }
++        Err(err) => format!(
++            "WinRT result: FAILED at {}.\r\nHRESULT: 0x{:08X}\r\nError: {}",
++            err.stage.label(),
++            err.hresult(),
++            err.source.message()
++        ),
++    };
++
++    format!(
++        "Herdr invoked the Windows system-toast backend.\r\n\r\n\
++         For a remote session, this proves the Linux server's SystemToast reached the Windows client.\r\n\r\n\
++         Title: {title}\r\nBody: {body}\r\n\r\n{outcome}\r\n\r\n\
++         Client log: {}",
++        log_path.display()
++    )
++}
++
++fn show_windows_toast_debug_dialog(message: &str) {
++    let caption = wide_null("Herdr Windows notification diagnostics");
++    let message = wide_null(message);
++    let result = unsafe {
++        MessageBoxW(
++            null_mut(),
++            message.as_ptr(),
++            caption.as_ptr(),
++            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
++        )
++    };
++    if result == 0 {
++        tracing::warn!(
++            event = "windows.toast.diagnostic",
++            outcome = "dialog_failed",
++            "failed to show Windows system toast diagnostic dialog"
++        );
++    }
 +}
 +
 +fn build_windows_toast_document(
@@ -245,7 +529,7 @@ index 317ac49..cfdcd6b 100644
  }
  
  fn wide_null(value: &str) -> Vec<u16> {
-@@ -829,6 +883,7 @@ mod tests {
+@@ -829,6 +1141,7 @@ mod tests {
  
      #[test]
      fn windows_shells_round_trip_agent_arguments_through_a_real_command() {
@@ -253,7 +537,7 @@ index 317ac49..cfdcd6b 100644
          let base = std::env::temp_dir().join(format!(
              "herdr-agent-argv-{}-{}",
              std::process::id(),
-@@ -1352,6 +1407,53 @@ mod tests {
+@@ -1352,6 +1665,142 @@ mod tests {
          );
      }
  
@@ -289,6 +573,95 @@ index 317ac49..cfdcd6b 100644
 +            assert_eq!(nodes.Length().unwrap(), 1);
 +            assert_eq!(nodes.Item(0).unwrap().InnerText().unwrap(), "title");
 +        }
++    }
++
++    #[test]
++    fn windows_toast_debug_env_parses_explicit_truthy_values() {
++        for value in ["1", "true", "TRUE", " yes ", "on"] {
++            assert!(super::windows_toast_debug_enabled_from_value(Some(value)));
++        }
++        for value in ["", "0", "false", "debug", "off"] {
++            assert!(!super::windows_toast_debug_enabled_from_value(Some(value)));
++        }
++        assert!(!super::windows_toast_debug_enabled_from_value(None));
++    }
++
++    #[test]
++    fn windows_toast_debug_report_includes_setting_and_post_show_guidance() {
++        let outcome = super::WindowsToastOutcome {
++            setting: windows::UI::Notifications::NotificationSetting::Enabled,
++            shell_state: super::WindowsShellNotificationState::Value(
++                windows_sys::Win32::UI::Shell::QUNS_ACCEPTS_NOTIFICATIONS,
++            ),
++        };
++        let report = super::windows_toast_debug_report("title", Some("body"), &Ok(outcome));
++
++        assert!(report.contains("SystemToast reached the Windows client"));
++        assert!(report.contains("WinRT notification setting: Enabled (0)"));
++        assert!(report.contains("Windows shell state: AcceptsNotifications (5)"));
++        assert!(report.contains("ToastNotifier.Show returned success"));
++        assert!(report.contains("If the setting is not Enabled"));
++        assert!(report.contains("Title: title"));
++        assert!(report.contains("Body: body"));
++    }
++
++    #[test]
++    fn windows_toast_debug_labels_disabled_notification_settings() {
++        use windows::UI::Notifications::NotificationSetting;
++
++        for (setting, label) in [
++            (
++                NotificationSetting::DisabledForApplication,
++                "DisabledForApplication",
++            ),
++            (NotificationSetting::DisabledForUser, "DisabledForUser"),
++            (
++                NotificationSetting::DisabledByGroupPolicy,
++                "DisabledByGroupPolicy",
++            ),
++            (
++                NotificationSetting::DisabledByManifest,
++                "DisabledByManifest",
++            ),
++            (NotificationSetting(99), "Unknown"),
++        ] {
++            assert_eq!(super::windows_notification_setting_label(setting), label);
++        }
++    }
++
++    #[test]
++    fn windows_toast_debug_labels_shell_suppression_states() {
++        use super::WindowsShellNotificationState::Value;
++        use windows_sys::Win32::UI::Shell::{
++            QUNS_BUSY, QUNS_NOT_PRESENT, QUNS_PRESENTATION_MODE, QUNS_QUIET_TIME,
++            QUNS_RUNNING_D3D_FULL_SCREEN,
++        };
++
++        for (state, label) in [
++            (Value(QUNS_NOT_PRESENT), "UserNotPresent"),
++            (Value(QUNS_BUSY), "Busy"),
++            (Value(QUNS_RUNNING_D3D_FULL_SCREEN), "RunningD3dFullScreen"),
++            (Value(QUNS_PRESENTATION_MODE), "PresentationMode"),
++            (Value(QUNS_QUIET_TIME), "QuietTime"),
++            (Value(99), "Unknown"),
++        ] {
++            assert_eq!(super::windows_shell_notification_state_label(state), label);
++        }
++    }
++
++    #[test]
++    fn windows_toast_debug_report_identifies_winrt_stage_and_hresult() {
++        let source = windows::core::Error::new(
++            windows::core::HRESULT(0x80070005_u32 as i32),
++            "diagnostic access denied",
++        );
++        let error = super::WindowsToastError::new(super::WindowsToastStage::CreateNotifier, source);
++        let report = super::windows_toast_debug_report("title", None, &Err(error));
++
++        assert!(report.contains("FAILED at create ToastNotifier"));
++        assert!(report.contains("HRESULT: 0x80070005"));
++        assert!(report.contains("diagnostic access denied"));
++        assert!(report.contains("Body: <none>"));
 +    }
 +
 +    #[test]
