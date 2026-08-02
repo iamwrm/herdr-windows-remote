@@ -2,11 +2,12 @@
 
 ## Record
 
-- **Status:** current 17-patch `v0.7.5` refresh released as
-  `v0.7.5-win.05`; earlier `v0.7.5` stacks shipped as `v0.7.5-win.01`–`.04`
+- **Status:** the current four-patch, initiative-owned representation postdates
+  the releases; its identical implementation tree shipped as `v0.7.5-win.05`;
+  earlier `v0.7.5` stacks shipped as `v0.7.5-win.01`–`.04`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-- **Deliverables:** patches `0001`–`0005` in `patches/herdr/` and
+- **Deliverables:** ownership patch `patches/herdr/0001-*-IV-0001.patch` and
   `.github/workflows/release-windows.yml`
 - **Implementation base:** upstream release tag `v0.7.5` (`ef4c23f`), pinned
   in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
@@ -61,14 +62,18 @@ pointed at that socket. Only a thin platform layer was Unix-only.
   `update::is_package_manager_managed_exe_path`, the 60s remote handshake
   timeout in `client/mod.rs`, `platform::capabilities().remote_attach`
 
-## Implemented patch series
+## Implemented ownership patch
 
-### Patch 0001 — `feat(windows): support herdr --remote from the native Windows binary`
+Patch `0001` contains the complete IV-0001 ownership boundary. The changes below
+were developed separately, but are maintained together because they jointly
+provide and safeguard the native Windows remote client.
+
+### Native Windows remote transport
 
 The port described above: `launcher.rs` split, new `unix.rs`/`windows.rs`
 platform layers, `crate::ipc` named-pipe bridge, un-gated modules.
 
-### Patch 0002 — `fix(windows): stop leaking win32-input-mode Enter sequences into pastes`
+### Win32-input-mode paste fix
 
 Multi-line pastes into a remote Linux pane inserted literal
 `[13;28;13;1;0;0;1_` after every line end. Two client-side defects in
@@ -95,7 +100,7 @@ test (`vti_win32_input_mode_sequence_inside_bracketed_paste_stays_payload`)
 deliberately asserted the raw-preservation behavior and was updated to expect
 the decoded payload — flag this if submitting a PR upstream.
 
-### Patch 0003 — `feat(fork): disable self-update and background version check`
+### Fork self-update safeguard
 
 `herdr update` and the background version check are **hard-disabled**
 (`FORK_BUILD` in `src/update.rs`): both compare against the official herdr.dev
@@ -107,7 +112,7 @@ Kept enabled on purpose: the agent-manifest background check (agent detection
 data only) and the remote-install manifest lookup — installing the matching
 official *Linux* binary on the ssh target is exactly what `--remote` needs.
 
-### Patch 0004 — `fix(windows): report host terminal theme so inverse-video cells render with real colors`
+### Host terminal theme and inverse-video rendering fix
 
 TUIs that hide the native cursor and draw their own as reverse video over
 default colors (pi's editor does exactly `\x1b[7m<char>\x1b[27m`) showed a
@@ -139,7 +144,7 @@ screenshot pixel sampling (`#CCCCCC`/`#0C0C0C` instead of pure
 conhost) still show the fallback unless the server also has fix 2. Both layers
 are platform-generic quality fixes; no protocol change was needed.
 
-### Patch 0005 — `feat(fork): add HERDR_REMOTE_TIMING for remote attach phase diagnostics`
+### Remote attach timing diagnostics
 
 `HERDR_REMOTE_TIMING=1` prints per-phase attach timing (each ssh round-trip
 labelled) for diagnosing slow attaches.
@@ -155,7 +160,7 @@ labelled) for diagnosing slow attaches.
 | herdr | `src/client/input/windows_vti.rs`, `src/client/input.rs` | win32-input-mode paste fix; OSC 10/11 theme forwarding |
 | herdr | `src/pane/terminal.rs` | inverse-cell fallback rendering |
 | herdr | `src/update.rs` | `FORK_BUILD` self-update disable |
-| this repo | `patches/herdr/0001..0005-*.patch`, `patches/herdr/BASE*` | durable patch series + pinned release tag/commit |
+| this repo | `patches/herdr/0001-*-IV-0001.patch`, `patches/herdr/BASE*` | durable ownership patch + pinned release tag/commit |
 | this repo | `.github/workflows/release-windows.yml` | fetch `BASE`, verify `BASE_COMMIT` → `git am` → build → release |
 
 ## Known limitations / non-goals
@@ -168,7 +173,7 @@ labelled) for diagnosing slow attaches.
 - `remote-client-bridge` still stubbed on Windows (Windows hosts can't be
   `--remote` *targets* — not needed, the target is Linux)
 - no upstreaming of the port itself (patches stay local per `docs/repo.md`);
-  patches 0002 and 0004 are platform-generic and worth offering upstream
+  the input and theme fixes are platform-generic and worth offering upstream
 
 ## Evidence and reproduction
 
@@ -183,7 +188,7 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: the complete 17-patch series applies with `git am` to a fresh
+- clean-room: the complete four-patch series applies with `git am` to a fresh
   worktree at `v0.7.5` and reproduces the implementation tree exactly; the
   obsolete fork CI workflow remains intentionally outside the series
 
@@ -210,8 +215,8 @@ steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 
 ### Update policy
 
-Fork builds never self-update (patch 0003). To update, download from this
-repo's releases. The remote-install path deliberately still uses the official
+Fork builds never self-update (the safeguard is owned by patch `0001`). To
+update, download from this repo's releases. The remote-install path deliberately still uses the official
 manifests — that is how `--remote` provisions the matching official *Linux*
 binary on the ssh target.
 
@@ -266,12 +271,16 @@ promptly.
 Publish:
 
 ```bash
-rm ../../patches/herdr/00*.patch
-git format-patch vX.Y.Z -o ../../patches/herdr/
+patch_stage=$(mktemp -d)
+git format-patch --filename-max-length=100 vX.Y.Z -o "$patch_stage"
+test "$(find "$patch_stage" -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
+rm ../../patches/herdr/*.patch
+cp "$patch_stage"/*.patch ../../patches/herdr/
+rm -rf "$patch_stage"
 echo vX.Y.Z > ../../patches/herdr/BASE
 git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
 cd ../..
-test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 17
+test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
 tmp=$(mktemp -d)
 git -C checkouts/herdr worktree add --detach "$tmp" vX.Y.Z
 git -C "$tmp" am "$PWD"/patches/herdr/*.patch
@@ -334,7 +343,7 @@ and this doc.
 | --- | --- | --- |
 | `fork-v0.7.3-win.1` | `v0.7.3` (`a0678a3`) | initial port |
 | `fork-v0.7.4-win.1` | `v0.7.4` (`50aaa2e`) | docs-only upstream release; clean rebase; auto-update path verified live |
-| `fork-v0.7.4-win.2` | `v0.7.4` | patch 0002: win32-input-mode paste fix |
-| `fork-v0.7.4-win.3` | `v0.7.4` | patch 0003: self-update disabled |
-| `fork-v0.7.4-win.4` | `v0.7.4` | patch 0004: host terminal theme / inverse-video fix |
-| `fork-v0.7.4-win.5` | `v0.7.4` | patch 0005: `HERDR_REMOTE_TIMING` |
+| `fork-v0.7.4-win.2` | `v0.7.4` | win32-input-mode paste fix |
+| `fork-v0.7.4-win.3` | `v0.7.4` | self-update disabled |
+| `fork-v0.7.4-win.4` | `v0.7.4` | host terminal theme / inverse-video fix |
+| `fork-v0.7.4-win.5` | `v0.7.4` | `HERDR_REMOTE_TIMING` |

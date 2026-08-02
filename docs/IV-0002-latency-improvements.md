@@ -2,21 +2,22 @@
 
 ## Record
 
-- **Status:** implemented and exported in the current 17-patch `v0.7.5`
-  refresh, but that refresh is unreleased; an earlier stack shipped in
-  `v0.7.5-win.01`; live deb1 verification and the W1 packet-capture verdict
-  remain pending
+- **Status:** implemented in ownership patch `0002` of the current four-patch
+  `v0.7.5` representation, which postdates the releases; its identical
+  implementation tree shipped as `v0.7.5-win.05` (the initial latency stack
+  shipped in `v0.7.5-win.01`); live deb1
+  verification and the W1 packet-capture verdict remain pending
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-- **Deliverables:** patches `patches/herdr/0006-*` through `0011-*` and
-  `0013-*` through `0014-*`, plus the deb1 network-simulation harness below
+- **Deliverables:** ownership patch `patches/herdr/0002-*-IV-0002.patch`,
+  plus the deb1 network-simulation harness below
 - **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on
-  [IV-0001](IV-0001-windows-remote.md)'s patches `0001`–`0005`
+  [IV-0001](IV-0001-windows-remote.md)'s ownership patch `0001`
 - **Child consumer integration:** [IV-0003](IV-0003-pi-predictive-echo.md)
   adapts pi's input prompt to consume W3 predictive echo; read it only when
   working on pi compatibility
-- **Related initiative:** [IV-0004](IV-0004-vscode-remote-open.md) owns patch
-  `0012`
+- **Related initiative:** [IV-0004](IV-0004-vscode-remote-open.md) owns the
+  following patch, `0003`; no IV-0004 changes are mixed into this patch
 
 ## Purpose
 
@@ -29,11 +30,11 @@ RTT, and hide the RTT itself where possible (predictive echo).
 ## Constraint that shapes every design below
 
 **The remote server is the *official* Linux binary.** The launcher installs
-official assets from `https://herdr.dev/latest.json` (kept deliberately, see
-IV-0001 patch `0003`). Therefore:
+official assets from `https://herdr.dev/latest.json` (kept deliberately by
+IV-0001 patch `0001`). Therefore:
 
 - Server-side changes only help fork-vs-fork setups and are at most
-  defense-in-depth (IV-0001 patch `0004` set this precedent).
+  defense-in-depth (IV-0001's theme fix set this precedent).
 - The wire protocol (`src/protocol/wire.rs`, `CURRENT_PROTOCOL`) must not
   change. No new `ServerMessage`/`ClientMessage` variants, no field changes.
 - All improvements must live in the **client**, the **launcher/bridge**, or
@@ -62,7 +63,7 @@ Setup path (before the client starts), all in
 The cold happy path is **1 probe connection + 1 persistent bridge**. A warm
 cache uses the same single probe connection but verifies only the cached path.
 Windows OpenSSH has no ControlMaster, so these remain fresh authenticated
-connections; `HERDR_REMOTE_TIMING=1` (IV-0001 patch `0005`) labels each phase.
+connections; `HERDR_REMOTE_TIMING=1` (IV-0001 patch `0001`) labels each phase.
 
 What already helps at high RTT (do not regress):
 
@@ -74,10 +75,11 @@ What already helps at high RTT (do not regress):
 
 ## Workstreams
 
-Landing order = W0 → W2 → W1 → W4 → W3 (measure first, cheapest wins next).
-W5 is exploration only. Each workstream is one patch unless noted.
+Implementation order was W0 → W2 → W1 → W4 → W3 (measure first, cheapest
+wins next). W5 is exploration only. All landed workstreams now form ownership
+patch `0002`; the headings retain their design boundaries inside that patch.
 
-### W0 — measurement: keystroke-echo latency probe (patch `0006`, landed)
+### W0 — measurement: keystroke-echo latency probe (landed)
 
 Everything else needs before/after numbers. `HERDR_REMOTE_TIMING` only covers
 attach; add a steady-state probe.
@@ -99,7 +101,7 @@ attach; add a steady-state probe.
   `=verbose` adds rolling reports every 25 samples (the rolling lines were
   too noisy to be the default during live testing).
 
-### W1 — TCP_NODELAY via ProxyCommand relay (patch `0008`, landed; verification pending)
+### W1 — TCP_NODELAY via ProxyCommand relay (landed; verification pending)
 
 **Hypothesis to verify first, not assume:** OpenSSH sets `TCP_NODELAY` only
 for interactive (tty) sessions; the bridge uses `ssh -T` (no tty), so Nagle +
@@ -138,7 +140,7 @@ while a previous one is unacked (typing fast ⇒ perceived ~2×RTT).
   whether to recommend enabling it, not whether the code ships. Fixes only
   the client→server leg; measure both directions with W0.
 
-### W2 — batch the setup probes + verified-host cache (patch `0007`, landed)
+### W2 — batch the setup probes + verified-host cache (landed)
 
 Collapse the 4–5 sequential probe connections into 1, and skip probing
 entirely on reattach.
@@ -188,20 +190,20 @@ entirely on reattach.
   reattaches skip `uname` and the login-shell spawn. Deviation: the kill switch is env
   `HERDR_REMOTE_NO_CACHE=1`, not a `--remote-no-cache` flag.
 
-### W3 — predictive local echo, mosh-style (patches `0010` + `0011`, landed)
+### W3 — predictive local echo, mosh-style (landed)
 
 The biggest UX win and the hardest. Hide the RTT for the common case: typing
 printable characters (and backspace) into a shell/editor.
 
-- **Prerequisite — client-side screen model (patch `0010`):** the
+- **Prerequisite — client-side screen model:** the
   terminal-ansi client today blits server bytes without understanding them.
   Prediction requires knowing cursor position and cell contents. Feed every
   received `TerminalFrame.bytes` into a local terminal model to mirror what
   is on screen. **libghostty-vt is already vendored** (`vendor/`, used by the
-  server's panes) — reuse it in the client as the model. No visible behavior
-  change in this patch; add an env-gated debug assert mode that the model's
+  server's panes) — reuse it in the client as the model. This model layer has
+  no visible behavior by itself; add an env-gated debug assert mode that its
   cursor matches reality after `full` frames.
-- **Prediction engine (patch `0011`):** on printable-char/backspace input in
+- **Prediction engine:** on printable-char/backspace input in
   a predictable context, immediately write the char at the model's cursor
   with a distinguishing style (underline, like mosh), advance a local
   predicted-cursor, and record the prediction with the `seq` in flight.
@@ -234,7 +236,7 @@ printable characters (and backspace) into a shell/editor.
   with underline and are confirmed (underline drops) after ~1 RTT;
   mispredictions self-heal ≤1 RTT; `off` restores today's behavior
   byte-for-byte.
-- **As landed (`0010`):** `src/client/screen_model.rs` — instead of a full
+- **As landed (screen model):** `src/client/screen_model.rs` — instead of a full
   libghostty-vt integration, a dedicated parser for `BlitEncoder`'s narrow
   vocabulary (no scrolling or relative motion; cell runs start with CUP).
   Upstream v0.7.5 may batch adjacent cells into one printable run, so the model
@@ -243,7 +245,7 @@ printable characters (and backspace) into a shell/editor.
   cell. It tracks symbols, plain-vs-styled pen, hyperlinks, cursor, and touched
   cells. Round-trip tests cover real `BlitEncoder` full and diff frames,
   contiguous ASCII-prefix/decomposed runs, wide chars, and hyperlinks.
-- **As landed (`0011`):** `src/client/predict.rs` — `remote.predictive_echo
+- **As landed (prediction engine):** `src/client/predict.rs` — `remote.predictive_echo
   = "off"|"auto"|"always"` (default `auto`), env `HERDR_PREDICTIVE_ECHO`.
   Conservatism as shipped: width-1 printable chars only (±shift), max 8
   outstanding, target *and* right-neighbor cells must be plain, same-row,
@@ -262,18 +264,19 @@ installation instructions, and independent upstream retirement path live in
 [IV-0003](IV-0003-pi-predictive-echo.md). This initiative continues to own
 all predictor and reconciliation behavior.
 
-### W3 follow-up — cursor-only reconciliation and input batching (patches `0013`–`0014`)
+### W3 follow-up — cursor-only reconciliation and input batching
 
 Live pi typing exposed a deterministic hole in the original reconciliation
 rule. Typing a space over an already blank cell changes no cell, so the server
-emits only cursor movement. Patch `0011` required the predicted cell to appear
-in the current frame's `touched` list; the untouched space therefore blocked
+emits only cursor movement. The initial predictor required the predicted cell
+to appear in the current frame's `touched` list; the untouched space therefore blocked
 later `d/e/f` acknowledgements in `abc def`. Pi also writes changed content and
 its hardware-cursor position separately, making a content frame followed by a
 cursor-only frame normal rather than exceptional.
 
-Patch `0013` makes observations cumulative and accepts same-row authoritative
-cursor progress as acknowledgement when the modeled symbol matches.
+The reconciliation follow-up makes observations cumulative and accepts
+same-row authoritative cursor progress as acknowledgement when the modeled
+symbol matches.
 Cursor-only confirmations explicitly remove their local underline. Matching
 server writes remove overlays even while an older prediction is pending;
 mismatches preserve the server's styling. Unsafe/untracked input, actionable
@@ -286,8 +289,9 @@ buffered, inserted before synchronized-output ends, and replace Linux's stale
 post-sync IME cursor repeat, producing one atomic stdout flush instead of a
 visible frame-then-correction pair.
 
-Patch `0014` reduces upload packetization without a timer or wire change: each
-length-prefixed protocol message is built and written contiguously, and all
+The input-batching follow-up reduces upload packetization without a timer or
+wire change: each length-prefixed protocol message is built and written
+contiguously, and all
 events already returned by one `ReadConsoleInputW` batch become one ordered
 `InputEvents` message. This removes avoidable tiny prefix/payload and
 per-console-record writes; whether TCP Nagle still adds material delay remains
@@ -297,7 +301,7 @@ Confirmation is expected after roughly **one full RTT**, not half an RTT:
 input must travel to the server and the rendered echo must return. Local
 underlined prediction should remain immediate.
 
-### W4 — event-driven upload pump (patch `0009`, landed)
+### W4 — event-driven upload pump (landed)
 
 Remove the 0–10 ms polling jitter on the keystroke path.
 
@@ -389,16 +393,15 @@ feel (pi editor, `htop`), `cat` of a large file (frame-skip behavior).
 
 ## Files affected (as landed)
 
-| Workstream | Patch | Files |
+| Workstream | Ownership patch | Files |
 |---|---|---|
-| W0 echo probe | `0006` | `src/client/echo_timing.rs` (new), `src/client/mod.rs` |
-| W2 batched probes + cache | `0007` | `src/remote/probe.rs` (new), `src/remote/launcher.rs` (probe funcs replaced), `src/remote.rs` |
-| W1 tcp relay | `0008` | `src/remote/tcp_relay.rs` (new), `src/remote/windows.rs`, `src/remote/unix.rs` (signature parity), `src/main.rs`, `src/config/model.rs` |
-| W4 blocking pump + CancelIoEx | `0009` | `src/remote/windows.rs`, `src/ipc.rs`, `Cargo.toml` (`Win32_System_IO`) |
-| W3 screen model | `0010` | `src/client/screen_model.rs` (new), `src/client/mod.rs`, `Cargo.toml`, `Cargo.lock` |
-| W3 prediction | `0011` | `src/client/predict.rs` (new), `src/client/mod.rs`, `src/config/model.rs` |
-| W3 cursor reconciliation | `0013` | `src/client/predict.rs`, `src/client/screen_model.rs`, `src/client/mod.rs` |
-| Input packetization | `0014` | `src/protocol/wire.rs`, `src/client/input/windows_vti.rs` |
+| W0 echo probe | `0002` | `src/client/echo_timing.rs` (new), `src/client/mod.rs` |
+| W2 batched probes + cache | `0002` | `src/remote/probe.rs` (new), `src/remote/launcher.rs` (probe funcs replaced), `src/remote.rs` |
+| W1 tcp relay | `0002` | `src/remote/tcp_relay.rs` (new), `src/remote/windows.rs`, `src/remote/unix.rs` (signature parity), `src/main.rs`, `src/config/model.rs` |
+| W4 blocking pump + CancelIoEx | `0002` | `src/remote/windows.rs`, `src/ipc.rs`, `Cargo.toml` (`Win32_System_IO`) |
+| W3 screen model | `0002` | `src/client/screen_model.rs` (new), `src/client/mod.rs`, `Cargo.toml`, `Cargo.lock` |
+| W3 prediction and reconciliation | `0002` | `src/client/predict.rs` (new), `src/client/screen_model.rs`, `src/client/mod.rs`, `src/config/model.rs` |
+| Input packetization | `0002` | `src/protocol/wire.rs`, `src/client/input/windows_vti.rs` |
 
 ## Non-goals
 
@@ -420,13 +423,13 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   including new suites: `echo_timing` (4), `probe` (9), `tcp_relay` (3),
   pump (2), `screen_model` (9, round-trip against real `BlitEncoder`),
   `predict` (13, full confirm/mispredict/typeahead/auto-unlock matrix).
-- Follow-up verification for `0013`–`0014`: `client::` (164),
+- Follow-up reconciliation/input-batching verification: `client::` (164),
   `protocol::wire::tests` (51), predictor regressions (23), and Clippy with
   `-D warnings` are green. Coverage includes coalesced and split `abc def`,
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: the complete 17-patch series `git am` applies to a fresh
+- Clean-room: the complete four-patch series `git am` applies to a fresh
   `v0.7.5` worktree and reproduces the refreshed implementation tree exactly;
   the fork-era CI workflow remains deliberately outside the series.
 
@@ -442,17 +445,17 @@ Still pending (record results in the check log):
 
 - **Client-side only** — locked in by the official-server constraint; held
   throughout, no wire-protocol change in any patch.
-- Landed order W0 → W2 → W1 → W4 → W3 as patches `0006`–`0011`
-  (numbers as reserved); IV-0002 resumes at `0013`–`0014` after IV-0004 used
-  `0012`.
+- The workstreams were originally exported as separate, interleaved patches.
+  They are now recombined into patch `0002`, so the ownership boundary matches
+  this IV and IV-0004 follows cleanly as patch `0003`.
 - W1 landed inert-by-default ahead of its packet-capture verification (see
   workstream note); the capture decides the *recommendation*, not the code.
 - Deferred: W5 transport swap; symmetric-loss ifb recipe; widening W3
   prediction contexts beyond plain-text typing (wide chars, backspace over
   committed text); a `--remote-no-cache` CLI flag (env var shipped
   instead); upstreaming (W0/W3 are platform-generic and may be worth
-  offering upstream once proven, under the same policy as IV-0001 patches
-  `0002` and `0004`).
+  offering upstream once proven, under the same policy as IV-0001's
+  platform-generic input and theme fixes).
 - The shared 256-event queue, direct TCP Nagle behavior, and dense-frame model
   cost remain measurement hypotheses, not reasons for speculative transport
   changes. `HERDR_ECHO_TIMING` starts after its blocking send and ends at the
@@ -461,23 +464,27 @@ Still pending (record results in the check log):
 
 ## Evidence log
 
-- 2026-07-19: patches `0006`–`0011` implemented and landed on `v0.7.4`;
+- 2026-07-19: the initial latency workstreams (then separate patch exports)
+  landed on `v0.7.4`;
   clippy + full test filters green; clean-room apply verified. Pending: W1
   Nagle packet-capture verdict, W0 baseline numbers at 200 ms netem, cold
   vs warm-cache attach timing on deb1.
 - 2026-07-20: reproduced the pi `abc def` stuck-underline/cursor failure as
-  an untouched-space FIFO block followed by pi's cursor-only frame. Patches
-  `0013`–`0014` implement cumulative cursor acknowledgement, idle timeout
+  an untouched-space FIFO block followed by pi's cursor-only frame. The
+  follow-ups implement cumulative cursor acknowledgement, idle timeout
   repair, atomic frame correction, contiguous protocol writes, and Windows
   console-event batching. Clippy, 164 client tests, 51 wire tests, and a
-  clean-room 14-patch apply are green; live high-RTT retest pending.
+  clean-room apply was green; live high-RTT retest pending.
 - 2026-07-22: refreshed the complete stack onto `v0.7.5` / protocol 17.
-  Upstream now batches adjacent terminal-diff cells, so patch `0010`'s screen
-  model was updated to replay contiguous ASCII and mixed ASCII/Unicode runs
+  Upstream now batches adjacent terminal-diff cells, so the screen model was
+  updated to replay contiguous ASCII and mixed ASCII/Unicode runs
   correctly; regression tests cover both shapes. Clippy is clean, and the
   filtered suites pass: remote 76, client 170, Windows 126, client transport 21,
   config 128, and wire 51. After review remediation, focused remote-probe
   (12), screen-model (16), predictor (27), updater (1), and generated-config
   (2) regressions pass; private-item rustdoc has no broken intra-doc links.
-  The regenerated 16-patch clean-room apply reproduces the implementation
-  tree; the nine known test-only unused-code/import warnings remain.
+  The regenerated clean-room stack reproduced the implementation tree; the
+  nine known test-only unused-code/import warnings remain.
+- 2026-08-01: recombined all IV-0002 workstreams into ownership patch `0002`;
+  the four-patch clean-room apply reproduces the same final implementation
+  tree as the former unconsolidated stack.

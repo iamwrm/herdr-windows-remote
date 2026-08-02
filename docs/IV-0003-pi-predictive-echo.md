@@ -5,7 +5,7 @@
 - **Status:** proof of concept implemented and deployed to deb1; high-RTT
   retest of the parent predictor remains pending
 - **Role:** child consumer-integration document of
-  [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed),
+  [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-landed),
   not an independent predictive-echo implementation
 - **Upstream:** [earendil-works/pi](https://github.com/earendil-works/pi)
   (`pi-tui`) — no herdr or pi-core changes
@@ -16,15 +16,15 @@
 ## Purpose
 
 Adapt pi's input-prompt rendering so the predictive echo owned by
-[IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-patches-0010--0011-landed)
+[IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-landed)
 works over a 200 ms link without weakening its safety gates. This child owns
 only the pi extension, its deployment, and its pi-upstream retirement path;
 the parent owns prediction, reconciliation, and transport behavior.
 
 ## Root cause
 
-The predictor (IV-0002 patch `0011`) refuses to predict unless the **hardware
-cursor is visible** and the **target cell is unstyled**. pi fails both by
+The predictor (IV-0002 ownership patch `0002`) refuses to predict unless the
+**hardware cursor is visible** and the **target cell is unstyled**. pi fails both by
 design: pi-tui hides the hardware cursor and draws its caret as an
 inverse-video cell (`ESC[7m<char>ESC[0m`,
 `pi-tui/dist/components/editor.js`). The gates are correct — pi's rendering
@@ -68,7 +68,7 @@ Typeahead works precisely because the block is *gone*: normal character
 echoes touch only their typed cells, so still-pending predictions to the
 right are not falsely invalidated. The parent initiative owns acknowledgement
 and reconciliation, including unchanged-space and cursor-only frames; see its
-[W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching-patches-00130014).
+[W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching).
 
 Side benefit independent of herdr: fixes pi's double-cursor when users
 enable `showHardwareCursor` manually (hardware cursor + software block at
@@ -95,7 +95,7 @@ the same cell today).
 - Live typing proved the extension reaches the predictor and exposed a herdr
   reconciliation defect. Its root cause, fix, and regression coverage are
   recorded in the parent's
-  [W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching-patches-00130014).
+  [W3 follow-up](IV-0002-latency-improvements.md#w3-follow-up--cursor-only-reconciliation-and-input-batching).
 - Live retest through `herdr --remote deb1` at 200 ms netem remains pending;
   the authoritative status belongs in the
   [IV-0002 evidence log](IV-0002-latency-improvements.md#evidence-log).

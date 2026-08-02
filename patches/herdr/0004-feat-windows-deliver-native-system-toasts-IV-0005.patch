@@ -1,22 +1,10 @@
-From 3e706b953f3b83da01a6b4b2bef904b2fd88e3dd Mon Sep 17 00:00:00 2001
-From: clean-room <clean-room@example.invalid>
-Date: Thu, 23 Jul 2026 16:40:20 +0800
-Subject: [PATCH 17/17] feat(windows): deliver system toast notifications with
- WinRT
+From c7a136d71e414dda9c25c74980ce2052fd7b5b48 Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Sun, 2 Aug 2026 00:03:34 +0800
+Subject: [PATCH 4/4] feat(windows): deliver native system toasts (IV-0005)
 
-Upstream stubs show_desktop_notification on Windows, so system toast
-notifications are dropped for native and remote Windows clients.
-
-Build ToastGeneric content through the WinRT XML DOM and submit it with
-ToastNotificationManager under the per-user herdr app ID. This keeps
-notification text as data and removes the uv, Python, windows-toasts,
-helper-process, network, and elevation requirements.
-
-Add opt-in HERDR_WINDOWS_TOAST_DEBUG dialogs that confirm client startup and
-SystemToast receipt, identify the failing WinRT stage and HRESULT, and report
-both ToastNotifier.Setting and the Windows shell notification state. Also add
-focused tests and serialize the existing PATH-sensitive Windows shell test
-with the shared environment lock.
+Keep the complete IV-0005 native WinRT notification implementation and
+its layered diagnostic UI in one ownership-scoped patch.
 ---
  Cargo.lock              | 105 ++++++++++
  Cargo.toml              |   1 +

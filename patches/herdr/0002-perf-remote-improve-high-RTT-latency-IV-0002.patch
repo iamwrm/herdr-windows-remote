@@ -1,0 +1,4159 @@
+From 9509f03af686798757b09915dde1f5efa11430d1 Mon Sep 17 00:00:00 2001
+From: iamwrm <iamwrm@gmail.com>
+Date: Sun, 2 Aug 2026 00:03:34 +0800
+Subject: [PATCH 2/4] perf(remote): improve high-RTT latency (IV-0002)
+
+Combine all IV-0002 workstreams and follow-ups:
+
+- echo timing, batched setup probes, and verified-path cache
+- optional TCP_NODELAY relay and event-driven bridge input
+- client screen model, predictive echo, and reconciliation
+- interactive input write batching
+---
+ Cargo.lock                      |    1 +
+ Cargo.toml                      |    2 +
+ src/client/echo_timing.rs       |  202 ++++++
+ src/client/input/windows_vti.rs |   37 +-
+ src/client/mod.rs               |  174 +++++-
+ src/client/predict.rs           | 1041 +++++++++++++++++++++++++++++++
+ src/client/screen_model.rs      |  658 +++++++++++++++++++
+ src/config/model.rs             |   20 +-
+ src/ipc.rs                      |    8 +-
+ src/main.rs                     |   15 +
+ src/protocol/wire.rs            |   47 +-
+ src/remote.rs                   |    3 +
+ src/remote/launcher.rs          |  337 ++++------
+ src/remote/probe.rs             |  596 ++++++++++++++++++
+ src/remote/tcp_relay.rs         |  166 +++++
+ src/remote/unix.rs              |    8 +-
+ src/remote/windows.rs           |  223 ++++++-
+ 17 files changed, 3256 insertions(+), 282 deletions(-)
+ create mode 100644 src/client/echo_timing.rs
+ create mode 100644 src/client/predict.rs
+ create mode 100644 src/client/screen_model.rs
+ create mode 100644 src/remote/probe.rs
+ create mode 100644 src/remote/tcp_relay.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 6cfdbd0..a46b096 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -607,6 +607,7 @@ dependencies = [
+  "toml",
+  "tracing",
+  "tracing-subscriber",
++ "unicode-segmentation",
+  "unicode-width",
+  "windows-sys",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index e136312..fee594d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,6 +41,7 @@ toml = "0.8"
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ unicode-width = "0.2"
++unicode-segmentation = "1.12"
+ schemars = { version = "1.2.1", features = ["derive"] }
+ 
+ [patch.crates-io]
+@@ -55,6 +56,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Diagnostics_ToolHelp",
+     "Win32_System_Console",
+     "Win32_System_JobObjects",
++    "Win32_System_IO",
+     "Win32_System_Kernel",
+     "Win32_System_Memory",
+     "Win32_System_Ole",
+diff --git a/src/client/echo_timing.rs b/src/client/echo_timing.rs
+new file mode 100644
+index 0000000..476f39a
+--- /dev/null
++++ b/src/client/echo_timing.rs
+@@ -0,0 +1,202 @@
++//! Env-gated keystroke→frame echo latency probe (`HERDR_ECHO_TIMING=1`).
++//!
++//! Measures the wall-clock time between sending a key input to the server and
++//! receiving the next rendered frame. On a remote attach this approximates
++//! the full echo path (client → ssh → server → PTY → render → ssh → client),
++//! which is dominated by the link RTT.
++//!
++//! Methodology: at most one probe is outstanding at a time; the first frame
++//! received after a probed input closes the probe. Frames generated for
++//! unrelated reasons (spinner animation, background output) close probes
++//! early and show up as below-RTT outliers — measure while typing into an
++//! idle shell prompt for the clean signal.
++//!
++//! `HERDR_ECHO_TIMING=1` prints one summary when the client loop ends;
++//! `HERDR_ECHO_TIMING=verbose` additionally reports rolling stats every
++//! [`REPORT_EVERY`] samples. Zero overhead when the env var is unset.
++
++use std::time::Instant;
++
++const ENV_VAR: &str = "HERDR_ECHO_TIMING";
++const REPORT_EVERY: usize = 25;
++const MAX_SAMPLES: usize = 10_000;
++
++pub(crate) struct EchoTiming {
++    enabled: bool,
++    /// Report rolling stats while sampling instead of only a final summary.
++    verbose: bool,
++    outstanding: Option<Instant>,
++    samples_ms: Vec<u64>,
++    reported_at: usize,
++}
++
++impl EchoTiming {
++    pub(crate) fn from_env() -> Self {
++        let value = std::env::var(ENV_VAR).unwrap_or_default();
++        let value = value.trim();
++        let enabled = !value.is_empty() && value != "0";
++        let verbose = matches!(value, "verbose" | "rolling" | "2");
++        Self {
++            enabled,
++            verbose,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        }
++    }
++
++    /// Records that a key input was just sent to the server. No-op while a
++    /// previous probe is still waiting for its frame.
++    pub(crate) fn on_key_input_sent(&mut self) {
++        if !self.enabled || self.outstanding.is_some() {
++            return;
++        }
++        self.outstanding = Some(Instant::now());
++    }
++
++    /// Records that a rendered frame arrived from the server, closing the
++    /// outstanding probe if any.
++    pub(crate) fn on_render_received(&mut self) {
++        let Some(started) = self.outstanding.take() else {
++            return;
++        };
++        if self.samples_ms.len() >= MAX_SAMPLES {
++            return;
++        }
++        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
++        self.samples_ms.push(elapsed_ms);
++        if self.verbose && self.samples_ms.len() - self.reported_at >= REPORT_EVERY {
++            self.report("rolling");
++        }
++    }
++
++    /// Prints a stats summary to stderr. Called automatically while sampling
++    /// and once more (as "final") when the client loop ends.
++    pub(crate) fn report(&mut self, label: &str) {
++        if !self.enabled || self.samples_ms.is_empty() || self.reported_at == self.samples_ms.len()
++        {
++            return;
++        }
++        self.reported_at = self.samples_ms.len();
++        let stats = Stats::compute(&self.samples_ms);
++        // \r\n: the host terminal is in raw mode while the client runs.
++        eprint!(
++            "herdr echo-timing ({label}): n={} p50={}ms p95={}ms min={}ms max={}ms\r\n",
++            stats.count, stats.p50, stats.p95, stats.min, stats.max
++        );
++    }
++}
++
++impl Drop for EchoTiming {
++    fn drop(&mut self) {
++        self.report("final");
++    }
++}
++
++/// Whether a structured input event should start an echo probe: key
++/// presses/repeats and pastes produce output; releases, mouse moves and
++/// focus events usually do not.
++#[cfg(windows)]
++pub(crate) fn is_key_or_paste_event(event: &crate::protocol::ClientInputEvent) -> bool {
++    use crate::protocol::{ClientInputEvent, ClientKeyKind};
++    match event {
++        ClientInputEvent::Key { kind, .. } => {
++            matches!(kind, ClientKeyKind::Press | ClientKeyKind::Repeat)
++        }
++        ClientInputEvent::Paste { .. } => true,
++        ClientInputEvent::Mouse { .. }
++        | ClientInputEvent::FocusGained
++        | ClientInputEvent::FocusLost => false,
++    }
++}
++
++struct Stats {
++    count: usize,
++    p50: u64,
++    p95: u64,
++    min: u64,
++    max: u64,
++}
++
++impl Stats {
++    fn compute(samples: &[u64]) -> Self {
++        let mut sorted = samples.to_vec();
++        sorted.sort_unstable();
++        let percentile = |p: usize| -> u64 {
++            let index = (sorted.len().saturating_sub(1)) * p / 100;
++            sorted[index]
++        };
++        Self {
++            count: sorted.len(),
++            p50: percentile(50),
++            p95: percentile(95),
++            min: sorted[0],
++            max: sorted[sorted.len() - 1],
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn enabled_probe() -> EchoTiming {
++        EchoTiming {
++            enabled: true,
++            verbose: false,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        }
++    }
++
++    #[test]
++    fn disabled_probe_records_nothing() {
++        let mut probe = EchoTiming {
++            enabled: false,
++            verbose: false,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        };
++        probe.on_key_input_sent();
++        assert!(probe.outstanding.is_none());
++        probe.on_render_received();
++        assert!(probe.samples_ms.is_empty());
++    }
++
++    #[test]
++    fn one_probe_outstanding_at_a_time() {
++        let mut probe = enabled_probe();
++        probe.on_key_input_sent();
++        let first = probe.outstanding;
++        assert!(first.is_some());
++        probe.on_key_input_sent();
++        assert_eq!(probe.outstanding, first, "second input must not restart");
++        probe.on_render_received();
++        assert!(probe.outstanding.is_none());
++        assert_eq!(probe.samples_ms.len(), 1);
++    }
++
++    #[test]
++    fn frame_without_probe_is_ignored() {
++        let mut probe = enabled_probe();
++        probe.on_render_received();
++        assert!(probe.samples_ms.is_empty());
++    }
++
++    #[test]
++    fn stats_percentiles() {
++        let samples: Vec<u64> = (1..=100).collect();
++        let stats = Stats::compute(&samples);
++        assert_eq!(stats.count, 100);
++        assert_eq!(stats.p50, 50);
++        assert_eq!(stats.p95, 95);
++        assert_eq!(stats.min, 1);
++        assert_eq!(stats.max, 100);
++
++        let one = Stats::compute(&[42]);
++        assert_eq!(one.p50, 42);
++        assert_eq!(one.p95, 42);
++    }
++}
+diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
+index 296bb91..d1cdde7 100644
+--- a/src/client/input/windows_vti.rs
++++ b/src/client/input/windows_vti.rs
+@@ -67,12 +67,14 @@ fn process_platform_input_items(
+     pump: &mut WindowsInputPump,
+     event_tx: &mpsc::Sender<ClientLoopEvent>,
+ ) -> bool {
++    // ReadConsoleInputW already gives us one immediately available batch.
++    // Preserve that batching through the client protocol instead of framing
++    // every translated console record as a separate tiny pipe/SSH write.
++    let mut events = Vec::new();
+     for item in items {
+-        if !send_windows_client_input_events(pump.process(item), event_tx) {
+-            return false;
+-        }
++        events.extend(pump.process(item));
+     }
+-    true
++    send_windows_client_input_events(events, event_tx)
+ }
+ 
+ #[cfg(windows)]
+@@ -1068,6 +1070,33 @@ fn windows_input_trace_enabled() -> bool {
+ mod tests {
+     use super::*;
+ 
++    #[cfg(windows)]
++    #[test]
++    fn available_console_items_are_sent_as_one_event_batch() {
++        let (event_tx, mut event_rx) = mpsc::channel(4);
++        let mut pump = WindowsInputPump::default();
++        let items = vec![
++            PlatformInputItem::Semantic(crate::protocol::ClientInputEvent::FocusGained),
++            PlatformInputItem::Semantic(crate::protocol::ClientInputEvent::FocusLost),
++        ];
++
++        assert!(process_platform_input_items(items, &mut pump, &event_tx));
++        let ClientLoopEvent::StdinEvents(events) = event_rx.try_recv().expect("event batch") else {
++            panic!("expected stdin events");
++        };
++        assert_eq!(
++            events,
++            vec![
++                crate::protocol::ClientInputEvent::FocusGained,
++                crate::protocol::ClientInputEvent::FocusLost,
++            ]
++        );
++        assert!(
++            event_rx.try_recv().is_err(),
++            "only one batch should be queued"
++        );
++    }
++
+     fn key_char(ch: char) -> WindowsInputRecord {
+         WindowsInputRecord::Key(WindowsKeyRecord {
+             key_down: true,
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 6b6c621..972040e 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -12,7 +12,10 @@
+ //! - Forwards OSC 52 clipboard writes from server to its own stdout
+ //! - Displays sound/toast notifications forwarded from server
+ 
++mod echo_timing;
+ mod input;
++mod predict;
++mod screen_model;
+ 
+ use std::collections::HashSet;
+ use std::io::{self, BufRead, Write as _};
+@@ -53,6 +56,8 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
+ // ---------------------------------------------------------------------------
+ 
+ struct ClientLoopConfig {
++    /// `remote.predictive_echo` setting ("off" | "auto" | "always").
++    predictive_echo: String,
+     sound_config: crate::config::SoundConfig,
+     mouse_scroll_lines: usize,
+     redraw_on_focus_gained: bool,
+@@ -1130,6 +1135,7 @@ fn run_client_with_mode(
+     let kitty_graphics_enabled =
+         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+     let loop_config = ClientLoopConfig {
++        predictive_echo: loaded_config.config.remote.predictive_echo.clone(),
+         sound_config: loaded_config.config.ui.sound,
+         mouse_scroll_lines,
+         redraw_on_focus_gained,
+@@ -1289,6 +1295,18 @@ async fn run_client_loop(
+     let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
+     #[cfg(unix)]
+     let is_remote_client = is_remote_client_process();
++    // Predictive local echo only makes sense for remote full-app clients on
++    // the diffed terminal-ansi stream (i0002 W3).
++    let mut predictor = if negotiated_encoding == RenderEncoding::TerminalAnsi
++        && attach_escape.is_none()
++        && is_remote_client_process()
++    {
++        predict::Predictor::new(predict::PredictiveEchoMode::from_config(
++            &config.predictive_echo,
++        ))
++    } else {
++        None
++    };
+ 
+     let mut state = ClientState {
+         blit_encoder: render_ansi::BlitEncoder::new(),
+@@ -1305,6 +1323,7 @@ async fn run_client_loop(
+         draw_host_cursor,
+     };
+     debug!(?negotiated_encoding, "client render encoding active");
++    let mut echo_timing = echo_timing::EchoTiming::from_env();
+     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
+ 
+     // Channel for events from the stdin, resize, and server reader threads.
+@@ -1471,10 +1490,16 @@ async fn run_client_loop(
+                     }
+                     continue;
+                 }
++                let prediction_output = predictor
++                    .as_mut()
++                    .map(|predictor| predictor.on_raw_input(&data))
++                    .unwrap_or_default();
++                write_prediction_output(&prediction_output);
+                 let msg = ClientMessage::Input { data };
+                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                     return Err(ClientError::ConnectionLost(e));
+                 }
++                echo_timing.on_key_input_sent();
+             }
+             #[cfg(windows)]
+             ClientLoopEvent::StdinEvents(events) => {
+@@ -1491,10 +1516,19 @@ async fn run_client_loop(
+                 ) {
+                     state.request_full_redraw();
+                 }
++                let prediction_output = predictor
++                    .as_mut()
++                    .map(|predictor| predictor.on_input_events(&events))
++                    .unwrap_or_default();
++                write_prediction_output(&prediction_output);
++                let probe_input = events.iter().any(echo_timing::is_key_or_paste_event);
+                 let msg = ClientMessage::InputEvents { events };
+                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                     return Err(ClientError::ConnectionLost(e));
+                 }
++                if probe_input {
++                    echo_timing.on_key_input_sent();
++                }
+             }
+             #[cfg(windows)]
+             ClientLoopEvent::StdinThemeReport(data) => {
+@@ -1508,6 +1542,11 @@ async fn run_client_loop(
+             }
+             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+                 state.reported_size = (new_cols, new_rows);
++                let prediction_output = predictor
++                    .as_mut()
++                    .map(predict::Predictor::on_resize)
++                    .unwrap_or_default();
++                write_prediction_output(&prediction_output);
+                 let msg = ClientMessage::Resize {
+                     cols: new_cols,
+                     rows: new_rows,
+@@ -1542,14 +1581,23 @@ async fn run_client_loop(
+                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+                     let _ = stdout.flush();
+                     state.blit_encoder.commit(frame_data, encoded);
++                    echo_timing.on_render_received();
+                 }
+                 ServerMessage::Terminal(frame) => {
+                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
+                         record_received_kitty_graphics(&frame.bytes);
+                     }
+-                    let mut stdout = io::stdout();
+-                    let _ = stdout.write_all(&frame.bytes);
+-                    let _ = stdout.flush();
++                    let prediction_output = predictor
++                        .as_mut()
++                        .map(|predictor| predictor.on_frame(&frame))
++                        .unwrap_or_default();
++                    let mut stdout = io::stdout().lock();
++                    let _ = write_terminal_frame_with_predictions(
++                        &mut stdout,
++                        &frame.bytes,
++                        &prediction_output,
++                    );
++                    echo_timing.on_render_received();
+                 }
+                 ServerMessage::Graphics { bytes } => {
+                     if state.kitty_graphics_enabled {
+@@ -1615,7 +1663,13 @@ async fn run_client_loop(
+                     "server closed connection",
+                 )));
+             }
+-            ClientLoopEvent::Timer => {}
++            ClientLoopEvent::Timer => {
++                let prediction_output = predictor
++                    .as_mut()
++                    .map(predict::Predictor::on_timer)
++                    .unwrap_or_default();
++                write_prediction_output(&prediction_output);
++            }
+         }
+     }
+ 
+@@ -1978,6 +2032,73 @@ fn write_window_title(title: Option<&str>) {
+ // Frame output
+ // ---------------------------------------------------------------------------
+ 
++const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
++
++fn write_prediction_output(bytes: &[u8]) {
++    if bytes.is_empty() {
++        return;
++    }
++    let mut stdout = io::stdout().lock();
++    let _ = stdout.write_all(bytes);
++    let _ = stdout.flush();
++}
++
++/// Keep frame reconciliation atomic with the server frame. Inserting the
++/// predictor's repaint/cursor anchor before the synchronized-output terminator
++/// prevents the host terminal from briefly exposing the stale server cursor.
++/// Linux encoders append a duplicate IME cursor anchor after that terminator;
++/// discard that tail when a predictor anchor supersedes it.
++fn write_terminal_frame_with_predictions(
++    mut writer: impl io::Write,
++    frame: &[u8],
++    prediction_output: &[u8],
++) -> io::Result<()> {
++    if prediction_output.is_empty() {
++        writer.write_all(frame)?;
++    } else if let Some(sync_end) = frame
++        .windows(SYNC_OUTPUT_END.len())
++        .rposition(|window| window == SYNC_OUTPUT_END)
++    {
++        let tail = &frame[sync_end + SYNC_OUTPUT_END.len()..];
++        if tail.is_empty() || is_post_sync_ime_cursor_anchor(tail) {
++            writer.write_all(&frame[..sync_end])?;
++            writer.write_all(prediction_output)?;
++            writer.write_all(SYNC_OUTPUT_END)?;
++        } else {
++            // Never discard an unrecognized server suffix. The correction is
++            // less atomic in this defensive fallback, but remains final.
++            writer.write_all(frame)?;
++            writer.write_all(prediction_output)?;
++        }
++    } else {
++        writer.write_all(frame)?;
++        writer.write_all(prediction_output)?;
++    }
++    writer.flush()
++}
++
++/// The non-Windows encoder's optional IME suffix is exactly
++/// `CUP(row,col) + DECTCEM(show|hide)`. Recognize only that grammar before
++/// replacing it; arbitrary bytes after synchronized output must be preserved.
++fn is_post_sync_ime_cursor_anchor(bytes: &[u8]) -> bool {
++    let Some(rest) = bytes.strip_prefix(b"\x1b[") else {
++        return false;
++    };
++    let Some(cup_end) = rest.iter().position(|byte| *byte == b'H') else {
++        return false;
++    };
++    let coordinates = &rest[..cup_end];
++    let Some(separator) = coordinates.iter().position(|byte| *byte == b';') else {
++        return false;
++    };
++    let (row, column_with_separator) = coordinates.split_at(separator);
++    let column = &column_with_separator[1..];
++    let valid_number = |number: &[u8]| !number.is_empty() && number.iter().all(u8::is_ascii_digit);
++    valid_number(row)
++        && valid_number(column)
++        && matches!(&rest[cup_end + 1..], b"\x1b[?25h" | b"\x1b[?25l")
++}
++
+ fn write_encoded_frame_with_graphics(
+     mut writer: impl io::Write,
+     encoded: &[u8],
+@@ -2389,6 +2510,51 @@ mod tests {
+         assert_eq!(output, b"text");
+     }
+ 
++    #[test]
++    fn prediction_output_stays_inside_frame_sync_block() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(
++            &mut output,
++            b"\x1b[?2026hframe\x1b[?2026l\x1b[3;5H\x1b[?25h",
++            b"prediction-cursor",
++        )
++        .unwrap();
++
++        assert_eq!(output, b"\x1b[?2026hframeprediction-cursor\x1b[?2026l");
++    }
++
++    #[test]
++    fn prediction_output_preserves_unrecognized_post_sync_suffix() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(
++            &mut output,
++            b"\x1b[?2026hframe\x1b[?2026lserver-suffix",
++            b"prediction-cursor",
++        )
++        .unwrap();
++
++        assert_eq!(
++            output,
++            b"\x1b[?2026hframe\x1b[?2026lserver-suffixprediction-cursor"
++        );
++    }
++
++    #[test]
++    fn post_sync_ime_cursor_anchor_recognizer_is_exact() {
++        assert!(is_post_sync_ime_cursor_anchor(b"\x1b[3;5H\x1b[?25h"));
++        assert!(is_post_sync_ime_cursor_anchor(b"\x1b[12;1H\x1b[?25l"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"\x1b[3;5H"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"\x1b[3;5H\x1b[?25hmore"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"server-suffix"));
++    }
++
++    #[test]
++    fn prediction_output_falls_back_after_unsynchronized_frame() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(&mut output, b"frame", b"prediction").unwrap();
++        assert_eq!(output, b"frameprediction");
++    }
++
+     #[test]
+     fn terminal_frame_kitty_detection_matches_apc_prefix() {
+         assert!(contains_kitty_graphics_bytes(b"text\x1b_Ga=p;\x1b\\"));
+diff --git a/src/client/predict.rs b/src/client/predict.rs
+new file mode 100644
+index 0000000..531469c
+--- /dev/null
++++ b/src/client/predict.rs
+@@ -0,0 +1,1041 @@
++//! Predictive local echo for remote attach (i0002 W3, mosh-style).
++//!
++//! On a high-RTT link every keystroke takes a full round trip before it
++//! echoes. When the typing context is safe (plain unstyled cells, visible
++//! cursor, room before the right margin) the client draws the typed
++//! character immediately — underlined, like mosh — and reconciles against
++//! the frames the server sends later:
++//!
++//! - the server echoes the same character into the predicted cell, or moves
++//!   its cursor past an unchanged cell such as a blank space → the prediction
++//!   is confirmed (cursor-only confirmations are explicitly repainted to drop
++//!   the local underline);
++//! - the server writes something else there → all outstanding predictions
++//!   are repainted from the [`ScreenModel`] (the server's truth) — this is
++//!   why the model exists: the server diffs against *its* idea of the
++//!   screen and would never repaint a wrongly-predicted cell it did not
++//!   touch;
++//! - a prediction stays unconfirmed too long → same repaint, so stalls
++//!   cannot leave stale artifacts.
++//!
++//! Modes (`remote.predictive_echo`, env `HERDR_PREDICTIVE_ECHO`):
++//! `off` — fully disabled, byte-for-byte today's behavior; `always` — draw
++//! from the first keystroke; `auto` (default) — predictions are tracked
++//! invisibly until two of them are confirmed with an echo delay above
++//! [`AUTO_MIN_LATENCY`], so fast links never see underlines and broken
++//! contexts never draw at all.
++//!
++//! Only printable width-1 characters (optionally shifted) and backspace
++//! over our own predictions are predicted. Any other key press flushes
++//! outstanding predictions back to server truth.
++
++use std::collections::VecDeque;
++use std::io::Write;
++use std::time::{Duration, Instant};
++
++use super::screen_model::ScreenModel;
++use crate::protocol::TerminalFrame;
++
++/// The plain pen (matches `render_ansi::build_sgr` for an unstyled cell).
++const PLAIN_SGR: &str = "\x1b[0;39;49m";
++/// Prediction pen: underline over default colors.
++const UNDERLINE_SGR: &str = "\x1b[0;4;39;49m";
++/// Maximum keystrokes predicted ahead of the last confirmation.
++const MAX_PENDING: usize = 8;
++/// Unconfirmed predictions older than this are flushed back to server truth.
++const PREDICTION_TIMEOUT: Duration = Duration::from_secs(5);
++/// `auto` starts drawing after this many confirmed predictions…
++const AUTO_MIN_CONFIRMED: u64 = 2;
++/// …whose echo delay exceeded this (fast links never show predictions).
++const AUTO_MIN_LATENCY: Duration = Duration::from_millis(60);
++
++const ENV_VAR: &str = "HERDR_PREDICTIVE_ECHO";
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum PredictiveEchoMode {
++    Off,
++    Auto,
++    Always,
++}
++
++impl PredictiveEchoMode {
++    pub(crate) fn from_config(config_value: &str) -> Self {
++        let value = std::env::var(ENV_VAR)
++            .ok()
++            .filter(|value| !value.trim().is_empty())
++            .unwrap_or_else(|| config_value.to_string());
++        match value.trim().to_ascii_lowercase().as_str() {
++            "off" | "false" | "0" => Self::Off,
++            "always" => Self::Always,
++            _ => Self::Auto,
++        }
++    }
++}
++
++#[derive(Debug)]
++struct Prediction {
++    x: u16,
++    y: u16,
++    ch: char,
++    /// Whether the local underlined overlay is still visible. A matching
++    /// server cell write clears it even if FIFO retirement is blocked by an
++    /// earlier cursor-only prediction.
++    drawn: bool,
++    /// Cumulative server acknowledgement; unlike `touched`, this survives
++    /// across frames until older predictions retire.
++    observed: bool,
++    sent_at: Instant,
++}
++
++pub(crate) struct Predictor {
++    model: ScreenModel,
++    pending: VecDeque<Prediction>,
++    /// An input could not be predicted, so the model is stale until another
++    /// server frame arrives. Never start a second prediction chain from that
++    /// stale cursor.
++    blocked_until_frame: bool,
++    display_unlocked: bool,
++    slow_confirmed: u64,
++    touched_scratch: Vec<(u16, u16)>,
++}
++
++impl Predictor {
++    /// Returns `None` for [`PredictiveEchoMode::Off`], so the client loop
++    /// carries no prediction state at all when disabled.
++    pub(crate) fn new(mode: PredictiveEchoMode) -> Option<Self> {
++        if mode == PredictiveEchoMode::Off {
++            return None;
++        }
++        Some(Self {
++            model: ScreenModel::new(),
++            pending: VecDeque::new(),
++            blocked_until_frame: false,
++            display_unlocked: mode == PredictiveEchoMode::Always,
++            slow_confirmed: 0,
++            touched_scratch: Vec::new(),
++        })
++    }
++
++    /// Structured input events (Windows client input path).
++    #[cfg(windows)]
++    pub(crate) fn on_input_events(
++        &mut self,
++        events: &[crate::protocol::ClientInputEvent],
++    ) -> Vec<u8> {
++        use crate::protocol::{ClientInputEvent, ClientKeyCode, ClientKeyKind};
++
++        const SHIFT: u8 = 0b1;
++        let mut out = Vec::new();
++        for event in events {
++            match event {
++                ClientInputEvent::Key {
++                    code,
++                    modifiers,
++                    kind: ClientKeyKind::Press | ClientKeyKind::Repeat,
++                } => match code {
++                    ClientKeyCode::Char(ch) if modifiers & !SHIFT == 0 => {
++                        self.on_char(*ch, &mut out);
++                    }
++                    ClientKeyCode::Backspace if *modifiers == 0 => {
++                        self.on_backspace(&mut out);
++                    }
++                    _ => self.on_other_input(&mut out),
++                },
++                ClientInputEvent::Paste { .. } | ClientInputEvent::Mouse { .. } => {
++                    self.on_other_input(&mut out);
++                }
++                // Key releases do not act on the remote application and must
++                // not interrupt a prediction chain. Focus notifications are
++                // likewise harmless to the modeled cursor.
++                _ => {}
++            }
++        }
++        out
++    }
++
++    /// Raw stdin bytes (Unix client input path). Predicts only when the
++    /// chunk is pure printable text; anything with ESC or control bytes
++    /// (arrows, bracketed pastes, chords) flushes instead.
++    #[cfg(unix)]
++    pub(crate) fn on_raw_input(&mut self, data: &[u8]) -> Vec<u8> {
++        let mut out = Vec::new();
++        if data == b"\x7f" {
++            self.on_backspace(&mut out);
++            return out;
++        }
++        match std::str::from_utf8(data) {
++            Ok(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
++                for ch in text.chars() {
++                    self.on_char(ch, &mut out);
++                }
++            }
++            _ => self.on_other_input(&mut out),
++        }
++        out
++    }
++
++    /// A printable character was typed. Predicts and (when unlocked) draws
++    /// it underlined at the predicted insertion point.
++    fn on_char(&mut self, ch: char, out: &mut impl Write) {
++        use unicode_width::UnicodeWidthChar as _;
++
++        if self.blocked_until_frame {
++            return;
++        }
++        if self.pending.len() >= MAX_PENDING {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        if ch.is_control() || ch.width() != Some(1) || !self.model.cursor_visible() {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        let (x, y) = self.insertion_point();
++        // Same-row typing with room before the right margin; the target and
++        // the cell we push the cursor into must both be unstyled.
++        if y != self.model.cursor().1
++            || x + 1 >= self.model.width()
++            || !self.cell_is_plain(x, y)
++            || !self.cell_is_plain(x + 1, y)
++        {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++
++        let drawn = self.display_unlocked;
++        if drawn {
++            let _ = write!(
++                out,
++                "\x1b[{};{}H{UNDERLINE_SGR}{ch}{PLAIN_SGR}",
++                y + 1,
++                x + 1
++            );
++        }
++        self.pending.push_back(Prediction {
++            x,
++            y,
++            ch,
++            drawn,
++            observed: false,
++            sent_at: Instant::now(),
++        });
++    }
++
++    /// Backspace is only predicted over our own outstanding predictions.
++    fn on_backspace(&mut self, out: &mut impl Write) {
++        let Some(prediction) = self.pending.pop_back() else {
++            self.blocked_until_frame = true;
++            return;
++        };
++        if prediction.drawn {
++            let symbol = self.model_symbol(prediction.x, prediction.y);
++            let _ = write!(
++                out,
++                "\x1b[{row};{col}H{PLAIN_SGR}{symbol}\x1b[{row};{col}H",
++                row = prediction.y + 1,
++                col = prediction.x + 1,
++            );
++        }
++    }
++
++    /// Any other key press invalidates the cursor used by this prediction
++    /// chain. Restore server truth and wait for a fresh frame before trying
++    /// to predict again.
++    fn on_other_input(&mut self, out: &mut impl Write) {
++        self.stop_predicting_until_frame(out);
++    }
++
++    pub(crate) fn on_resize(&mut self) -> Vec<u8> {
++        let mut out = Vec::new();
++        self.stop_predicting_until_frame(&mut out);
++        out
++    }
++
++    /// Applies a received frame to the model and returns bytes that must be
++    /// written after (or inserted at the end of) that frame.
++    pub(crate) fn on_frame(&mut self, frame: &TerminalFrame) -> Vec<u8> {
++        let mut out = Vec::new();
++        self.model.ensure_size(frame.width, frame.height);
++        if frame.full {
++            self.model.begin_full_frame();
++        }
++        let mut touched = std::mem::take(&mut self.touched_scratch);
++        touched.clear();
++        self.model.apply(&frame.bytes, &mut touched);
++
++        if !self.model.prediction_safe() {
++            if frame.full {
++                self.pending.clear();
++            } else {
++                self.stop_predicting_until_frame(&mut out);
++            }
++            self.blocked_until_frame = true;
++            self.touched_scratch = touched;
++            return out;
++        }
++        self.blocked_until_frame = false;
++
++        if frame.full {
++            // The redraw repainted every cell; the screen is server truth.
++            self.pending.clear();
++            self.touched_scratch = touched;
++            return out;
++        }
++
++        // Record observations before any conservative abort so repaint
++        // cleanup cannot overwrite cells the raw frame already styled. Cursor
++        // progress acknowledges unchanged cells such as a blank space.
++        let (server_x, server_y) = self.model.cursor();
++        let server_cursor_visible = self.model.cursor_visible();
++        let model = &self.model;
++        let mut observed_mismatch = false;
++        for prediction in &mut self.pending {
++            let cell_touched = touched.contains(&(prediction.x, prediction.y));
++            let cursor_passed =
++                server_cursor_visible && server_y == prediction.y && server_x > prediction.x;
++            if cell_touched {
++                prediction.drawn = false;
++            }
++            if !cell_touched && !cursor_passed {
++                continue;
++            }
++            let matches = model
++                .cell(prediction.x, prediction.y)
++                .is_some_and(|cell| cell.symbol.chars().eq(std::iter::once(prediction.ch)));
++            if matches {
++                prediction.observed = true;
++            } else {
++                observed_mismatch = true;
++            }
++        }
++
++        // A hidden or row-jumped server cursor is not a safe continuation of
++        // same-line prediction. This also handles transient TUI renders that
++        // omit their hardware-cursor marker.
++        if !self.pending.is_empty()
++            && (!server_cursor_visible
++                || server_y != self.pending.front().expect("pending exists").y)
++        {
++            self.stop_predicting_until_frame(&mut out);
++            self.touched_scratch = touched;
++            return out;
++        }
++
++        let now = Instant::now();
++        let mut repainted_confirmation = false;
++        // Observations are cumulative. Cursor progress confirms visually
++        // unchanged characters such as a space typed over an already-blank
++        // cell, while later touched predictions no longer lose their evidence
++        // behind that space.
++        while self.pending.front().is_some_and(|front| front.observed) {
++            let front = self.pending.pop_front().expect("front exists");
++            if front.drawn {
++                // A cursor-only acknowledgement did not repaint the local
++                // underline. Explicitly restore the now-confirmed cell.
++                let symbol = self.model_symbol(front.x, front.y);
++                let _ = write!(
++                    out,
++                    "\x1b[{};{}H{PLAIN_SGR}{symbol}",
++                    front.y + 1,
++                    front.x + 1,
++                );
++                repainted_confirmation = true;
++            }
++            if now.saturating_duration_since(front.sent_at) >= AUTO_MIN_LATENCY {
++                self.slow_confirmed += 1;
++                if self.slow_confirmed >= AUTO_MIN_CONFIRMED {
++                    self.display_unlocked = true;
++                }
++            }
++        }
++
++        let mispredicted = observed_mismatch || self.prediction_timed_out(now);
++
++        if mispredicted {
++            self.stop_predicting_until_frame(&mut out);
++        } else if self.pending.iter().any(|prediction| prediction.drawn) {
++            // A frame always parks the host cursor at the server's position.
++            // Matching cell writes already removed their local overlays; only
++            // the predicted cursor needs restoration.
++            self.reanchor_pending(&mut out);
++        } else if repainted_confirmation {
++            let (x, y) = self.model.cursor();
++            let _ = write!(out, "{PLAIN_SGR}\x1b[{};{}H", y + 1, x + 1);
++        }
++        self.touched_scratch = touched;
++        out
++    }
++
++    /// Timeouts must fire even when the server becomes idle; otherwise a
++    /// stale prediction remains until the next key happens to produce a frame.
++    pub(crate) fn on_timer(&mut self) -> Vec<u8> {
++        let mut out = Vec::new();
++        if self.prediction_timed_out(Instant::now()) {
++            self.stop_predicting_until_frame(&mut out);
++        }
++        out
++    }
++
++    fn prediction_timed_out(&self, now: Instant) -> bool {
++        self.pending
++            .front()
++            .is_some_and(|front| now.saturating_duration_since(front.sent_at) >= PREDICTION_TIMEOUT)
++    }
++
++    fn stop_predicting_until_frame(&mut self, out: &mut impl Write) {
++        self.flush_repaint(out);
++        self.blocked_until_frame = true;
++    }
++
++    fn insertion_point(&self) -> (u16, u16) {
++        match self.pending.back() {
++            Some(prediction) => ((prediction.x + 1).min(self.model.width()), prediction.y),
++            None => self.model.cursor(),
++        }
++    }
++
++    fn cell_is_plain(&self, x: u16, y: u16) -> bool {
++        self.model.cell(x, y).is_some_and(|cell| cell.plain)
++    }
++
++    fn model_symbol(&self, x: u16, y: u16) -> String {
++        match self.model.cell(x, y) {
++            Some(cell) if !cell.symbol.is_empty() => cell.symbol.clone(),
++            _ => " ".to_string(),
++        }
++    }
++
++    /// Repaints every drawn prediction with the model's (server-truth)
++    /// content and parks the host cursor back at the server's position.
++    fn flush_repaint(&mut self, out: &mut impl Write) {
++        let mut wrote = false;
++        while let Some(prediction) = self.pending.pop_front() {
++            if !prediction.drawn {
++                continue;
++            }
++            let symbol = self.model_symbol(prediction.x, prediction.y);
++            let _ = write!(
++                out,
++                "\x1b[{};{}H{PLAIN_SGR}{symbol}",
++                prediction.y + 1,
++                prediction.x + 1,
++            );
++            wrote = true;
++        }
++        if wrote {
++            let (x, y) = self.model.cursor();
++            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
++        }
++    }
++
++    fn reanchor_pending(&self, out: &mut impl Write) {
++        let (x, y) = self.insertion_point();
++        let _ = write!(
++            out,
++            "{PLAIN_SGR}\x1b[{};{}H",
++            y + 1,
++            x.min(self.model.width().saturating_sub(1)) + 1
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::render_ansi::BlitEncoder;
++    use crate::protocol::{CellData, CursorState, FrameData};
++
++    fn plain_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0,
++            bg: 0,
++            modifier: 0,
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn styled_cell(symbol: &str) -> CellData {
++        CellData {
++            modifier: 1,
++            ..plain_cell(symbol)
++        }
++    }
++
++    /// A tiny 8x2 "shell": `$ ` prompt with the cursor after it.
++    fn prompt_frame(extra: &[(u16, u16, CellData)], cursor: (u16, u16)) -> FrameData {
++        let mut cells = vec![plain_cell(" "); 16];
++        cells[0] = plain_cell("$");
++        for (x, y, cell) in extra {
++            cells[*y as usize * 8 + *x as usize] = cell.clone();
++        }
++        FrameData {
++            cells,
++            width: 8,
++            height: 2,
++            cursor: Some(CursorState {
++                x: cursor.0,
++                y: cursor.1,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    fn wide_prompt(text: &str, cursor_x: u16) -> FrameData {
++        let width = 12;
++        let mut cells = vec![plain_cell(" "); width as usize];
++        cells[0] = plain_cell("$");
++        for (offset, ch) in text.chars().enumerate() {
++            cells[2 + offset] = plain_cell(&ch.to_string());
++        }
++        FrameData {
++            cells,
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: cursor_x,
++                y: 0,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    /// Drives frames through a real `BlitEncoder` into the predictor.
++    struct Harness {
++        encoder: BlitEncoder,
++        predictor: Predictor,
++        seq: u64,
++    }
++
++    impl Harness {
++        fn new(mode: PredictiveEchoMode) -> Self {
++            Self {
++                encoder: BlitEncoder::new(),
++                predictor: Predictor::new(mode).expect("mode not off"),
++                seq: 0,
++            }
++        }
++
++        fn feed(&mut self, frame: &FrameData) -> Vec<u8> {
++            let encoded = self.encoder.encode(frame, false);
++            self.seq += 1;
++            let terminal_frame = TerminalFrame {
++                seq: self.seq,
++                width: frame.width,
++                height: frame.height,
++                full: encoded.full,
++                bytes: encoded.bytes.clone(),
++            };
++            self.encoder.commit(frame.clone(), encoded);
++            self.predictor.on_frame(&terminal_frame)
++        }
++    }
++
++    #[test]
++    fn off_mode_creates_no_predictor() {
++        assert!(Predictor::new(PredictiveEchoMode::Off).is_none());
++    }
++
++    #[test]
++    fn mode_parsing_defaults_to_auto() {
++        assert_eq!(
++            PredictiveEchoMode::from_config("off"),
++            PredictiveEchoMode::Off
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("always"),
++            PredictiveEchoMode::Always
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("auto"),
++            PredictiveEchoMode::Auto
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("garbage"),
++            PredictiveEchoMode::Auto
++        );
++    }
++
++    #[test]
++    fn always_mode_draws_underlined_prediction_at_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('l', &mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(out.contains("\x1b[1;3H"), "CUP to cursor: {out:?}");
++        assert!(out.contains(UNDERLINE_SGR), "underline pen: {out:?}");
++        assert!(out.contains('l'), "predicted char: {out:?}");
++        assert!(out.ends_with(PLAIN_SGR), "pen restored: {out:?}");
++        assert_eq!(harness.predictor.pending.len(), 1);
++    }
++
++    #[test]
++    fn prediction_confirms_when_server_echoes_same_char() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('l', &mut Vec::new());
++
++        // Server echo: `l` appears at (2,0), cursor advances.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("l"))], (3, 0)));
++        assert!(harness.predictor.pending.is_empty(), "confirmed");
++        assert!(out.is_empty(), "no repaint needed: {out:?}");
++    }
++
++    #[test]
++    fn misprediction_repaints_server_truth_and_flushes() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        // Server writes something else into the first predicted cell.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("X"))], (3, 0)));
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty(), "flushed");
++        // The second prediction's cell (3,0) is repainted from the model.
++        assert!(out.contains("\x1b[1;4H"), "repaint second cell: {out:?}");
++        assert!(out.contains(PLAIN_SGR), "plain pen: {out:?}");
++    }
++
++    #[test]
++    fn touched_misprediction_keeps_authoritative_server_style() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.feed(&prompt_frame(&[(2, 0, styled_cell("X"))], (3, 0)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            out.is_empty(),
++            "raw frame already repainted the mismatched cell with server style"
++        );
++    }
++
++    #[test]
++    fn typeahead_predictions_are_redrawn_and_cursor_reanchored() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        // Server confirms only the first char; the second is still pending.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("a"))], (3, 0)));
++        let out = String::from_utf8(out).expect("utf8");
++        assert_eq!(harness.predictor.pending.len(), 1);
++        assert!(
++            !out.contains(UNDERLINE_SGR),
++            "untouched prediction needs no redraw: {out:?}"
++        );
++        assert!(
++            out.ends_with("\x1b[1;5H"),
++            "cursor re-anchored past prediction: {out:?}"
++        );
++    }
++
++    #[test]
++    fn cursor_only_update_confirms_space_over_blank_cell() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char(' ', &mut Vec::new());
++        assert_eq!(harness.predictor.pending.len(), 1);
++
++        // A space at end-of-line does not change any cell. Pi reports it only
++        // by moving the hardware cursor in a second write/frame.
++        let out = harness.feed(&prompt_frame(&[], (3, 0)));
++        assert!(harness.predictor.pending.is_empty(), "space confirmed");
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(out.contains(PLAIN_SGR), "underline removed: {out:?}");
++        assert!(
++            out.ends_with("\x1b[1;4H"),
++            "server cursor restored: {out:?}"
++        );
++    }
++
++    #[test]
++    fn coalesced_abc_space_def_confirms_without_stale_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&wide_prompt("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        // The final diff writes every non-space character, while the space at
++        // column 5 remains visually blank and is acknowledged only by cursor
++        // progress.
++        let out = harness.feed(&wide_prompt("abc def", 9));
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            !out.contains(UNDERLINE_SGR),
++            "no prediction redraw: {out:?}"
++        );
++        assert!(out.contains(PLAIN_SGR), "space underline removed: {out:?}");
++        assert!(out.ends_with("\x1b[1;10H"), "cursor after f: {out:?}");
++    }
++
++    #[test]
++    fn cursor_only_catchup_repairs_pi_split_render() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&wide_prompt("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        // Pi writes changed content first and positions its hardware cursor in
++        // a second terminal write. The first frame can therefore contain all
++        // text while its cursor is still parked after c.
++        let content_out = harness.feed(&wide_prompt("abc def", 5));
++        assert_eq!(harness.predictor.pending.len(), 4, "space blocks suffix");
++        assert!(
++            String::from_utf8(content_out)
++                .expect("utf8")
++                .ends_with("\x1b[1;10H"),
++            "predicted cursor remains after f"
++        );
++
++        // The cursor-only frame must drain the untouched space and every
++        // later prediction, removing local underlines without another input.
++        let cursor_out = harness.feed(&wide_prompt("abc def", 9));
++        let cursor_out = String::from_utf8(cursor_out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(!cursor_out.contains(UNDERLINE_SGR));
++        assert!(cursor_out.ends_with("\x1b[1;10H"));
++    }
++
++    #[test]
++    fn cursor_progress_unblocks_predictions_behind_unchanged_space() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char(' ', &mut Vec::new());
++        harness.predictor.on_char('d', &mut Vec::new());
++        harness.predictor.on_char('e', &mut Vec::new());
++
++        // The space is untouched, while d/e are normal cell diffs. Cursor
++        // progress confirms the space so it cannot block the later writes.
++        harness.feed(&prompt_frame(
++            &[(3, 0, plain_cell("d")), (4, 0, plain_cell("e"))],
++            (5, 0),
++        ));
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "whole chain confirmed"
++        );
++    }
++
++    #[test]
++    fn failed_gate_flushes_chain_and_blocks_until_fresh_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[(4, 0, styled_cell("~"))], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        // `b` would push into the styled cell, so it cannot be represented by
++        // this prediction chain.
++        harness.predictor.on_char('b', &mut out);
++        assert!(harness.predictor.pending.is_empty(), "chain flushed");
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "drawn a restored to server truth");
++
++        let mut blocked_out = Vec::new();
++        harness.predictor.on_char('c', &mut blocked_out);
++        assert!(blocked_out.is_empty(), "no stale second chain");
++        assert!(harness.predictor.pending.is_empty());
++    }
++
++    #[test]
++    fn hidden_cursor_frame_flushes_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++
++        let mut hidden = prompt_frame(&[], (2, 0));
++        hidden.cursor.as_mut().expect("cursor").visible = false;
++        let out = harness.feed(&hidden);
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "prediction repainted before cursor hides");
++    }
++
++    #[test]
++    fn cross_row_cursor_frame_flushes_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++
++        let out = harness.feed(&prompt_frame(&[], (2, 1)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty());
++    }
++
++    #[test]
++    fn idle_timer_flushes_expired_prediction_without_another_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        harness
++            .predictor
++            .pending
++            .front_mut()
++            .expect("pending")
++            .sent_at = Instant::now()
++            .checked_sub(PREDICTION_TIMEOUT)
++            .expect("past");
++
++        let out = harness.predictor.on_timer();
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "expired prediction repainted");
++    }
++
++    fn confirm_auto_prediction(harness: &mut Harness, confirmed_text: &str, slow: bool) {
++        let ch = confirmed_text.chars().next_back().expect("non-empty text");
++        harness.predictor.on_char(ch, &mut Vec::new());
++        let pending = harness
++            .predictor
++            .pending
++            .front_mut()
++            .expect("pending prediction");
++        pending.sent_at = if slow {
++            Instant::now()
++                .checked_sub(AUTO_MIN_LATENCY + Duration::from_millis(1))
++                .expect("past")
++        } else {
++            Instant::now()
++                .checked_add(AUTO_MIN_LATENCY)
++                .expect("future")
++        };
++        let cells = confirmed_text
++            .chars()
++            .enumerate()
++            .map(|(offset, ch)| (2 + offset as u16, 0, plain_cell(&ch.to_string())))
++            .collect::<Vec<_>>();
++        harness.feed(&prompt_frame(
++            &cells,
++            (2 + confirmed_text.chars().count() as u16, 0),
++        ));
++    }
++
++    #[test]
++    fn auto_mode_dark_launches_then_unlocks_after_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        assert!(!harness.predictor.display_unlocked);
++        confirm_auto_prediction(&mut harness, "ab", true);
++        assert!(harness.predictor.display_unlocked);
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('c', &mut out);
++        assert!(!out.is_empty(), "draws once unlocked");
++    }
++
++    #[test]
++    fn auto_mode_does_not_count_fast_fast_slow_as_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", false);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(!harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 1);
++    }
++
++    #[test]
++    fn auto_mode_counts_nonconsecutive_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 2);
++    }
++
++    #[test]
++    fn styled_cells_and_hidden_cursor_are_not_predicted() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[(2, 0, styled_cell("~"))], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "styled target");
++
++        let mut hidden = prompt_frame(&[], (2, 0));
++        hidden.cursor.as_mut().expect("cursor").visible = false;
++        harness.feed(&hidden);
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "hidden cursor");
++    }
++
++    #[test]
++    fn right_margin_is_not_predicted() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (7, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty());
++    }
++
++    #[test]
++    fn backspace_undoes_last_prediction_only() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        harness.predictor.on_backspace(&mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.contains("\x1b[1;3H"), "restores the cell: {out:?}");
++
++        // Without pending predictions, backspace is left to the server.
++        let mut out = Vec::new();
++        harness.predictor.on_backspace(&mut out);
++        assert!(out.is_empty());
++    }
++
++    #[cfg(windows)]
++    fn key_event(
++        ch: char,
++        kind: crate::protocol::ClientKeyKind,
++    ) -> crate::protocol::ClientInputEvent {
++        crate::protocol::ClientInputEvent::Key {
++            code: crate::protocol::ClientKeyCode::Char(ch),
++            modifiers: 0,
++            kind,
++        }
++    }
++
++    #[cfg(windows)]
++    fn mouse_event(kind: crate::protocol::ClientMouseKind) -> crate::protocol::ClientInputEvent {
++        crate::protocol::ClientInputEvent::Mouse {
++            kind,
++            column: 4,
++            row: 1,
++            modifiers: 0,
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_click_flushes_and_blocks_later_key_in_same_batch() {
++        use crate::protocol::{ClientKeyKind, ClientMouseButton, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.predictor.on_input_events(&[
++            mouse_event(ClientMouseKind::Down(ClientMouseButton::Left)),
++            key_event('b', ClientKeyKind::Press),
++        ]);
++        assert!(!out.is_empty(), "drawn prediction must be repainted");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++
++        harness.feed(&prompt_frame(&[], (4, 0)));
++        harness
++            .predictor
++            .on_input_events(&[key_event('c', ClientKeyKind::Press)]);
++        assert_eq!(harness.predictor.pending.len(), 1, "fresh frame recovers");
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_scroll_blocks_prediction_but_key_release_does_not() {
++        use crate::protocol::{ClientKeyKind, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_input_events(&[
++            key_event('x', ClientKeyKind::Release),
++            key_event('a', ClientKeyKind::Press),
++        ]);
++        assert_eq!(harness.predictor.pending.len(), 1, "release is harmless");
++
++        let out = harness
++            .predictor
++            .on_input_events(&[mouse_event(ClientMouseKind::ScrollDown)]);
++        assert!(!out.is_empty(), "scroll repaints drawn prediction");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++    }
++
++    #[test]
++    fn other_keys_flush_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        harness.predictor.on_other_input(&mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.contains("\x1b[1;3H"), "repaint predicted cell: {out:?}");
++        assert!(out.ends_with("\x1b[1;3H"), "cursor at server pos: {out:?}");
++    }
++
++    #[test]
++    fn full_frame_clears_pending_without_correction() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        harness.encoder = BlitEncoder::new();
++        let out = harness.feed(&prompt_frame(&[], (2, 0)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.is_empty(), "full frame itself restores truth");
++    }
++
++    #[test]
++    fn resize_repaints_pending_while_waiting_for_full_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.predictor.on_resize();
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty());
++    }
++
++    #[test]
++    fn pending_cap_stops_predicting() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        let width = MAX_PENDING as u16 + 2;
++        let wide = FrameData {
++            cells: vec![plain_cell(" "); width as usize],
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: 0,
++                y: 0,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        };
++        harness.feed(&wide);
++        for _ in 0..MAX_PENDING + 3 {
++            harness.predictor.on_char('x', &mut Vec::new());
++        }
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "cap flushes unsafe chain"
++        );
++        assert!(harness.predictor.blocked_until_frame);
++    }
++}
+diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
+new file mode 100644
+index 0000000..27dc588
+--- /dev/null
++++ b/src/client/screen_model.rs
+@@ -0,0 +1,658 @@
++//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
++//!
++//! Terminal-ansi clients normally blit server frame bytes to stdout without
++//! understanding them. Predictive local echo needs to know what is on screen
++//! (cursor position, cell contents and styling), so this model replays every
++//! received `TerminalFrame` into a cell grid.
++//!
++//! The frame stream is produced exclusively by `protocol::render_ansi::
++//! BlitEncoder`, whose output vocabulary is small and contains **no scrolling
++//! and no relative cursor motion**. Cell runs begin at an absolute `CUP`;
++//! a width-1 cell may let the following cell continue inline. Printable runs
++//! are split at Unicode extended grapheme boundaries before updating cells.
++//! The parser below handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
++//! visibility, `?2026 h/l` sync markers, DECSCUSR, OSC (hyperlinks,
++//! clipboard) and APC (Kitty graphics) passthrough — and ignores everything
++//! else. Round-trip tests validate the model against `BlitEncoder` output of
++//! reference frames.
++
++/// The SGR parameter list `build_sgr` emits for a completely unstyled cell.
++const PLAIN_SGR_PARAMS: &str = "0;39;49";
++
++/// One mirrored cell.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct ModelCell {
++    /// Grapheme cluster displayed in the cell. Blank cells hold `" "`.
++    pub(crate) symbol: String,
++    /// Whether the cell was written with the plain pen (default colors, no
++    /// modifiers, no hyperlink). Predictions only ever target plain cells.
++    pub(crate) plain: bool,
++}
++
++impl ModelCell {
++    fn blank() -> Self {
++        Self {
++            symbol: " ".to_string(),
++            plain: true,
++        }
++    }
++
++    /// Wide-character continuation cells: covered by the cell to their left.
++    fn continuation() -> Self {
++        Self {
++            symbol: String::new(),
++            plain: false,
++        }
++    }
++}
++
++pub(crate) struct ScreenModel {
++    width: u16,
++    height: u16,
++    cells: Vec<ModelCell>,
++    /// 0-based (col, row) of the host cursor after the last applied frame.
++    cursor: (u16, u16),
++    cursor_visible: bool,
++    /// Whether the current pen is the plain SGR.
++    pen_plain: bool,
++    /// Whether an OSC 8 hyperlink is currently open.
++    hyperlink_open: bool,
++    /// False after standalone zero-width output, whose host-terminal cell
++    /// effect cannot be represented safely for prediction reconciliation.
++    prediction_safe: bool,
++}
++
++impl ScreenModel {
++    pub(crate) fn new() -> Self {
++        Self {
++            width: 0,
++            height: 0,
++            cells: Vec::new(),
++            cursor: (0, 0),
++            cursor_visible: false,
++            pen_plain: false,
++            hyperlink_open: false,
++            prediction_safe: true,
++        }
++    }
++
++    pub(crate) fn ensure_size(&mut self, width: u16, height: u16) {
++        if self.width == width && self.height == height {
++            return;
++        }
++        self.width = width;
++        self.height = height;
++        self.cells = vec![ModelCell::blank(); width as usize * height as usize];
++        self.cursor = (0, 0);
++        self.cursor_visible = false;
++        self.prediction_safe = true;
++    }
++
++    /// A full frame replaces prior screen truth, so it can recover from an
++    /// earlier unmodelable zero-width write unless this frame contains one too.
++    pub(crate) fn begin_full_frame(&mut self) {
++        self.prediction_safe = true;
++    }
++
++    pub(crate) fn prediction_safe(&self) -> bool {
++        self.prediction_safe
++    }
++
++    pub(crate) fn cursor(&self) -> (u16, u16) {
++        self.cursor
++    }
++
++    pub(crate) fn cursor_visible(&self) -> bool {
++        self.cursor_visible
++    }
++
++    pub(crate) fn width(&self) -> u16 {
++        self.width
++    }
++
++    pub(crate) fn cell(&self, x: u16, y: u16) -> Option<&ModelCell> {
++        if x >= self.width || y >= self.height {
++            return None;
++        }
++        self.cells.get(y as usize * self.width as usize + x as usize)
++    }
++
++    /// Replays one frame's bytes into the grid. `touched` receives the
++    /// (col, row) of every cell the frame wrote, for prediction reconcile.
++    pub(crate) fn apply(&mut self, bytes: &[u8], touched: &mut Vec<(u16, u16)>) {
++        let mut index = 0;
++        while index < bytes.len() {
++            if bytes[index] == 0x1b {
++                index = self.apply_escape(bytes, index, touched);
++            } else if bytes[index] < 0x20 || bytes[index] == 0x7f {
++                // Stray C0/DEL outside an escape — the encoder never emits
++                // these, skip defensively.
++                index += 1;
++            } else {
++                index = self.apply_text_run(bytes, index, touched);
++            }
++        }
++    }
++
++    /// Consumes one escape sequence starting at `start` (which is ESC).
++    fn apply_escape(&mut self, bytes: &[u8], start: usize, touched: &mut Vec<(u16, u16)>) -> usize {
++        let Some(&kind) = bytes.get(start + 1) else {
++            return start + 1;
++        };
++        match kind {
++            b'[' => {
++                // CSI: parameter bytes 0x30..=0x3f, intermediates 0x20..=0x2f,
++                // final 0x40..=0x7e.
++                let mut end = start + 2;
++                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
++                    end += 1;
++                }
++                if end >= bytes.len() {
++                    return bytes.len();
++                }
++                let params = &bytes[start + 2..end];
++                self.apply_csi(params, bytes[end], touched);
++                end + 1
++            }
++            b']' => {
++                // OSC: terminated by BEL or ST (ESC \).
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x07 {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 1;
++                    }
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            b'_' => {
++                // APC (Kitty graphics passthrough): terminated by ST.
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            // Stray ST or an escape we do not model.
++            _ => start + 2,
++        }
++    }
++
++    fn apply_csi(&mut self, params: &[u8], final_byte: u8, touched: &mut Vec<(u16, u16)>) {
++        let params = std::str::from_utf8(params).unwrap_or("");
++        match final_byte {
++            b'H' => {
++                let mut split = params.split(';');
++                let row: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                let col: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                self.cursor = (
++                    col.saturating_sub(1).min(self.width.saturating_sub(1)),
++                    row.saturating_sub(1).min(self.height.saturating_sub(1)),
++                );
++            }
++            b'm' => {
++                self.pen_plain = matches!(params, "" | "0" | PLAIN_SGR_PARAMS);
++            }
++            b'J' => {
++                if params == "2" {
++                    for (index, cell) in self.cells.iter_mut().enumerate() {
++                        if cell.symbol != " " || !cell.plain {
++                            *cell = ModelCell::blank();
++                            touched.push((
++                                (index % self.width.max(1) as usize) as u16,
++                                (index / self.width.max(1) as usize) as u16,
++                            ));
++                        }
++                    }
++                }
++            }
++            // ?2026 sync markers carry no screen state; only ?25 does.
++            b'h' | b'l' if params == "?25" => {
++                self.cursor_visible = final_byte == b'h';
++            }
++            // DECSCUSR (`CSI Ps SP q`) and anything else: no cell effect.
++            _ => {}
++        }
++    }
++
++    fn apply_osc(&mut self, payload: &[u8]) {
++        // OSC 8 hyperlink open/close; OSC 52 clipboard is passthrough.
++        if let Some(rest) = payload.strip_prefix(b"8;") {
++            let uri = rest.splitn(2, |b| *b == b';').nth(1).unwrap_or(b"");
++            self.hyperlink_open = !uri.is_empty();
++        }
++    }
++
++    /// Consumes one printable run. The encoder may batch adjacent cells
++    /// without another CUP because inline eligibility is decided by the
++    /// previous cell. Split the run at extended grapheme boundaries so an
++    /// ASCII base plus combining marks remains one modeled cell.
++    fn apply_text_run(
++        &mut self,
++        bytes: &[u8],
++        start: usize,
++        touched: &mut Vec<(u16, u16)>,
++    ) -> usize {
++        let mut end = start;
++        while end < bytes.len() && bytes[end] != 0x1b && bytes[end] >= 0x20 && bytes[end] != 0x7f {
++            end += 1;
++        }
++        use unicode_segmentation::UnicodeSegmentation as _;
++
++        let run = String::from_utf8_lossy(&bytes[start..end]);
++        for grapheme in run.graphemes(true) {
++            self.write_symbol(grapheme.to_string(), touched);
++        }
++        end
++    }
++
++    fn write_symbol(&mut self, symbol: String, touched: &mut Vec<(u16, u16)>) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let (x, y) = self.cursor;
++        if x >= self.width || y >= self.height {
++            return;
++        }
++        let width = symbol.width() as u16;
++        if width == 0 {
++            // BlitEncoder emits this grapheme without advancing the cursor.
++            // A host terminal may attach it to a preceding glyph, so neither
++            // a destination cell nor prediction reconciliation is knowable.
++            self.prediction_safe = false;
++            return;
++        }
++        let plain = self.pen_plain && !self.hyperlink_open;
++        let index = y as usize * self.width as usize + x as usize;
++        self.cells[index] = ModelCell { symbol, plain };
++        touched.push((x, y));
++        for offset in 1..width {
++            let column = x + offset;
++            if column >= self.width {
++                break;
++            }
++            self.cells[index + offset as usize] = ModelCell::continuation();
++            touched.push((column, y));
++        }
++        self.cursor.0 = (x + width).min(self.width.saturating_sub(1));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::render_ansi::BlitEncoder;
++    use crate::protocol::{CellData, CursorState, FrameData};
++
++    fn plain_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0,
++            bg: 0,
++            modifier: 0,
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn styled_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0x00_00_00_02, // red
++            bg: 0,
++            modifier: 1, // bold
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn frame(width: u16, height: u16, cells: Vec<CellData>, cursor: (u16, u16)) -> FrameData {
++        FrameData {
++            cells,
++            width,
++            height,
++            cursor: Some(CursorState {
++                x: cursor.0,
++                y: cursor.1,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    fn assert_model_matches(model: &ScreenModel, frame: &FrameData) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let mut expect_continuations = 0;
++        for y in 0..frame.height {
++            for x in 0..frame.width {
++                let cell = &frame.cells[y as usize * frame.width as usize + x as usize];
++                let model_cell = model.cell(x, y).expect("cell in range");
++                if expect_continuations > 0 {
++                    expect_continuations -= 1;
++                    assert_eq!(
++                        model_cell,
++                        &ModelCell::continuation(),
++                        "continuation at ({x},{y})"
++                    );
++                    continue;
++                }
++                if cell.skip {
++                    continue;
++                }
++                assert_eq!(model_cell.symbol, cell.symbol, "symbol at ({x},{y})");
++                let plain = cell.fg == 0 && cell.bg == 0 && cell.modifier == 0;
++                assert_eq!(model_cell.plain, plain, "plainness at ({x},{y})");
++                expect_continuations = cell.symbol.width().saturating_sub(1);
++            }
++        }
++        let cursor = frame.cursor.as_ref().expect("cursor");
++        assert_eq!(model.cursor(), (cursor.x, cursor.y), "cursor position");
++        assert_eq!(model.cursor_visible(), cursor.visible, "cursor visibility");
++    }
++
++    /// Encodes `frames` in sequence through a real `BlitEncoder` (full frame
++    /// first, then diffs) and replays the bytes into a model.
++    fn replay(frames: &[FrameData]) -> ScreenModel {
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++        for frame in frames {
++            let encoded = encoder.encode(frame, false);
++            model.ensure_size(frame.width, frame.height);
++            model.apply(&encoded.bytes, &mut touched);
++            encoder.commit(frame.clone(), encoded);
++        }
++        model
++    }
++
++    #[test]
++    fn full_frame_round_trips_through_real_encoder() {
++        let mut cells = vec![plain_cell(" "); 12];
++        cells[0] = plain_cell("$");
++        cells[2] = styled_cell("l");
++        cells[3] = plain_cell("s");
++        let frame = frame(4, 3, cells, (1, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_model_matches(&model, &frame);
++    }
++
++    #[test]
++    fn incremental_frame_round_trips_through_real_encoder() {
++        let mut first_cells = vec![plain_cell(" "); 12];
++        first_cells[0] = plain_cell("$");
++        let first = frame(4, 3, first_cells.clone(), (2, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("e");
++        second_cells[5] = styled_cell("X");
++        let second = frame(4, 3, second_cells, (3, 0));
++
++        let model = replay(&[first, second.clone()]);
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn contiguous_ascii_diff_updates_each_cell() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![plain_cell("a"), plain_cell("b"), plain_cell("c"), plain_cell(" ")],
++            (3, 0),
++        );
++        let model = replay(&[first, second.clone()]);
++
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn decomposed_grapheme_full_frame_occupies_one_cell() {
++        let reference = frame(
++            3,
++            1,
++            vec![plain_cell("e\u{301}"), plain_cell("!"), plain_cell(" ")],
++            (2, 0),
++        );
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert_model_matches(&model, &reference);
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "e\u{301}");
++        assert_eq!(model.cell(1, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn ascii_prefix_and_decomposed_grapheme_diff_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell("a"),
++                plain_cell("e\u{301}"),
++                plain_cell("!"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("ae\u{301}"),
++            "test must exercise one ASCII-leading decomposed run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
++    }
++
++    fn zero_width_diff(symbol: &str) -> (ScreenModel, Vec<(u16, u16)>) {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell(" "),
++                plain_cell(symbol),
++                plain_cell("x"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.begin_full_frame();
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++        (model, touched)
++    }
++
++    #[test]
++    fn combining_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{301}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
++    }
++
++    #[test]
++    fn zwj_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{200d}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
++    }
++
++    #[test]
++    fn ascii_prefix_and_wide_cell_in_one_run_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let mut second_cells = vec![plain_cell(" "); 4];
++        second_cells[0] = plain_cell("a");
++        second_cells[1] = plain_cell("你");
++        second_cells[2] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("a你"),
++            "test must exercise one mixed printable run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
++    }
++
++    #[test]
++    fn wide_symbol_occupies_two_columns() {
++        let mut cells = vec![plain_cell(" "); 8];
++        cells[0] = plain_cell("你");
++        cells[1] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        cells[2] = plain_cell("!");
++        let frame = frame(4, 2, cells, (3, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "你");
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::continuation());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn hyperlinked_cells_are_not_plain() {
++        let mut cells = vec![plain_cell(" "); 4];
++        cells[0] = CellData {
++            hyperlink: Some(0),
++            ..plain_cell("h")
++        };
++        cells[1] = plain_cell("x");
++        let mut frame = frame(4, 1, cells, (2, 0));
++        frame.hyperlinks = vec!["https://example.com".to_string()];
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert!(!model.cell(0, 0).unwrap().plain, "hyperlinked cell");
++        assert!(model.cell(1, 0).unwrap().plain, "cell after link close");
++    }
++
++    #[test]
++    fn hidden_cursor_is_reported_hidden() {
++        let mut reference = frame(2, 1, vec![plain_cell("a"), plain_cell(" ")], (0, 0));
++        reference.cursor.as_mut().expect("cursor").visible = false;
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert!(!model.cursor_visible());
++    }
++
++    #[test]
++    fn resize_clears_the_grid() {
++        let reference = frame(2, 1, vec![plain_cell("a"), plain_cell("b")], (0, 0));
++        let mut model = replay(std::slice::from_ref(&reference));
++        model.ensure_size(3, 2);
++        assert_eq!(model.cell(0, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.width(), 3);
++    }
++
++    #[test]
++    fn touched_reports_written_cells() {
++        let mut first_cells = vec![plain_cell(" "); 4];
++        first_cells[0] = plain_cell("a");
++        let first = frame(4, 1, first_cells.clone(), (1, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("b");
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++
++        let encoded = encoder.encode(&first, false);
++        model.ensure_size(first.width, first.height);
++        model.apply(&encoded.bytes, &mut touched);
++        encoder.commit(first, encoded);
++
++        touched.clear();
++        let encoded = encoder.encode(&second, false);
++        model.apply(&encoded.bytes, &mut touched);
++        assert_eq!(touched, vec![(2, 0)], "diff frame touches only the change");
++    }
++
++    #[test]
++    fn cursor_only_diff_updates_cursor_without_touching_cells() {
++        let cells = vec![plain_cell(" "); 4];
++        let first = frame(4, 1, cells.clone(), (1, 0));
++        let second = frame(4, 1, cells, (2, 0));
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++
++        let encoded = encoder.encode(&first, false);
++        model.ensure_size(first.width, first.height);
++        model.apply(&encoded.bytes, &mut touched);
++        encoder.commit(first, encoded);
++
++        touched.clear();
++        let encoded = encoder.encode(&second, false);
++        model.apply(&encoded.bytes, &mut touched);
++        assert!(touched.is_empty());
++        assert_eq!(model.cursor(), (2, 0));
++        assert!(model.cursor_visible());
++    }
++
++    #[test]
++    fn kitty_graphics_and_osc52_are_passthrough() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(b"\x1b_Ga=T;payload\x1b\\\x1b]52;c;YQ==\x07\x1b[1;1Hz", &mut touched);
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "z");
++    }
++
++    #[test]
++    fn truncated_escape_at_end_does_not_panic() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(b"\x1b[1;1", &mut touched);
++        model.apply(b"\x1b]8;;unterminated", &mut touched);
++        model.apply(b"\x1b", &mut touched);
++    }
++}
+diff --git a/src/config/model.rs b/src/config/model.rs
+index 9fbca3a..7843d64 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -863,15 +863,31 @@ pub struct AdvancedConfig {
+ #[derive(Debug, Deserialize)]
+ #[serde(default)]
+ pub struct RemoteConfig {
+-    /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
+-    /// Set false to run plain ssh unchanged. Default: true.
++    /// Manage ssh options for `herdr --remote`: on Unix, add fallback
++    /// keepalives and private connection reuse; on Windows, add command-line
++    /// keepalives without config-file writes or connection reuse. Set false
++    /// to run plain ssh unchanged. Default: true.
+     pub manage_ssh_config: bool,
++    /// Windows only: route the `--remote` ssh transport through a local
++    /// `herdr remote-tcp-relay` ProxyCommand that owns the TCP socket with
++    /// TCP_NODELAY set, avoiding Nagle keystroke stalls on high-RTT links.
++    /// Overrides any ProxyCommand/ProxyJump from your ssh config for the
++    /// target, so it is opt-in. Requires manage_ssh_config. Default: false.
++    pub tcp_relay: bool,
++    /// Predictive local echo for remote attach: draw typed characters
++    /// immediately (underlined) instead of waiting a full round trip, then
++    /// reconcile against server frames. `"off"`, `"auto"` (only activates
++    /// once echo delay is observed to be high), or `"always"`.
++    /// Default: "auto".
++    pub predictive_echo: String,
+ }
+ 
+ impl Default for RemoteConfig {
+     fn default() -> Self {
+         Self {
+             manage_ssh_config: true,
++            tcp_relay: false,
++            predictive_echo: "auto".to_string(),
+         }
+     }
+ }
+diff --git a/src/ipc.rs b/src/ipc.rs
+index ce164b0..abb3549 100644
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -181,12 +181,10 @@ fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
+     Ok(windows_named_pipe_available(&*stream)?.is_none())
+ }
+ 
+-/// Returns the number of bytes available to read without blocking, or `None`
+-/// when the peer has closed the pipe. Shared with the remote-attach bridge,
+-/// whose client pump must poll instead of blocking in `read` (named pipes
+-/// cannot be half-closed or shut down from another thread).
++/// Returns the number of bytes available to the IPC poller without blocking,
++/// or `None` when the peer has closed the pipe.
+ #[cfg(windows)]
+-pub(crate) fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
++fn windows_named_pipe_available(stream: &LocalStream) -> io::Result<Option<u32>> {
+     use std::os::windows::io::{AsHandle, AsRawHandle};
+ 
+     let LocalStream::NamedPipe(pipe) = stream;
+diff --git a/src/main.rs b/src/main.rs
+index 5d140e1..b68ca5a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -386,6 +386,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # command-line keepalives that override ServerAlive* values in user config.
+ # Set false to use ssh config unchanged without herdr's additions.
+ # manage_ssh_config = true
++# Windows only: opt into a TCP_NODELAY ProxyCommand relay. This overrides any
++# ProxyJump/ProxyCommand in user config, so leave it off for proxied targets.
++# Requires manage_ssh_config = true.
++# tcp_relay = false
++# Predictive local echo for remote terminal attach: "off", "auto", or "always".
++# Auto displays predictions only after observing enough network latency.
++# predictive_echo = "auto"
+ 
+ [experimental]
+ # Allow launching herdr from inside a herdr-managed pane.
+@@ -495,6 +502,11 @@ fn main() -> io::Result<()> {
+         return remote::run_remote_client_bridge();
+     }
+ 
++    // Hidden ssh ProxyCommand: TCP_NODELAY relay for `--remote` transports.
++    if args.get(1).map(|s| s.as_str()) == Some("remote-tcp-relay") {
++        return remote::run_remote_tcp_relay(&args[2..]);
++    }
++
+     if args.get(1).map(|s| s.as_str()) == Some("server") {
+         return server::headless::run_server();
+     }
+@@ -678,6 +690,7 @@ fn main() -> io::Result<()> {
+                 "server",
+                 "client",
+                 "remote-client-bridge",
++                "remote-tcp-relay",
+                 "update",
+                 "status",
+                 "config",
+@@ -861,6 +874,8 @@ mod tests {
+         assert!(DEFAULT_CONFIG.contains("On Windows, true writes no config"));
+         assert!(DEFAULT_CONFIG.contains("provides no connection reuse"));
+         assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
++        assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
++        assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
+     }
+ 
+     #[test]
+diff --git a/src/protocol/wire.rs b/src/protocol/wire.rs
+index 9cc2924..3c7eabb 100644
+--- a/src/protocol/wire.rs
++++ b/src/protocol/wire.rs
+@@ -819,19 +819,23 @@ impl From<io::Error> for FramingError {
+ /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
+ /// (would be truncated by the length prefix cast).
+ pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
+-    let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
++    // Build the prefix and payload in one buffer so small interactive input
++    // reaches pipes/TCP as one write instead of two independently packetized
++    // writes. Encode directly after the reserved prefix to avoid a copy.
++    let mut frame = Vec::with_capacity(256);
++    frame.resize(LENGTH_PREFIX_BYTES, 0);
++    let len = bincode::serde::encode_into_std_write(msg, &mut frame, bincode::config::standard())
+         .map_err(|e| FramingError::Bincode(e.to_string()))?;
+ 
+-    let len = payload.len();
+     if len > u32::MAX as usize {
+         return Err(FramingError::Bincode(format!(
+-            "payload length {len} exceeds u32::MAX ({}), would be truncated by length prefix",
++            "payload length {len} exceeds u32::MAX ({}), would be truncated by the length prefix",
+             u32::MAX
+         )));
+     }
++    frame[..LENGTH_PREFIX_BYTES].copy_from_slice(&(len as u32).to_le_bytes());
+ 
+-    writer.write_all(&(len as u32).to_le_bytes())?;
+-    writer.write_all(&payload)?;
++    writer.write_all(&frame)?;
+     writer.flush()?;
+     Ok(())
+ }
+@@ -1443,6 +1447,39 @@ mod tests {
+         assert_eq!(msg, decoded);
+     }
+ 
++    #[derive(Default)]
++    struct RecordingWriter {
++        bytes: Vec<u8>,
++        writes: usize,
++        flushes: usize,
++    }
++
++    impl Write for RecordingWriter {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.writes += 1;
++            self.bytes.extend_from_slice(bytes);
++            Ok(bytes.len())
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            self.flushes += 1;
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn framing_uses_one_write_for_prefix_and_payload() {
++        let msg = ClientMessage::Input { data: vec![b'x'] };
++        let mut writer = RecordingWriter::default();
++        write_message(&mut writer, &msg).unwrap();
++
++        assert_eq!(writer.writes, 1);
++        assert_eq!(writer.flushes, 1);
++        let decoded: ClientMessage =
++            read_message(&mut writer.bytes.as_slice(), MAX_FRAME_SIZE).unwrap();
++        assert_eq!(decoded, msg);
++    }
++
+     #[test]
+     fn framing_large_payload_roundtrip() {
+         // Create a Frame message that is ≥128 KB.
+diff --git a/src/remote.rs b/src/remote.rs
+index 6186d83..6f5de59 100644
+--- a/src/remote.rs
++++ b/src/remote.rs
+@@ -4,6 +4,8 @@
+ //! bridge socket / ssh option handling lives in `unix` and `windows`.
+ 
+ mod launcher;
++mod probe;
++mod tcp_relay;
+ 
+ #[cfg(unix)]
+ mod unix;
+@@ -13,6 +15,7 @@ mod windows;
+ pub(crate) use launcher::{
+     extract_remote_args, run_remote, REATTACH_COMMAND_ENV_VAR, REMOTE_KEYBINDINGS_ENV_VAR,
+ };
++pub(crate) use tcp_relay::run_remote_tcp_relay;
+ 
+ #[cfg(unix)]
+ pub(crate) use unix::run_remote_client_bridge;
+diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
+index dc20501..627dbc6 100644
+--- a/src/remote/launcher.rs
++++ b/src/remote/launcher.rs
+@@ -15,6 +15,7 @@ use serde::Deserialize;
+ use std::thread;
+ use std::time::{Duration, Instant};
+ 
++use super::probe;
+ #[cfg(unix)]
+ use super::unix as sys;
+ #[cfg(windows)]
+@@ -206,12 +207,19 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         remote.keybindings,
+         remote.live_handoff,
+     );
+-    let manage_ssh_config = timed("phase: load config", "", || {
+-        crate::config::Config::load().config.remote.manage_ssh_config
++    let remote_config = timed("phase: load config", "", || {
++        crate::config::Config::load().config.remote
+     });
+-    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
++    let remote_ssh = RemoteSsh::new(
++        remote.target.clone(),
++        remote_config.manage_ssh_config,
++        remote_config.tcp_relay,
++    );
++    let remote_probe = timed("phase: probe remote", "", || {
++        probe::probe_remote(&remote_ssh)
++    })?;
+     let prepared_remote = timed("phase: prepare remote herdr", "", || {
+-        prepare_remote_herdr(&remote_ssh, remote.live_handoff)
++        prepare_remote_herdr(&remote_ssh, remote.live_handoff, &remote_probe)
+     })?;
+     timed("phase: ensure remote server ready", "", || {
+         ensure_remote_server_ready(
+@@ -220,8 +228,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+             prepared_remote.installed_or_replaced,
+             prepared_remote.stop_after_install_approved,
+             remote.live_handoff,
++            remote_probe.server_status_json.as_deref(),
+         )
+     })?;
++    if let Some(path) = &prepared_remote.matched_probe_path {
++        probe::save_cache(&remote.target, path, &prepared_remote.remote_herdr.platform);
++    }
+ 
+     let _bridge = sys::SshStdioBridge::start(
+         remote.target,
+@@ -242,7 +254,22 @@ pub(crate) struct RemotePlatform {
+ }
+ 
+ impl RemotePlatform {
+-    fn from_uname(os: &str, arch: &str) -> Option<Self> {
++    /// Rebuilds a platform from cached ids (`linux`/`macos`, `x86_64`/`aarch64`).
++    pub(crate) fn from_ids(os: &str, arch: &str) -> Option<Self> {
++        let os = match os {
++            "linux" => "linux",
++            "macos" => "macos",
++            _ => return None,
++        };
++        let arch = match arch {
++            "x86_64" => "x86_64",
++            "aarch64" => "aarch64",
++            _ => return None,
++        };
++        Some(Self { os, arch })
++    }
++
++    pub(crate) fn from_uname(os: &str, arch: &str) -> Option<Self> {
+         let os = match os.trim() {
+             "Linux" => "linux",
+             "Darwin" => "macos",
+@@ -405,7 +432,7 @@ struct RemoteManifestReleaseRef<'a> {
+     assets: &'a BTreeMap<String, RemoteAssetRef>,
+ }
+ 
+-fn current_version() -> String {
++pub(crate) fn current_version() -> String {
+     crate::build_info::version()
+ }
+ 
+@@ -427,6 +454,9 @@ struct PreparedRemoteHerdr {
+     remote_herdr: RemoteHerdr,
+     installed_or_replaced: bool,
+     stop_after_install_approved: bool,
++    /// Expanded absolute path of the probe candidate that matched, for the
++    /// per-target probe cache. `None` when the binary was (re)installed.
++    matched_probe_path: Option<String>,
+ }
+ 
+ pub(crate) struct RemoteSsh {
+@@ -435,9 +465,9 @@ pub(crate) struct RemoteSsh {
+ }
+ 
+ impl RemoteSsh {
+-    fn new(target: String, manage_ssh_config: bool) -> Self {
++    fn new(target: String, manage_ssh_config: bool, tcp_relay: bool) -> Self {
+         let managed_config = if manage_ssh_config {
+-            sys::write_managed_ssh_config()
++            sys::write_managed_ssh_config(tcp_relay)
+                 .inspect_err(|err| {
+                     tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
+                 })
+@@ -472,7 +502,7 @@ impl RemoteSsh {
+         command
+     }
+ 
+-    fn sh_output(&self, script: &str) -> io::Result<Output> {
++    pub(crate) fn sh_output(&self, script: &str) -> io::Result<Output> {
+         timed("ssh sh script", script_summary(script), || {
+             let mut child = self
+                 .command()
+@@ -625,37 +655,51 @@ impl InstallSource {
+ fn prepare_remote_herdr(
+     ssh: &RemoteSsh,
+     live_handoff_enabled: bool,
++    remote_probe: &probe::RemoteProbe,
+ ) -> io::Result<PreparedRemoteHerdr> {
+-    let platform = detect_remote_platform(ssh)?;
++    let platform = remote_probe.platform.clone().ok_or_else(|| {
++        io::Error::other(format!(
++            "unsupported remote platform: {}",
++            remote_probe.platform_detail()
++        ))
++    })?;
+     let remote_herdr = RemoteHerdr::for_platform(platform);
+     let override_binary = remote_binary_override_path()?;
+-    let remote_binary_candidates = remote_binary_candidates(ssh, &remote_herdr)?;
++    // Candidates were discovered and version-checked in the single probe
++    // round trip; `remote_herdr_from_path` re-applies the absolute-path and
++    // mise-shim filters and takes care of shell quoting.
++    let remote_binary_candidates: Vec<(RemoteHerdr, &probe::CandidateProbe)> = remote_probe
++        .candidates
++        .iter()
++        .filter_map(|candidate| {
++            remote_herdr_from_path(&remote_herdr, &candidate.path)
++                .map(|remote_herdr| (remote_herdr, candidate))
++        })
++        .collect();
+ 
+     if override_binary.is_none() {
+-        for candidate in &remote_binary_candidates {
+-            if remote_binary_matches(ssh, candidate).unwrap_or(false) {
++        for (candidate_herdr, candidate) in &remote_binary_candidates {
++            if candidate.matches_current() {
+                 return Ok(PreparedRemoteHerdr {
+-                    remote_herdr: candidate.clone(),
++                    remote_herdr: candidate_herdr.clone(),
+                     installed_or_replaced: false,
+                     stop_after_install_approved: false,
++                    matched_probe_path: Some(candidate.path.clone()),
+                 });
+             }
+         }
+-        if remote_binary_matches(ssh, &remote_herdr)? {
+-            return Ok(PreparedRemoteHerdr {
+-                remote_herdr,
+-                installed_or_replaced: false,
+-                stop_after_install_approved: false,
+-            });
+-        }
+     }
+ 
+     let mut stop_after_install_approved = false;
+-    if let Some(status_probe_herdr) = remote_binary_candidates.first().or_else(|| {
+-        remote_binary_exists(ssh, &remote_herdr)
+-            .ok()
+-            .and_then(|exists| exists.then_some(&remote_herdr))
+-    }) {
++    if let Some(status_probe_herdr) = remote_binary_candidates
++        .first()
++        .map(|(candidate_herdr, _)| candidate_herdr)
++        .or_else(|| {
++            remote_binary_exists(ssh, &remote_herdr)
++                .ok()
++                .and_then(|exists| exists.then_some(&remote_herdr))
++        })
++    {
+         stop_after_install_approved = confirm_remote_install_with_running_server(
+             ssh,
+             status_probe_herdr,
+@@ -685,140 +729,10 @@ fn prepare_remote_herdr(
+         remote_herdr,
+         installed_or_replaced: true,
+         stop_after_install_approved,
++        matched_probe_path: None,
+     })
+ }
+ 
+-fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
+-    let output = ssh.sh_output("uname -s\nuname -m\n")?;
+-    if !output.status.success() {
+-        return Err(command_failed("remote platform detection failed", &output));
+-    }
+-
+-    let stdout = String::from_utf8_lossy(&output.stdout);
+-    let mut lines = stdout.lines();
+-    let os = lines.next().unwrap_or_default();
+-    let arch = lines.next().unwrap_or_default();
+-    RemotePlatform::from_uname(os, arch).ok_or_else(|| {
+-        io::Error::other(format!(
+-            "unsupported remote platform: {} {}",
+-            os.trim(),
+-            arch.trim()
+-        ))
+-    })
+-}
+-
+-fn remote_binary_candidates(
+-    ssh: &RemoteSsh,
+-    remote_herdr: &RemoteHerdr,
+-) -> io::Result<Vec<RemoteHerdr>> {
+-    let mut candidates = Vec::new();
+-
+-    if let Some(path_candidate) = remote_binary_on_path_any(ssh, remote_herdr)? {
+-        push_if_new_remote_binary_candidate(&mut candidates, path_candidate);
+-    }
+-
+-    let output = ssh.sh_output(&known_remote_binary_candidate_script(
+-        &remote_herdr.platform,
+-    ))?;
+-    if !output.status.success() {
+-        return Err(command_failed("remote binary discovery failed", &output));
+-    }
+-    let stdout = String::from_utf8_lossy(&output.stdout);
+-    for candidate in remote_herdrs_from_path_discovery(remote_herdr, &stdout) {
+-        push_if_new_remote_binary_candidate(&mut candidates, candidate);
+-    }
+-
+-    Ok(candidates)
+-}
+-
+-fn push_if_new_remote_binary_candidate(candidates: &mut Vec<RemoteHerdr>, candidate: RemoteHerdr) {
+-    if !candidates
+-        .iter()
+-        .any(|existing| existing.shell_path == candidate.shell_path)
+-    {
+-        candidates.push(candidate);
+-    }
+-}
+-
+-fn known_remote_binary_candidate_script(platform: &RemotePlatform) -> String {
+-    let mut script = String::from(
+-        r#"home=${HOME:-}
+-user=${USER:-}
+-version="#,
+-    );
+-    script.push_str(&shell_quote(&current_version()));
+-    script.push_str(
+-        r#"
+-emit() {
+-    path=$1
+-    if [ -n "$path" ] && [ -x "$path" ]; then
+-        printf '%s\n' "$path"
+-    fi
+-}
+-if [ -n "$home" ]; then
+-    emit "$home/.local/bin/herdr"
+-fi
+-"#,
+-    );
+-    if platform.os == "macos" {
+-        script.push_str(
+-            r#"    emit "/opt/homebrew/bin/herdr"
+-    emit "/usr/local/bin/herdr"
+-"#,
+-        );
+-    } else if platform.os == "linux" {
+-        script.push_str(
+-            r#"    emit "/home/linuxbrew/.linuxbrew/bin/herdr"
+-"#,
+-        );
+-    }
+-    script.push_str(
+-        r#"if [ -n "$home" ]; then
+-    emit "$home/.local/share/mise/installs/herdr/$version/bin/herdr"
+-    emit "$home/.local/share/mise/installs/herdr/$version/herdr"
+-    emit "$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr"
+-    emit "$home/.nix-profile/bin/herdr"
+-fi
+-if [ -n "$user" ]; then
+-    emit "/etc/profiles/per-user/$user/bin/herdr"
+-fi
+-emit "/nix/var/nix/profiles/default/bin/herdr"
+-emit "/run/current-system/sw/bin/herdr"
+-"#,
+-    );
+-
+-    script
+-}
+-
+-fn remote_binary_on_path_any(
+-    ssh: &RemoteSsh,
+-    remote_herdr: &RemoteHerdr,
+-) -> io::Result<Option<RemoteHerdr>> {
+-    let output = ssh.user_shell_output("command -v herdr")?;
+-    if !output.status.success() {
+-        return Ok(None);
+-    }
+-
+-    let stdout = String::from_utf8_lossy(&output.stdout);
+-    Ok(remote_herdr_from_path_discovery(remote_herdr, &stdout))
+-}
+-
+-fn remote_herdrs_from_path_discovery(remote_herdr: &RemoteHerdr, stdout: &str) -> Vec<RemoteHerdr> {
+-    stdout
+-        .lines()
+-        .filter_map(|path| remote_herdr_from_path(remote_herdr, path))
+-        .collect()
+-}
+-
+-fn remote_herdr_from_path_discovery(
+-    remote_herdr: &RemoteHerdr,
+-    stdout: &str,
+-) -> Option<RemoteHerdr> {
+-    stdout
+-        .lines()
+-        .find_map(|path| remote_herdr_from_path(remote_herdr, path))
+-}
+-
+ fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<RemoteHerdr> {
+     let path = path.trim();
+     if !path.starts_with('/') {
+@@ -982,8 +896,20 @@ fn ensure_remote_server_ready(
+     remote_binary_changed: bool,
+     stop_after_install_approved: bool,
+     live_handoff_enabled: bool,
++    probe_server_status_json: Option<&str>,
+ ) -> io::Result<()> {
+-    let status = remote_server_status(ssh, remote_herdr)?;
++    // The combined probe already fetched the server status; installing a
++    // binary does not change the *running* server, so the snapshot stays
++    // valid. Fall back to a live round trip when the probe had no usable
++    // status (e.g. no remote binary existed before an install).
++    let status = match probe_server_status_json.and_then(|json| {
++        parse_remote_server_status_json(json)
++            .inspect_err(|err| tracing::debug!(%err, "probe server status unusable"))
++            .ok()
++    }) {
++        Some(status) => status,
++        None => remote_server_status(ssh, remote_herdr)?,
++    };
+     let RemoteServerStatus::Running {
+         version,
+         protocol,
+@@ -1218,6 +1144,11 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
+     serde_json::from_str(status).ok()
+ }
+ 
++/// Protocol number from a `status client --json` line, for probe matching.
++pub(crate) fn client_status_protocol(status: &str) -> Option<u32> {
++    parse_client_status_json(status).map(|status| status.protocol)
++}
++
+ fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatus> {
+     let parsed: RemoteServerStatusJson = serde_json::from_str(status).map_err(|err| {
+         io::Error::other(format!(
+@@ -1610,7 +1541,7 @@ fn reattach_command(
+     command
+ }
+ 
+-fn shell_quote(value: &str) -> String {
++pub(crate) fn shell_quote(value: &str) -> String {
+     if !value.is_empty()
+         && value.chars().all(|ch| {
+             ch.is_ascii_alphanumeric()
+@@ -1626,7 +1557,7 @@ fn shell_quote(value: &str) -> String {
+     format!("'{}'", value.replace('\'', "'\\''"))
+ }
+ 
+-fn command_failed(context: &str, output: &Output) -> io::Error {
++pub(crate) fn command_failed(context: &str, output: &Output) -> io::Error {
+     let stderr = String::from_utf8_lossy(&output.stderr);
+     let stderr = stderr.trim();
+     if stderr.is_empty() {
+@@ -1988,8 +1919,8 @@ mod tests {
+             os: "linux",
+             arch: "x86_64",
+         });
+-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "/usr/bin/herdr\n")
+-            .expect("path binary");
++        let remote_herdr =
++            remote_herdr_from_path(&remote_herdr, "/usr/bin/herdr").expect("path binary");
+ 
+         assert_eq!(
+             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+@@ -2004,8 +1935,7 @@ mod tests {
+             arch: "x86_64",
+         });
+         let remote_herdr =
+-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/herdr bin/herdr\n")
+-                .expect("path binary");
++            remote_herdr_from_path(&remote_herdr, "/opt/herdr bin/herdr").expect("path binary");
+ 
+         assert_eq!(
+             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+@@ -2020,8 +1950,7 @@ mod tests {
+             arch: "aarch64",
+         });
+         let remote_herdr =
+-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/homebrew/bin/herdr\n")
+-                .expect("path binary");
++            remote_herdr_from_path(&remote_herdr, "/opt/homebrew/bin/herdr").expect("path binary");
+ 
+         assert_eq!(
+             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+@@ -2030,76 +1959,29 @@ mod tests {
+         assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
+     }
+ 
+-    #[test]
+-    fn remote_path_discovery_reads_multiple_absolute_paths() {
+-        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+-            os: "linux",
+-            arch: "x86_64",
+-        });
+-        let candidates = remote_herdrs_from_path_discovery(
+-            &remote_herdr,
+-            "/usr/bin/herdr\nbin/herdr\n /opt/herdr bin/herdr\n",
+-        );
+-
+-        assert_eq!(candidates.len(), 2);
+-        assert_eq!(candidates[0].shell_path, "/usr/bin/herdr");
+-        assert_eq!(candidates[1].shell_path, "'/opt/herdr bin/herdr'");
+-    }
+-
+     #[test]
+     fn remote_path_discovery_ignores_mise_shims() {
+         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+             os: "linux",
+             arch: "x86_64",
+         });
+-        let candidates = remote_herdrs_from_path_discovery(
+-            &remote_herdr,
+-            "/home/can/.local/share/mise/shims/herdr\n/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr\n",
+-        );
+ 
+-        assert_eq!(candidates.len(), 1);
++        assert!(remote_herdr_from_path(
++            &remote_herdr,
++            "/home/can/.local/share/mise/shims/herdr"
++        )
++        .is_none());
+         assert_eq!(
+-            candidates[0].shell_path,
++            remote_herdr_from_path(
++                &remote_herdr,
++                "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr"
++            )
++            .expect("install path binary")
++            .shell_path,
+             "/home/can/.local/share/mise/installs/herdr/0.7.1/bin/herdr"
+         );
+     }
+ 
+-    #[test]
+-    fn known_remote_binary_candidate_script_includes_mise_and_nix_paths() {
+-        let script = known_remote_binary_candidate_script(&RemotePlatform {
+-            os: "linux",
+-            arch: "x86_64",
+-        });
+-
+-        assert!(script.contains("emit \"$home/.local/bin/herdr\""));
+-        assert!(!script.contains("mise/shims/herdr"));
+-        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
+-        assert!(
+-            script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/bin/herdr\"")
+-        );
+-        assert!(script.contains("emit \"$home/.local/share/mise/installs/herdr/$version/herdr\""));
+-        assert!(script.contains(
+-            "emit \"$home/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
+-        ));
+-        assert!(script.contains("emit \"$home/.nix-profile/bin/herdr\""));
+-        assert!(script.contains("emit \"/etc/profiles/per-user/$user/bin/herdr\""));
+-        assert!(script.contains("emit \"/run/current-system/sw/bin/herdr\""));
+-        assert!(script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
+-        assert!(!script.contains("emit \"/opt/homebrew/bin/herdr\""));
+-    }
+-
+-    #[test]
+-    fn known_remote_binary_candidate_script_includes_macos_homebrew_paths() {
+-        let script = known_remote_binary_candidate_script(&RemotePlatform {
+-            os: "macos",
+-            arch: "aarch64",
+-        });
+-
+-        assert!(script.contains("emit \"/opt/homebrew/bin/herdr\""));
+-        assert!(script.contains("emit \"/usr/local/bin/herdr\""));
+-        assert!(!script.contains("emit \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
+-    }
+-
+     #[test]
+     fn remote_path_discovery_quotes_single_quotes_in_discovered_binary() {
+         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+@@ -2107,8 +1989,7 @@ mod tests {
+             arch: "x86_64",
+         });
+         let remote_herdr =
+-            remote_herdr_from_path_discovery(&remote_herdr, "/opt/herdr's/bin/herdr\n")
+-                .expect("path binary");
++            remote_herdr_from_path(&remote_herdr, "/opt/herdr's/bin/herdr").expect("path binary");
+ 
+         assert_eq!(
+             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+@@ -2122,7 +2003,7 @@ mod tests {
+             os: "linux",
+             arch: "x86_64",
+         });
+-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "bin/herdr\n");
++        let remote_herdr = remote_herdr_from_path(&remote_herdr, "bin/herdr");
+ 
+         assert!(remote_herdr.is_none());
+     }
+@@ -2133,7 +2014,7 @@ mod tests {
+             os: "linux",
+             arch: "x86_64",
+         });
+-        let remote_herdr = remote_herdr_from_path_discovery(&remote_herdr, "\n");
++        let remote_herdr = remote_herdr_from_path(&remote_herdr, "");
+ 
+         assert!(remote_herdr.is_none());
+     }
+diff --git a/src/remote/probe.rs b/src/remote/probe.rs
+new file mode 100644
+index 0000000..dcbc6a3
+--- /dev/null
++++ b/src/remote/probe.rs
+@@ -0,0 +1,596 @@
++//! Combined remote setup probe (i0002 W2).
++//!
++//! The launcher historically ran 4–5 sequential ssh commands before the
++//! bridge could start (platform, PATH lookup, known-path scan, per-candidate
++//! version check, server status). On Windows every ssh command is a fresh
++//! connection (no ControlMaster), so at high RTT the probes dominated attach
++//! time. This module gathers all of them in **one** `ssh /bin/sh -s`
++//! invocation emitting a sentinel-tagged blob, plus a per-target cache that
++//! lets reattaches probe only the previously verified binary path.
++//!
++//! The decision logic in `launcher.rs` is unchanged — this module only
++//! changes how its inputs are gathered.
++
++use std::fs;
++use std::io;
++use std::path::PathBuf;
++
++use serde::{Deserialize, Serialize};
++use sha2::{Digest as _, Sha256};
++
++use super::launcher::{
++    client_status_protocol, command_failed, current_version, sanitize_path_component, shell_quote,
++    RemotePlatform, RemoteSsh, CURRENT_PROTOCOL,
++};
++
++/// Sentinel prefixing every probe output line, so login-shell rc noise in
++/// stdout cannot be mistaken for probe data.
++const SENTINEL: &str = "__HERDR_PROBE__";
++
++/// Kill switch for the per-target probe cache (`HERDR_REMOTE_NO_CACHE=1`).
++const NO_CACHE_ENV_VAR: &str = "HERDR_REMOTE_NO_CACHE";
++
++/// One remote herdr binary discovered by the probe script, with the results
++/// of running it. Paths are absolute and fully expanded by the remote shell.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct CandidateProbe {
++    pub(crate) path: String,
++    /// First line of `<path> --version`, e.g. `herdr 0.7.4`.
++    pub(crate) version_line: Option<String>,
++    /// First line of `<path> status client --json`.
++    pub(crate) client_status_json: Option<String>,
++}
++
++impl CandidateProbe {
++    /// Mirrors `launcher::remote_binary_matches`: exact version line and
++    /// client protocol match against the local binary.
++    pub(crate) fn matches_current(&self) -> bool {
++        self.version_line.as_deref() == Some(expected_version_line().as_str())
++            && self
++                .client_status_json
++                .as_deref()
++                .and_then(client_status_protocol)
++                == Some(CURRENT_PROTOCOL)
++    }
++}
++
++/// Everything the launcher needs to know about the remote host, gathered in
++/// a single ssh round trip.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct RemoteProbe {
++    /// Raw `uname -s` value (kept for error messages).
++    pub(crate) uname_s: String,
++    /// Raw `uname -m` value (kept for error messages).
++    pub(crate) uname_m: String,
++    /// Parsed platform; `None` when unsupported or (cached fast probe) known
++    /// from the cache instead of uname.
++    pub(crate) platform: Option<RemotePlatform>,
++    /// Discovered binaries in priority order (login-shell PATH first, then
++    /// known install locations), deduplicated by path.
++    pub(crate) candidates: Vec<CandidateProbe>,
++    /// `status server --json` output from the best available binary.
++    pub(crate) server_status_json: Option<String>,
++    /// Whether the end marker was seen (output not truncated).
++    complete: bool,
++}
++
++impl RemoteProbe {
++    pub(crate) fn matching_candidate(&self) -> Option<&CandidateProbe> {
++        self.candidates
++            .iter()
++            .find(|candidate| candidate.matches_current())
++    }
++
++    pub(crate) fn platform_detail(&self) -> String {
++        format!("{} {}", self.uname_s.trim(), self.uname_m.trim())
++    }
++}
++
++fn expected_version_line() -> String {
++    format!("herdr {}", current_version())
++}
++
++/// Runs the remote probe: a single-connection fast probe of the cached
++/// verified path when the cache is warm, falling back to (and replacing the
++/// cache after) the full probe. ssh transport errors always propagate —
++/// only *stale cache content* falls back.
++pub(crate) fn probe_remote(ssh: &RemoteSsh) -> io::Result<RemoteProbe> {
++    if let Some(cached) = load_cache(ssh.target()) {
++        let output = ssh.sh_output(&fast_probe_script(&cached.path))?;
++        if let Some(probe) = cached_probe_from_output(&output, &cached)? {
++            return Ok(probe);
++        }
++        remove_cache(ssh.target());
++    }
++
++    let output = ssh.sh_output(&full_probe_script())?;
++    if !output.status.success() {
++        return Err(command_failed("remote probe failed", &output));
++    }
++    let probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
++    if !probe.complete {
++        return Err(io::Error::other(
++            "remote probe output was truncated (no end marker)",
++        ));
++    }
++    Ok(probe)
++}
++
++fn cached_probe_from_output(
++    output: &std::process::Output,
++    cached: &ProbeCacheEntry,
++) -> io::Result<Option<RemoteProbe>> {
++    if !output.status.success() {
++        return Err(command_failed("cached remote probe failed", output));
++    }
++
++    let mut probe = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
++    if !probe.complete || probe.matching_candidate().is_none() {
++        return Ok(None);
++    }
++    probe.platform = RemotePlatform::from_ids(&cached.os, &cached.arch);
++    Ok(probe.platform.is_some().then_some(probe))
++}
++
++/// Shared shell prelude: the `probe` function runs one binary and emits its
++/// results; `first`/`best` track which binary should report server status
++/// (prefer one matching the local version).
++fn probe_script_prelude(header: &str) -> String {
++    format!(
++        r#"{header}
++S={SENTINEL}
++version={version}
++expected="herdr $version"
++first=
++best=
++probe() {{
++    p=$1
++    tag=$2
++    [ -n "$p" ] && [ -x "$p" ] || return 0
++    case "$p" in /*) ;; *) return 0 ;; esac
++    printf '%s %s %s\n' "$S" "$tag" "$p"
++    v=$("$p" --version 2>/dev/null | head -n 1)
++    if [ -n "$v" ]; then
++        printf '%s version %s\t%s\n' "$S" "$p" "$v"
++        cs=$("$p" status client --json 2>/dev/null | head -n 1)
++        if [ -n "$cs" ]; then
++            printf '%s client_status %s\t%s\n' "$S" "$p" "$cs"
++        fi
++        if [ -z "$first" ]; then
++            first=$p
++        fi
++        if [ "$v" = "$expected" ] && [ -z "$best" ]; then
++            best=$p
++        fi
++    fi
++    return 0
++}}
++"#,
++        version = shell_quote(&current_version()),
++    )
++}
++
++/// Shared shell epilogue: server status from the best binary + end marker.
++const PROBE_SCRIPT_EPILOGUE: &str = r#"status_bin=${best:-$first}
++if [ -n "$status_bin" ]; then
++    ss=$("$status_bin" status server --json 2>/dev/null | head -n 1)
++    if [ -n "$ss" ]; then
++        printf '%s server_status %s\n' "$S" "$ss"
++    fi
++fi
++printf '%s end\n' "$S"
++"#;
++
++/// The full probe: uname, login-shell PATH lookup, known install locations
++/// (same list `known_remote_binary_candidate_script` used to scan), then
++/// server status. Branches on `uname -s` because the platform is not known
++/// before the probe runs.
++pub(crate) fn full_probe_script() -> String {
++    let mut script = probe_script_prelude("# herdr remote probe (full)");
++    script.push_str(
++        r#"os=$(uname -s)
++printf '%s uname_s %s\n' "$S" "$os"
++printf '%s uname_m %s\n' "$S" "$(uname -m)"
++if [ -n "${SHELL:-}" ] && [ -x "$SHELL" ]; then
++    path_out=$("$SHELL" -c 'command -v herdr' 2>/dev/null)
++    IFS='
++'
++    for line in $path_out; do
++        probe "$line" path_candidate
++    done
++    unset IFS
++fi
++if [ -n "${HOME:-}" ]; then
++    probe "$HOME/.local/bin/herdr" candidate
++fi
++case "$os" in
++    Darwin)
++        probe "/opt/homebrew/bin/herdr" candidate
++        probe "/usr/local/bin/herdr" candidate
++        ;;
++    Linux)
++        probe "/home/linuxbrew/.linuxbrew/bin/herdr" candidate
++        ;;
++esac
++if [ -n "${HOME:-}" ]; then
++    probe "$HOME/.local/share/mise/installs/herdr/$version/bin/herdr" candidate
++    probe "$HOME/.local/share/mise/installs/herdr/$version/herdr" candidate
++    probe "$HOME/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr" candidate
++    probe "$HOME/.nix-profile/bin/herdr" candidate
++fi
++if [ -n "${USER:-}" ]; then
++    probe "/etc/profiles/per-user/$USER/bin/herdr" candidate
++fi
++probe "/nix/var/nix/profiles/default/bin/herdr" candidate
++probe "/run/current-system/sw/bin/herdr" candidate
++"#,
++    );
++    script.push_str(PROBE_SCRIPT_EPILOGUE);
++    script
++}
++
++/// The cached fast probe: check only the previously verified path (platform
++/// comes from the cache, so no uname round trip is needed either).
++pub(crate) fn fast_probe_script(cached_path: &str) -> String {
++    let mut script = probe_script_prelude("# herdr remote probe (cached path)");
++    script.push_str(&format!(
++        "probe {} candidate\n",
++        shell_quote(cached_path)
++    ));
++    script.push_str(PROBE_SCRIPT_EPILOGUE);
++    script
++}
++
++pub(crate) fn parse_probe_output(stdout: &str) -> RemoteProbe {
++    let mut probe = RemoteProbe {
++        uname_s: String::new(),
++        uname_m: String::new(),
++        platform: None,
++        candidates: Vec::new(),
++        server_status_json: None,
++        complete: false,
++    };
++
++    for line in stdout.lines() {
++        let Some(rest) = line.strip_prefix(SENTINEL).and_then(|rest| rest.strip_prefix(' '))
++        else {
++            continue;
++        };
++        let (tag, value) = rest.split_once(' ').unwrap_or((rest, ""));
++        match tag {
++            "uname_s" => probe.uname_s = value.to_string(),
++            "uname_m" => probe.uname_m = value.to_string(),
++            "path_candidate" | "candidate" => {
++                if !probe
++                    .candidates
++                    .iter()
++                    .any(|candidate| candidate.path == value)
++                {
++                    probe.candidates.push(CandidateProbe {
++                        path: value.to_string(),
++                        version_line: None,
++                        client_status_json: None,
++                    });
++                }
++            }
++            "version" | "client_status" => {
++                let Some((path, payload)) = value.split_once('\t') else {
++                    continue;
++                };
++                let Some(candidate) = probe
++                    .candidates
++                    .iter_mut()
++                    .find(|candidate| candidate.path == path)
++                else {
++                    continue;
++                };
++                if tag == "version" {
++                    candidate.version_line = Some(payload.to_string());
++                } else {
++                    candidate.client_status_json = Some(payload.to_string());
++                }
++            }
++            "server_status" => probe.server_status_json = Some(value.to_string()),
++            "end" => probe.complete = true,
++            _ => {}
++        }
++    }
++
++    probe.platform = RemotePlatform::from_uname(&probe.uname_s, &probe.uname_m);
++    probe
++}
++
++// ---------------------------------------------------------------------------
++// Per-target probe cache
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++pub(crate) struct ProbeCacheEntry {
++    /// Local herdr version the entry was verified against.
++    pub(crate) herdr_version: String,
++    /// Expanded absolute path of the verified remote binary.
++    pub(crate) path: String,
++    /// Remote platform ids (`linux`/`macos`, `x86_64`/`aarch64`).
++    pub(crate) os: String,
++    pub(crate) arch: String,
++}
++
++fn cache_disabled() -> bool {
++    std::env::var_os(NO_CACHE_ENV_VAR).is_some_and(|value| !value.is_empty())
++}
++
++fn cache_dir() -> PathBuf {
++    crate::config::state_dir().join("remote-probe-cache")
++}
++
++fn cache_file(target: &str) -> PathBuf {
++    let readable_target = sanitize_path_component(target);
++    let target_digest = format!("{:x}", Sha256::digest(target.as_bytes()));
++    cache_dir().join(format!("{readable_target}-{target_digest}.json"))
++}
++
++fn load_cache(target: &str) -> Option<ProbeCacheEntry> {
++    if cache_disabled() {
++        return None;
++    }
++    let contents = fs::read_to_string(cache_file(target)).ok()?;
++    let entry: ProbeCacheEntry = serde_json::from_str(&contents).ok()?;
++    (entry.herdr_version == current_version()).then_some(entry)
++}
++
++pub(crate) fn save_cache(target: &str, path: &str, platform: &RemotePlatform) {
++    if cache_disabled() {
++        return;
++    }
++    let entry = ProbeCacheEntry {
++        herdr_version: current_version(),
++        path: path.to_string(),
++        os: platform.os.to_string(),
++        arch: platform.arch.to_string(),
++    };
++    let Ok(contents) = serde_json::to_string_pretty(&entry) else {
++        return;
++    };
++    let file = cache_file(target);
++    if let Some(parent) = file.parent() {
++        let _ = fs::create_dir_all(parent);
++    }
++    let _ = fs::write(file, contents);
++}
++
++fn remove_cache(target: &str) {
++    let _ = fs::remove_file(cache_file(target));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn parse(lines: &[&str]) -> RemoteProbe {
++        parse_probe_output(&lines.join("\n"))
++    }
++
++    #[test]
++    fn parse_reads_platform_candidates_and_server_status() {
++        let probe = parse(&[
++            "login shell noise",
++            "__HERDR_PROBE__ uname_s Linux",
++            "__HERDR_PROBE__ uname_m x86_64",
++            "__HERDR_PROBE__ path_candidate /usr/bin/herdr",
++            "__HERDR_PROBE__ version /usr/bin/herdr\therdr 0.7.4",
++            "__HERDR_PROBE__ client_status /usr/bin/herdr\t{\"protocol\":11}",
++            "__HERDR_PROBE__ candidate /home/can/.local/bin/herdr",
++            "__HERDR_PROBE__ server_status {\"running\":false}",
++            "__HERDR_PROBE__ end",
++        ]);
++
++        assert_eq!(
++            probe.platform,
++            Some(RemotePlatform {
++                os: "linux",
++                arch: "x86_64"
++            })
++        );
++        assert_eq!(probe.candidates.len(), 2);
++        assert_eq!(probe.candidates[0].path, "/usr/bin/herdr");
++        assert_eq!(
++            probe.candidates[0].version_line.as_deref(),
++            Some("herdr 0.7.4")
++        );
++        assert_eq!(
++            probe.candidates[0].client_status_json.as_deref(),
++            Some("{\"protocol\":11}")
++        );
++        assert_eq!(probe.candidates[1].path, "/home/can/.local/bin/herdr");
++        assert_eq!(
++            probe.server_status_json.as_deref(),
++            Some("{\"running\":false}")
++        );
++        assert!(probe.complete);
++    }
++
++    #[test]
++    fn parse_dedups_candidates_and_keeps_priority_order() {
++        let probe = parse(&[
++            "__HERDR_PROBE__ path_candidate /home/can/.local/bin/herdr",
++            "__HERDR_PROBE__ candidate /home/can/.local/bin/herdr",
++            "__HERDR_PROBE__ candidate /usr/local/bin/herdr",
++            "__HERDR_PROBE__ end",
++        ]);
++
++        assert_eq!(probe.candidates.len(), 2);
++        assert_eq!(probe.candidates[0].path, "/home/can/.local/bin/herdr");
++        assert_eq!(probe.candidates[1].path, "/usr/local/bin/herdr");
++    }
++
++    #[test]
++    fn parse_without_end_marker_is_incomplete() {
++        let probe = parse(&["__HERDR_PROBE__ uname_s Linux"]);
++        assert!(!probe.complete);
++    }
++
++    #[test]
++    fn parse_ignores_unknown_tags_and_orphan_results() {
++        let probe = parse(&[
++            "__HERDR_PROBE__ future_tag whatever",
++            "__HERDR_PROBE__ version /not/probed\therdr 0.7.4",
++            "__HERDR_PROBE__ end",
++        ]);
++        assert!(probe.candidates.is_empty());
++        assert!(probe.complete);
++    }
++
++    #[test]
++    fn candidate_matches_current_requires_version_and_protocol() {
++        let matching = CandidateProbe {
++            path: "/usr/bin/herdr".to_string(),
++            version_line: Some(expected_version_line()),
++            client_status_json: Some(format!("{{\"protocol\":{CURRENT_PROTOCOL}}}")),
++        };
++        assert!(matching.matches_current());
++
++        let wrong_version = CandidateProbe {
++            version_line: Some("herdr 0.0.1".to_string()),
++            ..matching.clone()
++        };
++        assert!(!wrong_version.matches_current());
++
++        let wrong_protocol = CandidateProbe {
++            client_status_json: Some("{\"protocol\":1}".to_string()),
++            ..matching.clone()
++        };
++        assert!(!wrong_protocol.matches_current());
++
++        let no_status = CandidateProbe {
++            client_status_json: None,
++            ..matching
++        };
++        assert!(!no_status.matches_current());
++    }
++
++    fn test_cache_entry() -> ProbeCacheEntry {
++        ProbeCacheEntry {
++            herdr_version: current_version(),
++            path: "/usr/bin/herdr".to_string(),
++            os: "linux".to_string(),
++            arch: "x86_64".to_string(),
++        }
++    }
++
++    fn process_output(command: &str) -> std::process::Output {
++        #[cfg(windows)]
++        let output = std::process::Command::new("cmd")
++            .args(["/D", "/C", command])
++            .output();
++        #[cfg(unix)]
++        let output = std::process::Command::new("sh")
++            .args(["-c", command])
++            .output();
++        output.expect("run test child")
++    }
++
++    #[test]
++    fn cached_probe_transport_failure_propagates_without_fallback() {
++        let output = process_output("exit 255");
++        let error = cached_probe_from_output(&output, &test_cache_entry())
++            .expect_err("ssh-style transport exit must fail");
++        assert!(error.to_string().contains("cached remote probe failed"));
++    }
++
++    #[test]
++    fn successful_stale_cached_probe_requests_full_fallback() {
++        let output = process_output("exit 0");
++        assert!(
++            cached_probe_from_output(&output, &test_cache_entry())
++                .expect("successful probe is parseable")
++                .is_none(),
++            "complete validation failure must fall back to the full probe"
++        );
++    }
++
++    #[test]
++    fn full_probe_script_covers_known_install_locations() {
++        let script = full_probe_script();
++
++        assert!(script.contains("probe \"$HOME/.local/bin/herdr\" candidate"));
++        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
++        assert!(script
++            .contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/bin/herdr\""));
++        assert!(script.contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/herdr\""));
++        assert!(script.contains(
++            "probe \"$HOME/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
++        ));
++        assert!(script.contains("probe \"$HOME/.nix-profile/bin/herdr\""));
++        assert!(script.contains("probe \"/etc/profiles/per-user/$USER/bin/herdr\""));
++        assert!(script.contains("probe \"/run/current-system/sw/bin/herdr\""));
++        assert!(script.contains("probe \"/home/linuxbrew/.linuxbrew/bin/herdr\""));
++        assert!(script.contains("probe \"/opt/homebrew/bin/herdr\""));
++        assert!(script.contains("probe \"/usr/local/bin/herdr\""));
++        // Shims are rejected Rust-side (remote_herdr_from_path); the script
++        // must not scan them as known locations.
++        assert!(!script.contains("mise/shims/herdr"));
++        // Single round trip: uname, PATH lookup, and server status are all in
++        // the same script.
++        assert!(script.contains("uname -s"));
++        assert!(script.contains("command -v herdr"));
++        assert!(script.contains("status server --json"));
++        assert!(script.contains("status client --json"));
++    }
++
++    #[test]
++    fn fast_probe_script_checks_only_cached_path() {
++        let script = fast_probe_script("/opt/herdr bin/herdr");
++
++        assert!(script.contains("probe '/opt/herdr bin/herdr' candidate"));
++        assert!(!script.contains("uname"));
++        assert!(!script.contains("command -v herdr"));
++        assert!(script.contains("status server --json"));
++    }
++
++    #[test]
++    fn cache_entry_round_trips_through_json() {
++        let entry = ProbeCacheEntry {
++            herdr_version: "0.7.4".to_string(),
++            path: "/usr/bin/herdr".to_string(),
++            os: "linux".to_string(),
++            arch: "x86_64".to_string(),
++        };
++        let json = serde_json::to_string(&entry).expect("serialize");
++        let parsed: ProbeCacheEntry = serde_json::from_str(&json).expect("parse");
++        assert_eq!(parsed, entry);
++    }
++
++    fn cache_file_name(target: &str) -> String {
++        cache_file(target)
++            .file_name()
++            .and_then(|name| name.to_str())
++            .expect("UTF-8 cache filename")
++            .to_string()
++    }
++
++    #[test]
++    fn cache_file_name_is_readable_deterministic_and_bounded() {
++        let name = cache_file_name("user@host:22");
++        assert_eq!(name, cache_file_name("user@host:22"));
++        assert!(name.starts_with("user-host-22-"));
++        assert!(name.ends_with(".json"));
++        assert_eq!(name.len(), "user-host-22-".len() + 64 + ".json".len());
++        assert!(name.len() <= 102);
++    }
++
++    #[test]
++    fn cache_file_hashes_the_complete_unsanitized_target() {
++        assert_ne!(
++            cache_file_name("user@host:22"),
++            cache_file_name("user-host:22"),
++            "targets with the same sanitized form must not collide"
++        );
++
++        let shared_prefix = "a".repeat(40);
++        assert_ne!(
++            cache_file_name(&format!("{shared_prefix}-first.example")),
++            cache_file_name(&format!("{shared_prefix}-second.example")),
++            "targets truncated to the same readable prefix must not collide"
++        );
++    }
++}
+diff --git a/src/remote/tcp_relay.rs b/src/remote/tcp_relay.rs
+new file mode 100644
+index 0000000..de7e484
+--- /dev/null
++++ b/src/remote/tcp_relay.rs
+@@ -0,0 +1,166 @@
++//! `herdr remote-tcp-relay <host> <port>` — a minimal ssh ProxyCommand that
++//! owns the TCP connection with `TCP_NODELAY` set (i0002 W1).
++//!
++//! OpenSSH only sets `TCP_NODELAY` on interactive (tty) sessions; the remote
++//! bridge runs `ssh -T`, so Nagle's algorithm can hold a keystroke packet
++//! back until the previous one is acked — up to a full extra RTT when typing
++//! fast on a high-latency link. Routing the connection through this relay
++//! (`-o ProxyCommand=<herdr> remote-tcp-relay %h %p`) puts the socket under
++//! our control. Injected on Windows when `remote.tcp_relay = true` (or
++//! `HERDR_REMOTE_TCP_RELAY=1`); see `remote::windows::apply_managed_ssh_options`.
++//!
++//! Note this only fixes the client→server leg. The server→client leg is
++//! sshd's socket and follows the same tty rule there; measure both with
++//! `HERDR_ECHO_TIMING` before assuming symmetric gains.
++
++use std::io;
++#[cfg(test)]
++use std::io::{Read, Write};
++use std::net::{Shutdown, TcpStream, ToSocketAddrs};
++use std::thread;
++
++use super::launcher::copy_flush;
++
++pub(crate) fn run_remote_tcp_relay(args: &[String]) -> io::Result<()> {
++    let (host, port) = parse_relay_args(args).map_err(|usage| {
++        eprintln!("{usage}");
++        io::Error::new(io::ErrorKind::InvalidInput, "invalid remote-tcp-relay args")
++    })?;
++
++    let stream = connect_nodelay(&host, port)?;
++    relay_stdio(stream)
++}
++
++pub(crate) fn parse_relay_args(args: &[String]) -> Result<(String, u16), String> {
++    let usage = "usage: herdr remote-tcp-relay <host> <port>";
++    let [host, port] = args else {
++        return Err(usage.to_string());
++    };
++    if host.is_empty() {
++        return Err(usage.to_string());
++    }
++    let port: u16 = port
++        .parse()
++        .map_err(|_| format!("{usage} (invalid port `{port}`)"))?;
++    Ok((host.clone(), port))
++}
++
++fn connect_nodelay(host: &str, port: u16) -> io::Result<TcpStream> {
++    let addrs = (host, port).to_socket_addrs().map_err(|err| {
++        io::Error::new(err.kind(), format!("failed to resolve {host}:{port}: {err}"))
++    })?;
++    let mut last_err = None;
++    for addr in addrs {
++        match TcpStream::connect(addr) {
++            Ok(stream) => {
++                stream.set_nodelay(true)?;
++                return Ok(stream);
++            }
++            Err(err) => last_err = Some(err),
++        }
++    }
++    Err(last_err.unwrap_or_else(|| {
++        io::Error::new(
++            io::ErrorKind::AddrNotAvailable,
++            format!("no addresses resolved for {host}:{port}"),
++        )
++    }))
++}
++
++/// Splices stdin→socket and socket→stdout. Returns when the server side
++/// closes (ssh observes EOF on our stdout); a stdin EOF half-closes the
++/// socket so the server can finish sending.
++fn relay_stdio(stream: TcpStream) -> io::Result<()> {
++    let mut write_half = stream.try_clone()?;
++    let upload = thread::spawn(move || {
++        let mut stdin = io::stdin().lock();
++        let _ = copy_flush(&mut stdin, &mut write_half);
++        let _ = write_half.shutdown(Shutdown::Write);
++    });
++
++    let mut read_half = stream;
++    let mut stdout = io::stdout().lock();
++    let result = copy_flush(&mut read_half, &mut stdout).map(|_| ());
++    drop(stdout);
++    // If the server closed first, stdin may still be open and the upload
++    // thread blocked in read; exiting the process releases it. Only join
++    // when the upload already finished (stdin EOF path).
++    if upload.is_finished() {
++        let _ = upload.join();
++    }
++    result
++}
++
++/// Testable core of the relay: like [`relay_stdio`] but over arbitrary
++/// streams instead of the process stdio.
++#[cfg(test)]
++fn relay_streams(
++    mut input: impl Read + Send + 'static,
++    output: &mut impl Write,
++    stream: TcpStream,
++) -> io::Result<()> {
++    let mut write_half = stream.try_clone()?;
++    let upload = thread::spawn(move || {
++        let _ = copy_flush(&mut input, &mut write_half);
++        let _ = write_half.shutdown(Shutdown::Write);
++    });
++    let mut read_half = stream;
++    let result = copy_flush(&mut read_half, output).map(|_| ());
++    let _ = upload.join();
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::TcpListener;
++
++    #[test]
++    fn parse_relay_args_accepts_host_and_port() {
++        let args = vec!["example.com".to_string(), "22".to_string()];
++        assert_eq!(
++            parse_relay_args(&args),
++            Ok(("example.com".to_string(), 22))
++        );
++    }
++
++    #[test]
++    fn parse_relay_args_rejects_bad_shapes() {
++        assert!(parse_relay_args(&[]).is_err());
++        assert!(parse_relay_args(&["host".to_string()]).is_err());
++        assert!(parse_relay_args(&["host".to_string(), "notaport".to_string()]).is_err());
++        assert!(parse_relay_args(&[String::new(), "22".to_string()]).is_err());
++        assert!(parse_relay_args(&[
++            "host".to_string(),
++            "22".to_string(),
++            "extra".to_string()
++        ])
++        .is_err());
++    }
++
++    #[test]
++    fn relay_sets_nodelay_and_splices_both_directions() {
++        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
++        let addr = listener.local_addr().expect("addr");
++
++        // Echo server: read everything, send it back uppercased, close.
++        let server = thread::spawn(move || {
++            let (mut conn, _) = listener.accept().expect("accept");
++            let mut received = Vec::new();
++            conn.read_to_end(&mut received).expect("read");
++            let upper = received.to_ascii_uppercase();
++            conn.write_all(&upper).expect("write");
++            conn.shutdown(Shutdown::Write).ok();
++        });
++
++        let stream = connect_nodelay(&addr.ip().to_string(), addr.port()).expect("connect");
++        assert!(stream.nodelay().expect("nodelay query"));
++
++        let input = io::Cursor::new(b"keystrokes".to_vec());
++        let mut output = Vec::new();
++        relay_streams(input, &mut output, stream).expect("relay");
++
++        assert_eq!(output, b"KEYSTROKES");
++        server.join().expect("server thread");
++    }
++}
+diff --git a/src/remote/unix.rs b/src/remote/unix.rs
+index 70fe163..6e15701 100644
+--- a/src/remote/unix.rs
++++ b/src/remote/unix.rs
+@@ -259,7 +259,9 @@ fn ssh_config_quote(path: &str) -> String {
+ /// first-value-wins rule keeps any `ServerAlive*` the user set there (including
+ /// an explicit `0` to disable it). Herdr's keepalive values apply only when
+ /// the user has none.
+-pub(crate) fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
++/// `_tcp_relay` is Windows-only (`remote.tcp_relay`); Unix keeps ssh's own
++/// transport untouched because ControlMaster already multiplexes it.
++pub(crate) fn write_managed_ssh_config(_tcp_relay: bool) -> io::Result<ManagedSshConfig> {
+     use std::os::unix::fs::OpenOptionsExt;
+ 
+     let dir = private_ssh_config_dir()?;
+@@ -436,7 +438,7 @@ mod tests {
+         use std::os::unix::fs::PermissionsExt;
+         use std::path::PathBuf;
+ 
+-        let managed_config = write_managed_ssh_config().expect("write managed config");
++        let managed_config = write_managed_ssh_config(false).expect("write managed config");
+         let path = managed_config.options.config_path.clone();
+         let control_path = managed_config.options.control_path.clone();
+         let contents = std::fs::read_to_string(&path).expect("read keepalive config");
+@@ -502,7 +504,7 @@ mod tests {
+ 
+     #[test]
+     fn remote_ssh_command_uses_managed_config_when_present() {
+-        let managed_config = write_managed_ssh_config().expect("write managed config");
++        let managed_config = write_managed_ssh_config(false).expect("write managed config");
+         let config_path = managed_config.options.config_path.clone();
+         let control_path = managed_config.options.control_path.clone();
+         let ssh = RemoteSsh {
+diff --git a/src/remote/windows.rs b/src/remote/windows.rs
+index 383343c..50a630c 100644
+--- a/src/remote/windows.rs
++++ b/src/remote/windows.rs
+@@ -15,10 +15,12 @@
+ //!   repeated password prompts.
+ //! - Named pipes have no half-close: dropping the send half of a split stream
+ //!   does not deliver EOF to the peer, and reads cannot be unblocked by a
+-//!   shutdown from another thread. The client→ssh pump therefore polls with
+-//!   `PeekNamedPipe` (like `crate::ipc::poll_local_stream_read` does) instead
+-//!   of blocking in `read`, so the whole pipe can be dropped — which *is*
+-//!   observable by the client — once the ssh transport dies.
++//!   shutdown from another thread. The client→ssh pump therefore blocks in
++//!   `read` and is released with `CancelIoEx` on the pipe handle once the ssh
++//!   transport dies (i0002 W4 — this used to be a 10 ms `PeekNamedPipe` poll,
++//!   which added 0–10 ms to every keystroke; `CancelSynchronousIo` does *not*
++//!   work here because interprocess emulates sync reads with overlapped I/O).
++//!   The whole pipe is then dropped, which *is* observable by the client.
+ 
+ use std::fs;
+ use std::io::{self, Read as _};
+@@ -38,16 +40,34 @@ use super::launcher::{
+ };
+ use crate::ipc::LocalStream;
+ 
+-/// How often the client→ssh pump checks for new client data or a stop
+-/// request. Only waited out when the client is idle; pending input is drained
+-/// before sleeping again.
+-const CLIENT_READ_POLL: Duration = Duration::from_millis(10);
++/// Backoff between `CancelIoEx` retries while waiting for the pump thread to
++/// observe its stop flag (the cancel is a no-op when the thread is momentarily
++/// between blocking reads).
++const CANCEL_RETRY: Duration = Duration::from_millis(1);
+ 
+ /// Windows has no ssh connection multiplexing, so the "managed" options are
+ /// just inline keepalive flags for every ssh command we spawn.
+ #[derive(Clone, Debug)]
+ pub(crate) struct ManagedSshOptions {
+     keepalive: bool,
++    /// Route the TCP connection through `herdr remote-tcp-relay` so the
++    /// socket gets TCP_NODELAY (`remote.tcp_relay`, i0002 W1).
++    tcp_relay: bool,
++}
++
++/// Overrides `remote.tcp_relay` for testing: `HERDR_REMOTE_TCP_RELAY=1`
++/// forces the relay on, `=0` forces it off.
++const TCP_RELAY_ENV_VAR: &str = "HERDR_REMOTE_TCP_RELAY";
++
++fn tcp_relay_enabled(config_value: bool) -> bool {
++    match std::env::var(TCP_RELAY_ENV_VAR) {
++        Ok(value) => match value.trim() {
++            "" => config_value,
++            "0" => false,
++            _ => true,
++        },
++        Err(_) => config_value,
++    }
+ }
+ 
+ pub(crate) struct ManagedSshConfig {
+@@ -64,9 +84,12 @@ impl ManagedSshConfig {
+ /// (the default) just opts into herdr's keepalive `-o` flags. Unlike the Unix
+ /// managed config these override `ServerAlive*` values from the user's own
+ /// ssh config, because OpenSSH gives command-line options top precedence.
+-pub(crate) fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
++pub(crate) fn write_managed_ssh_config(tcp_relay: bool) -> io::Result<ManagedSshConfig> {
+     Ok(ManagedSshConfig {
+-        options: ManagedSshOptions { keepalive: true },
++        options: ManagedSshOptions {
++            keepalive: true,
++            tcp_relay: tcp_relay_enabled(tcp_relay),
++        },
+     })
+ }
+ 
+@@ -84,6 +107,23 @@ pub(crate) fn apply_managed_ssh_options(
+             .arg("-o")
+             .arg("ServerAliveCountMax=4");
+     }
++    if options.tcp_relay {
++        if let Some(proxy_option) = tcp_relay_proxy_option() {
++            command.arg("-o").arg(proxy_option);
++        }
++    }
++}
++
++/// `ProxyCommand` routing the connection through this binary's TCP_NODELAY
++/// relay. `%h`/`%p` are expanded by ssh; the exe path is double-quoted for
++/// the shell Windows OpenSSH runs proxy commands with. Beware this option
++/// has command-line precedence and overrides any ProxyCommand/ProxyJump the
++/// user's ssh config defines for the target — which is why `remote.tcp_relay`
++/// is opt-in.
++fn tcp_relay_proxy_option() -> Option<String> {
++    let exe = std::env::current_exe().ok()?;
++    let exe = exe.to_str()?;
++    Some(format!("ProxyCommand=\"{exe}\" remote-tcp-relay %h %p"))
+ }
+ 
+ /// Nothing to tear down: no ControlMaster connection exists on Windows.
+@@ -241,6 +281,11 @@ fn bridge_connection(
+     let status = child.wait()?;
+     let _ = download.join();
+     stop.store(true, Ordering::Release);
++    // A blocking named-pipe read cannot be unblocked by closing the handle
++    // from another thread; cancel the pump's in-flight read instead. The
++    // download pump has already been joined, so no other I/O on the pipe can
++    // be cancelled by accident.
++    cancel_blocking_pipe_read(&stream, &upload);
+     let _ = upload.join();
+     // All Arc clones are gone here: the pipe handle closes, which the client
+     // observes as a broken pipe and reports as a lost connection.
+@@ -256,8 +301,10 @@ fn bridge_connection(
+     }
+ }
+ 
+-/// Pumps client bytes into ssh's stdin without ever blocking in `read`, so a
+-/// stop request (ssh died) is honored even while the client is idle.
++/// Pumps client bytes into ssh's stdin with plain blocking reads. When the
++/// ssh transport dies, `bridge_connection` sets `stop` and cancels the
++/// in-flight read with [`cancel_blocking_pipe_read`]; keystrokes
++/// are otherwise forwarded the moment they arrive, with no poll latency.
+ fn pump_client_to_ssh(
+     stream: &LocalStream,
+     child_stdin: &mut (impl io::Write + Send),
+@@ -268,32 +315,53 @@ fn pump_client_to_ssh(
+         if stop.load(Ordering::Acquire) {
+             return;
+         }
+-        match crate::ipc::windows_named_pipe_available(stream) {
++        let mut reader = stream;
++        match reader.read(&mut buffer) {
+             // Client closed its end of the pipe.
+-            Ok(None) => return,
+-            Ok(Some(0)) => thread::sleep(CLIENT_READ_POLL),
+-            Ok(Some(_)) => {
+-                let mut reader = stream;
+-                match reader.read(&mut buffer) {
+-                    Ok(0) => return,
+-                    Ok(bytes_read) => {
+-                        if child_stdin
+-                            .write_all(&buffer[..bytes_read])
+-                            .and_then(|()| child_stdin.flush())
+-                            .is_err()
+-                        {
+-                            return;
+-                        }
+-                    }
+-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+-                    Err(_) => return,
++            Ok(0) => return,
++            Ok(bytes_read) => {
++                if child_stdin
++                    .write_all(&buffer[..bytes_read])
++                    .and_then(|()| child_stdin.flush())
++                    .is_err()
++                {
++                    return;
+                 }
+             }
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            // ERROR_OPERATION_ABORTED: our read was cancelled at shutdown.
++            Err(err) if err.raw_os_error() == Some(995) => return,
+             Err(_) => return,
+         }
+     }
+ }
+ 
++/// Repeatedly cancels in-flight I/O on the pipe until the pump thread exits.
++/// The caller must have set the pump's stop flag first, so a cancel that
++/// lands between two reads is followed by a clean flag-observed exit instead
++/// of another blocking read racing the next cancel forever.
++///
++/// Uses `CancelIoEx` on the pipe handle — not `CancelSynchronousIo` on the
++/// thread — because interprocess implements "sync" named-pipe reads as
++/// overlapped I/O awaited internally, which is invisible to the synchronous
++/// cancel API. The cancelled read surfaces as `ERROR_OPERATION_ABORTED`.
++fn cancel_blocking_pipe_read(stream: &LocalStream, thread: &JoinHandle<()>) {
++    use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
++
++    let LocalStream::NamedPipe(pipe) = stream;
++    while !thread.is_finished() {
++        // CancelIoEx returns ERROR_NOT_FOUND when no I/O is in flight at
++        // this instant; harmless, retry until the stop flag is observed.
++        let _ = unsafe {
++            windows_sys::Win32::System::IO::CancelIoEx(
++                pipe.as_handle().as_raw_handle(),
++                std::ptr::null(),
++            )
++        };
++        thread::sleep(CANCEL_RETRY);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::super::launcher::RemotePlatform;
+@@ -317,9 +385,29 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn tcp_relay_option_injects_proxy_command() {
++        let mut command = Command::new("ssh");
++        let options = ManagedSshOptions {
++            keepalive: false,
++            tcp_relay: true,
++        };
++        apply_managed_ssh_options(&mut command, Some(&options));
++        let args = command
++            .get_args()
++            .map(|arg| arg.to_string_lossy().into_owned())
++            .collect::<Vec<_>>();
++        assert_eq!(args[0], "-o");
++        assert!(
++            args[1].starts_with("ProxyCommand=\"")
++                && args[1].ends_with("\" remote-tcp-relay %h %p"),
++            "got {args:?}"
++        );
++    }
++
+     #[test]
+     fn keepalive_options_apply_only_when_managed() {
+-        let config = write_managed_ssh_config().expect("managed options");
++        let config = write_managed_ssh_config(false).expect("managed options");
+         let mut command = Command::new("ssh");
+         apply_managed_ssh_options(&mut command, Some(config.options()));
+         let args = command
+@@ -341,6 +429,79 @@ mod tests {
+         assert_eq!(plain.get_args().count(), 0);
+     }
+ 
++    #[derive(Clone, Default)]
++    struct SharedSink(Arc<std::sync::Mutex<Vec<u8>>>);
++
++    impl io::Write for SharedSink {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            self.0.lock().expect("sink lock").extend_from_slice(buf);
++            Ok(buf.len())
++        }
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    fn pipe_pair(name: &str) -> (LocalStream, LocalStream) {
++        use interprocess::local_socket::traits::Listener as _;
++        let path = std::env::temp_dir().join(format!(
++            "herdr-pump-test-{name}-{}.sock",
++            std::process::id()
++        ));
++        let listener = crate::ipc::bind_local_listener(&path).expect("bind");
++        let client = crate::ipc::connect_local_stream(&path).expect("connect");
++        let server = listener.accept().expect("accept");
++        let _ = fs::remove_file(&path);
++        (client, server)
++    }
++
++    #[test]
++    fn pump_forwards_client_bytes_and_exits_on_client_close() {
++        use std::io::Write as _;
++
++        let (mut client, server) = pipe_pair("forward");
++        let sink = SharedSink::default();
++        let mut pump_sink = sink.clone();
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop);
++        });
++
++        client.write_all(b"keystrokes").expect("client write");
++        let deadline = std::time::Instant::now() + Duration::from_secs(5);
++        while sink.0.lock().expect("sink lock").len() < 10 {
++            assert!(std::time::Instant::now() < deadline, "pump never forwarded");
++            thread::sleep(Duration::from_millis(1));
++        }
++        assert_eq!(sink.0.lock().expect("sink lock").as_slice(), b"keystrokes");
++
++        // Client close must end the pump without any cancel.
++        drop(client);
++        pump.join().expect("pump thread");
++    }
++
++    #[test]
++    fn pump_blocked_in_read_is_released_by_cancel() {
++        let (client, server) = pipe_pair("cancel");
++        let server = Arc::new(server);
++        let pump_stream = Arc::clone(&server);
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            pump_client_to_ssh(&pump_stream, &mut io::sink(), &pump_stop);
++        });
++
++        // Let the pump enter its blocking read, then stop it the way
++        // bridge_connection does.
++        thread::sleep(Duration::from_millis(50));
++        assert!(!pump.is_finished(), "pump must be blocked in read");
++        stop.store(true, Ordering::Release);
++        cancel_blocking_pipe_read(&server, &pump);
++        pump.join().expect("pump thread");
++        drop(client);
++    }
++
+     #[test]
+     fn bridge_drop_wakes_blocking_accept_without_spawning_ssh() {
+         let socket = std::env::temp_dir().join(format!(
+-- 
+2.52.0.windows.1
+

@@ -2,13 +2,14 @@
 
 ## Record
 
-- **Status:** implemented and exported as patch `0017`; released in
+- **Status:** implemented in ownership patch `0004`; this representation
+  postdates the release, while its identical implementation tree shipped in
   `v0.7.5-win.05`
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-- **Deliverables:** `patches/herdr/0017-*`
-- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on patches
-  `0001`–`0016`
+- **Deliverables:** `patches/herdr/0004-*-IV-0005.patch`
+- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on ownership patches
+  `0001`–`0003`
 - **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
   Windows remote client that receives forwarded notifications
 - **History:** `v0.7.5-win.02` and `v0.7.5-win.03` used an interim
@@ -51,7 +52,7 @@ forwarding path.
 config — on the remote Linux box for `--remote` sessions. The local Windows
 config's toast setting is irrelevant during a remote session.
 
-## Implemented design (patch 0017)
+## Implemented design (ownership patch `0004`)
 
 `src/platform/windows.rs` uses the native Windows Runtime APIs projected by
 the target-specific `windows` Rust dependency:

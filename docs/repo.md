@@ -42,6 +42,18 @@ based on, while `patches/herdr/BASE_COMMIT` pins that tag's peeled commit so a
 moved upstream tag cannot silently change a release build. The release workflow
 verifies both; keep them in sync with the patches.
 
+The current herdr series has one patch per owning initiative:
+
+| Order | Owner | Scope |
+|---|---|---|
+| `0001` | [IV-0001](IV-0001-windows-remote.md) | native Windows remote transport and fork safeguards |
+| `0002` | [IV-0002](IV-0002-latency-improvements.md) | high-RTT attach, transport, and predictive-input latency |
+| `0003` | [IV-0004](IV-0004-vscode-remote-open.md) | remote-shell `hcode` integration |
+| `0004` | [IV-0005](IV-0005-windows-system-notifications.md) | native Windows system toasts |
+
+[IV-0003](IV-0003-pi-predictive-echo.md) owns only a pi extension, so it has no
+herdr patch.
+
 ## Working on a change
 
 1. Hack inside `checkouts/herdr/` on a branch or dirty tree.
@@ -117,6 +129,10 @@ and other repository artifacts exist. Keep it consistent as they evolve.
 - One root IV per initiative under `docs/` (`IV-NNNN-short-slug.md`), as
   described above.
 - Number patches (`0001-...`, `0002-...`) so apply order is explicit.
+- Prefer one self-contained patch per IV ownership boundary. Combine follow-ups
+  owned by the same IV; split only when ownership differs or a change has a
+  genuinely independent lifecycle. Include the IV number in the patch subject
+  and filename.
 - If a patch stops applying cleanly, fix it and commit the updated patch —
   the patch files are the source of truth, not the checkouts.
 - Patch files are format-patch mailboxes, whose context and `-- ` footer

@@ -1,46 +1,429 @@
-From f6a3ff353e3d2bc633c0ff86fba6dd4be698469d Mon Sep 17 00:00:00 2001
+From d8eadc086633fb6c3e6576c249232f361107011c Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
-Date: Wed, 15 Jul 2026 19:13:59 +0800
-Subject: [PATCH 01/17] feat(windows): support herdr --remote from the native
- Windows binary
+Date: Sun, 2 Aug 2026 00:03:34 +0800
+Subject: [PATCH 1/4] feat(windows): support native remote attach (IV-0001)
 
-Port the remote thin-client launcher to Windows:
+Combine the complete IV-0001 ownership boundary:
 
-- Split src/remote/unix.rs into a platform-neutral src/remote/launcher.rs
-  plus small unix/windows platform modules (bridge socket, ssh options,
-  remote-side client bridge).
-- Windows bridge serves the local thin client over a named pipe through
-  crate::ipc and splices each connection onto ssh -T stdio. Named pipes
-  have no half-close, so the client->ssh pump polls with PeekNamedPipe
-  and the whole pipe is dropped once the ssh transport dies.
-- Windows OpenSSH has no ControlMaster: inject ServerAlive* keepalives
-  as command-line options instead of a managed ssh config.
-- Keep the bridge shutdown wake connection open until the accept thread
-  joins; interprocess clears already-disconnected clients as empty
-  connections and would keep blocking otherwise.
-- Un-gate portable helpers used by the launcher (checksum,
-  is_package_manager_managed_exe_path) and the 60s remote handshake
-  timeout; set remote_attach capability on Windows.
-
-Verified live from Windows against a Debian VM: attach, input/output
-round trip, server survival across client loss, and reattach with
-scrollback restore.
+- platform-neutral remote launcher and Windows named-pipe transport
+- Win32 input and terminal-theme fixes
+- fork update safeguards and remote attach timing diagnostics
 ---
- src/client/mod.rs      |    3 -
- src/ipc.rs             |   10 +-
- src/main.rs            |   25 +-
- src/platform/mod.rs    |    4 +-
- src/remote.rs          |  156 +-
- src/remote/launcher.rs | 2530 +++++++++++++++++++++++++++++++
- src/remote/unix.rs     | 3252 +++++-----------------------------------
- src/remote/windows.rs  |  366 +++++
- src/update.rs          |    1 -
- 9 files changed, 3321 insertions(+), 3026 deletions(-)
+ src/client/input.rs             |   12 +
+ src/client/input/windows_vti.rs |  261 ++-
+ src/client/mod.rs               |   37 +-
+ src/ipc.rs                      |   10 +-
+ src/main.rs                     |   49 +-
+ src/pane/terminal.rs            |  136 +-
+ src/platform/mod.rs             |    4 +-
+ src/remote.rs                   |  156 +-
+ src/remote/launcher.rs          | 2574 ++++++++++++++++++++++++
+ src/remote/unix.rs              | 3252 ++++---------------------------
+ src/remote/windows.rs           |  370 ++++
+ src/update.rs                   |   35 +-
+ 12 files changed, 3823 insertions(+), 3073 deletions(-)
  create mode 100644 src/remote/launcher.rs
  create mode 100644 src/remote/windows.rs
 
+diff --git a/src/client/input.rs b/src/client/input.rs
+index 1d55754..f8d6414 100644
+--- a/src/client/input.rs
++++ b/src/client/input.rs
+@@ -26,6 +26,18 @@ use super::ClientLoopEvent;
+ #[cfg(any(windows, test))]
+ mod windows_vti;
+ 
++/// Writes the host terminal default-color query (OSC 10/11) to stdout.
++///
++/// Used by the Windows console reader to re-query after the host reports a
++/// color scheme change, mirroring the Unix client's behavior.
++#[cfg(windows)]
++fn write_host_terminal_theme_query_to_stdout() -> std::io::Result<()> {
++    use std::io::Write as _;
++    let mut stdout = std::io::stdout();
++    stdout.write_all(crate::terminal_theme::HOST_COLOR_QUERY_SEQUENCE.as_bytes())?;
++    stdout.flush()
++}
++
+ // ---------------------------------------------------------------------------
+ // Stdin reader thread
+ // ---------------------------------------------------------------------------
+diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
+index 3b29e79..296bb91 100644
+--- a/src/client/input/windows_vti.rs
++++ b/src/client/input/windows_vti.rs
+@@ -36,7 +36,29 @@ pub(super) fn raw_console_reader_loop(
+             }
+             WindowsInputItems::Closed => return,
+         }
++        if !flush_pump_theme_reports(&mut pump, &event_tx) {
++            return;
++        }
++    }
++}
++
++#[cfg(windows)]
++fn flush_pump_theme_reports(
++    pump: &mut WindowsInputPump,
++    event_tx: &mpsc::Sender<ClientLoopEvent>,
++) -> bool {
++    let outbox = pump.take_theme_reports();
++    if outbox.requery {
++        // The host announced a color scheme change: re-query the concrete
++        // default colors, mirroring the Unix client's behavior.
++        let _ = super::write_host_terminal_theme_query_to_stdout();
++    }
++    if outbox.bytes.is_empty() {
++        return true;
+     }
++    event_tx
++        .blocking_send(ClientLoopEvent::StdinThemeReport(outbox.bytes))
++        .is_ok()
+ }
+ 
+ #[cfg(windows)]
+@@ -194,6 +216,15 @@ struct WindowsInputMapper {
+ struct WindowsInputPump {
+     framer: crate::raw_input::RawInputFramer,
+     paste_from_win32_key_records: bool,
++    theme_reports: ThemeReportOutbox,
++}
++
++/// Host terminal theme report sequences collected while pumping console
++/// input, waiting to be forwarded to the server as raw input bytes.
++#[derive(Default)]
++struct ThemeReportOutbox {
++    bytes: Vec<u8>,
++    requery: bool,
+ }
+ 
+ impl Default for WindowsInputPump {
+@@ -201,6 +232,7 @@ impl Default for WindowsInputPump {
+         Self {
+             framer: crate::raw_input::RawInputFramer::for_host_input(),
+             paste_from_win32_key_records: false,
++            theme_reports: ThemeReportOutbox::default(),
+         }
+     }
+ }
+@@ -215,7 +247,6 @@ enum PlatformInputItem {
+         win32_paste_bytes: Vec<u8>,
+     },
+     PasteAwareKey {
+-        bytes: Vec<u8>,
+         win32_paste_bytes: Vec<u8>,
+         events: Vec<crate::protocol::ClientInputEvent>,
+     },
+@@ -269,17 +300,20 @@ impl WindowsInputPump {
+                 self.process_raw_events(raw_events)
+             }
+             PlatformInputItem::PasteAwareKey {
+-                bytes,
+                 win32_paste_bytes,
+                 events,
+             } => {
+                 if self.framer.has_pending_bracketed_paste() {
+-                    let bytes = if self.paste_from_win32_key_records {
+-                        &win32_paste_bytes
+-                    } else {
+-                        &bytes
+-                    };
+-                    let raw_events = self.framer.push(bytes);
++                    // Within a bracketed paste, a decoded key record always
++                    // contributes its paste payload (e.g. `\r` for Enter),
++                    // never its raw win32-input-mode sequence bytes — even
++                    // when the paste itself began as plain text. Some ConPTY
++                    // hosts forward pasted text verbatim while re-encoding
++                    // only synthesized keys (Enter between pasted lines) as
++                    // win32 sequences; pushing the raw sequence here leaked
++                    // literal `\x1b[13;28;13;..._` text into the paste, which
++                    // remote Linux panes displayed after every line end.
++                    let raw_events = self.framer.push(&win32_paste_bytes);
+                     self.process_raw_events(raw_events)
+                 } else {
+                     let raw_events = self.framer.flush_timeout();
+@@ -306,9 +340,45 @@ impl WindowsInputPump {
+         {
+             self.paste_from_win32_key_records = false;
+         }
++        for event in &events {
++            self.collect_theme_report(event);
++        }
+         Self::raw_events_to_client_events(events)
+     }
+ 
++    /// Reconstructs host theme report sequences (OSC 10/11 responses, color
++    /// scheme reports) so the client can forward them to the server as raw
++    /// input bytes — the same shape Unix clients deliver. The server's
++    /// raw-input framer parses them into this client's host theme, which
++    /// pane rendering needs to resolve inverse-video cells against the real
++    /// host colors instead of libghostty's fallback palette.
++    fn collect_theme_report(&mut self, event: &crate::raw_input::RawInputEvent) {
++        match event {
++            crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
++                self.theme_reports.bytes.extend_from_slice(
++                    crate::terminal_theme::osc_set_default_color_sequence(*kind, *color)
++                        .as_bytes(),
++                );
++            }
++            crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
++                self.theme_reports.bytes.extend_from_slice(match appearance {
++                    crate::terminal_theme::HostAppearance::Dark => {
++                        crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT
++                    }
++                    crate::terminal_theme::HostAppearance::Light => {
++                        crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT
++                    }
++                });
++                self.theme_reports.requery = true;
++            }
++            _ => {}
++        }
++    }
++
++    fn take_theme_reports(&mut self) -> ThemeReportOutbox {
++        std::mem::take(&mut self.theme_reports)
++    }
++
+     fn raw_events_to_client_events(
+         events: Vec<crate::raw_input::RawInputEvent>,
+     ) -> Vec<crate::protocol::ClientInputEvent> {
+@@ -412,8 +482,7 @@ impl WindowsInputMapper {
+                 if let Some((bytes, event)) = self.synthetic_modified_key_event(key, kind) {
+                     flush_pending_win32_before_items = true;
+                     items.push(PlatformInputItem::PasteAwareKey {
+-                        win32_paste_bytes: bytes.clone(),
+-                        bytes,
++                        win32_paste_bytes: bytes,
+                         events: vec![event],
+                     });
+                 } else if let Some(bytes) = self.synthetic_utf16_unit_to_bytes(key.unicode) {
+@@ -430,8 +499,7 @@ impl WindowsInputMapper {
+         let events = self.translate_semantic_key_events(key);
+         let items = if let Some(bytes) = self.paste_payload_bytes_for_key(key) {
+             vec![PlatformInputItem::PasteAwareKey {
+-                win32_paste_bytes: bytes.clone(),
+-                bytes,
++                win32_paste_bytes: bytes,
+                 events,
+             }]
+         } else {
+@@ -479,7 +547,6 @@ impl WindowsInputMapper {
+                         });
+                     } else {
+                         items.push(PlatformInputItem::PasteAwareKey {
+-                            bytes,
+                             win32_paste_bytes,
+                             events: self.translate_semantic_key_events(record),
+                         })
+@@ -847,18 +914,35 @@ impl WindowsWin32InputModeFramer {
+     }
+ }
+ 
++/// Parses the parameter body of a win32-input-mode sequence
++/// (`CSI Vk;Sc;Uc;Kd;Cs;Rc _`).
++///
++/// Mirrors the reference decoder, `InputStateMachineEngine::_GenerateWin32Key`
++/// in microsoft/terminal: every parameter is optional (defaulting to 0, except
++/// the repeat count which defaults to 1), empty parameters count as omitted,
++/// and extra trailing parameters are ignored. Some ConPTY hosts emit more than
++/// six fields (e.g. Enter arrives as `^[[13;28;13;1;0;0;1_`); rejecting those
++/// leaked the literal sequence bytes into bracketed-paste payloads, which
++/// showed up as `[13;28;13;1;0;0;1_` after every line end when pasting
++/// multi-line text into a remote (Linux) pane. Local Windows panes hid the
++/// bug because their own ConPTY re-parses the leaked sequence leniently.
+ fn parse_win32_input_mode_key_record(body: &str) -> Option<WindowsKeyRecord> {
+-    let mut fields = body.split(';');
+-    let virtual_key_code = fields.next()?.parse::<u16>().ok()?;
+-    let virtual_scan_code = fields.next()?.parse::<u16>().ok()?;
+-    let unicode = fields.next()?.parse::<u16>().ok()?;
+-    let key_down = fields.next()?.parse::<u16>().ok()? != 0;
+-    let control_key_state = fields.next()?.parse::<u32>().ok()?;
+-    let repeat_count = fields.next()?.parse::<u16>().ok()?;
+-    if fields.next().is_some() {
+-        return None;
++    fn field<T: std::str::FromStr>(value: Option<&str>, default: T) -> Option<T> {
++        match value {
++            None | Some("") => Some(default),
++            Some(value) => value.parse::<T>().ok(),
++        }
+     }
+ 
++    let mut fields = body.split(';');
++    let virtual_key_code = field(fields.next(), 0u16)?;
++    let virtual_scan_code = field(fields.next(), 0u16)?;
++    let unicode = field(fields.next(), 0u16)?;
++    let key_down = field(fields.next(), 0u16)? != 0;
++    let control_key_state = field(fields.next(), 0u32)?;
++    let repeat_count = field(fields.next(), 1u16)?;
++    // Extra parameters are ignored, exactly like the reference decoder.
++
+     Some(WindowsKeyRecord {
+         key_down,
+         repeat_count,
+@@ -1160,6 +1244,46 @@ mod tests {
+         .collect()
+     }
+ 
++    #[test]
++    fn vti_osc_default_color_response_becomes_theme_report_not_input() {
++        let mut translator = WindowsInputTranslator::default();
++        let mut events = Vec::new();
++        for record in "\x1b]10;rgb:aabb/bbcc/ccdd\x1b\\\x1b]11;rgb:11/22/33\x1b\\"
++            .chars()
++            .map(key_char)
++        {
++            events.extend(translator.translate(record));
++        }
++        events.extend(translator.idle());
++
++        assert_eq!(events, Vec::new(), "theme responses must not become input");
++        let outbox = translator.pump.take_theme_reports();
++        let reports = String::from_utf8(outbox.bytes).unwrap();
++        assert_eq!(reports, "\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\");
++        assert!(!outbox.requery);
++
++        // Reports drain once.
++        assert!(translator.pump.take_theme_reports().bytes.is_empty());
++    }
++
++    #[test]
++    fn vti_color_scheme_report_becomes_theme_report_and_requeries() {
++        let mut translator = WindowsInputTranslator::default();
++        let mut events = Vec::new();
++        for record in "\x1b[?997;2n".chars().map(key_char) {
++            events.extend(translator.translate(record));
++        }
++        events.extend(translator.idle());
++
++        assert_eq!(events, Vec::new());
++        let outbox = translator.pump.take_theme_reports();
++        assert_eq!(
++            outbox.bytes,
++            crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT.to_vec()
++        );
++        assert!(outbox.requery);
++    }
++
+     #[test]
+     fn vti_bracketed_paste_records_emit_single_paste() {
+         let records = "\x1b[200~alpha\rbravo\rcharlie\x1b[201~"
+@@ -1188,6 +1312,90 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn vti_win32_input_mode_seven_field_enter_decodes_as_enter() {
++        // Some ConPTY hosts append an extra parameter to win32-input-mode
++        // sequences. The reference decoder ignores extra parameters; so must
++        // we.
++        let records = "\x1b[13;28;13;1;0;0;1_".chars().map(key_char);
++
++        assert_eq!(
++            translate(records),
++            vec![crate::protocol::ClientInputEvent::Key {
++                code: crate::protocol::ClientKeyCode::Enter,
++                modifiers: 0,
++                kind: crate::protocol::ClientKeyKind::Press,
++            }]
++        );
++    }
++
++    #[test]
++    fn vti_win32_input_mode_omitted_fields_use_reference_defaults() {
++        // Per the win32-input-mode spec, all parameters are optional
++        // (repeat count defaults to 1). `^[[13;28;13;1_` is Enter down.
++        let records = "\x1b[13;28;13;1_".chars().map(key_char);
++
++        assert_eq!(
++            translate(records),
++            vec![crate::protocol::ClientInputEvent::Key {
++                code: crate::protocol::ClientKeyCode::Enter,
++                modifiers: 0,
++                kind: crate::protocol::ClientKeyKind::Press,
++            }]
++        );
++    }
++
++    #[test]
++    fn vti_win32_encoded_enter_inside_plain_paste_stays_in_paste_payload() {
++        // Multi-line paste as some ConPTY hosts deliver it: pasted text
++        // forwarded verbatim (plain chars, bracketed), but the Enter between
++        // lines re-encoded as a win32-input-mode key sequence. The decoded
++        // Enter must contribute `\r` to the paste payload, not its raw
++        // sequence bytes.
++        let mut records: Vec<_> = "\x1b[200~echo XXX".chars().map(key_char).collect();
++        records.extend("\x1b[13;28;13;1;0;0;1_".chars().map(key_char));
++        records.extend("\x1b[13;28;13;0;0;0;1_".chars().map(key_char));
++        records.extend("echo YYY\x1b[201~".chars().map(key_char));
++
++        assert_eq!(
++            translate(records),
++            vec![crate::protocol::ClientInputEvent::Paste {
++                text: "echo XXX\recho YYY".into(),
++            }]
++        );
++    }
++
++    #[test]
++    fn vti_win32_encoded_six_field_enter_inside_plain_paste_stays_in_paste_payload() {
++        // Same as above with the standard six-field encoding.
++        let mut records: Vec<_> = "\x1b[200~alpha".chars().map(key_char).collect();
++        records.extend("\x1b[13;28;13;1;0;1_".chars().map(key_char));
++        records.extend("bravo\x1b[201~".chars().map(key_char));
++
++        assert_eq!(
++            translate(records),
++            vec![crate::protocol::ClientInputEvent::Paste {
++                text: "alpha\rbravo".into(),
++            }]
++        );
++    }
++
++    #[test]
++    fn vti_win32_input_mode_bracketed_paste_with_seven_field_enters_emits_single_paste() {
++        // Fully win32-encoded paste (brackets included) with the
++        // extra-parameter Enter variant between lines.
++        let mut records = win32_input_mode_encoded_key_bytes(b"\x1b[200~line one");
++        records.extend("\x1b[13;28;13;1;0;0;1_".chars().map(key_char));
++        records.extend(win32_input_mode_encoded_key_bytes(b"line two\x1b[201~"));
++
++        assert_eq!(
++            translate(records),
++            vec![crate::protocol::ClientInputEvent::Paste {
++                text: "line one\rline two".into(),
++            }]
++        );
++    }
++
+     #[test]
+     fn vti_win32_input_mode_decoded_paste_handles_shift_repeats_and_releases() {
+         let mut records = win32_input_mode_encoded_key_bytes(b"\x1b[200~");
+@@ -1690,7 +1898,12 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn vti_win32_input_mode_sequence_inside_bracketed_paste_stays_payload() {
++    fn vti_win32_input_mode_sequence_inside_bracketed_paste_decodes_to_payload() {
++        // A win32-encoded key record inside a plain-started paste contributes
++        // its paste payload instead of its literal sequence bytes: ConPTY
++        // hosts that forward pasted text verbatim still re-encode synthesized
++        // Enters between pasted lines, and preserving the raw sequence leaked
++        // `\x1b[13;...]_` text into remote (non-ConPTY) panes.
+         let records = "\x1b[200~alpha\x1b[13;28;13;1;16;1_bravo\x1b[201~"
+             .chars()
+             .map(key_char);
+@@ -1698,7 +1911,7 @@ mod tests {
+         assert_eq!(
+             translate(records),
+             vec![crate::protocol::ClientInputEvent::Paste {
+-                text: "alpha\x1b[13;28;13;1;16;1_bravo".into(),
++                text: "alpha\rbravo".into(),
+             }]
+         );
+     }
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 011de93..be4e5dc 100644
+index 011de93..6b6c621 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -663,7 +663,6 @@ fn requested_render_encoding() -> RenderEncoding {
@@ -63,6 +446,72 @@ index 011de93..be4e5dc 100644
      if is_remote_client_process() {
          return REMOTE_HANDSHAKE_READ_TIMEOUT;
      }
+@@ -806,6 +803,12 @@ enum ClientLoopEvent {
+     /// Structured input events from platforms without Unix-style stdin bytes.
+     #[cfg(windows)]
+     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
++    /// Host terminal theme report sequences (OSC 10/11 responses, color
++    /// scheme reports) reconstructed from console input. Forwarded to the
++    /// server as raw input bytes so its raw-input framer — which is how Unix
++    /// clients deliver these — updates this client's host theme.
++    #[cfg(windows)]
++    StdinThemeReport(Vec<u8>),
+     /// Terminal resize detected.
+     Resize(u16, u16, u32, u32),
+     /// Server message received.
+@@ -1493,6 +1496,16 @@ async fn run_client_loop(
+                     return Err(ClientError::ConnectionLost(e));
+                 }
+             }
++            #[cfg(windows)]
++            ClientLoopEvent::StdinThemeReport(data) => {
++                if state.attach_escape.is_some() {
++                    continue;
++                }
++                let msg = ClientMessage::Input { data };
++                if let Err(e) = write_to_server(&mut write_stream, &msg) {
++                    return Err(ClientError::ConnectionLost(e));
++                }
++            }
+             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+                 state.reported_size = (new_cols, new_rows);
+                 let msg = ClientMessage::Resize {
+@@ -2118,7 +2131,14 @@ fn query_host_terminal_theme() {
+ }
+ 
+ fn should_query_host_terminal_theme() -> bool {
+-    !cfg!(windows)
++    // Windows included: the OSC 10/11 responses come back through ConPTY as
++    // console input and are forwarded to the server by the console reader
++    // (`StdinThemeReport`). Without the query the server never learns the
++    // host colors, so panes resolve inverse-video against libghostty's
++    // fallback palette — e.g. white cursor blocks for TUIs that draw their
++    // cursor with reverse video. Terminals that do not answer the query are
++    // unaffected (no response, no event).
++    true
+ }
+ 
+ fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
+@@ -2429,16 +2449,13 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn host_terminal_theme_query_is_disabled_on_windows() {
+-        assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
++    fn host_terminal_theme_query_is_enabled_on_all_platforms() {
++        assert!(should_query_host_terminal_theme());
+     }
+ 
+     #[test]
+     fn color_scheme_reports_are_enabled_only_for_full_clients() {
+-        assert_eq!(
+-            should_enable_host_color_scheme_reports(true),
+-            !cfg!(windows)
+-        );
++        assert!(should_enable_host_color_scheme_reports(true));
+         assert!(!should_enable_host_color_scheme_reports(false));
+     }
+ 
 diff --git a/src/ipc.rs b/src/ipc.rs
 index c293a27..ce164b0 100644
 --- a/src/ipc.rs
@@ -95,7 +544,7 @@ index c293a27..ce164b0 100644
  
      let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/main.rs b/src/main.rs
-index a73423b..26dc62a 100644
+index a73423b..5d140e1 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -58,7 +58,6 @@ mod agent_resume;
@@ -106,7 +555,31 @@ index a73423b..26dc62a 100644
  mod checksum;
  mod cli;
  mod client;
-@@ -377,14 +376,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -147,15 +146,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # new_cwd = "follow"
+ 
+ [update]
+-# Update channel used by background version checks and `herdr update`.
+-# Defaults to "stable" on Linux/macOS and "preview" on Windows.
+-# Set explicitly to choose stable releases or opt-in preview builds.
++# This patched build disables binary version checks and `herdr update` so an
++# official build cannot replace its native Windows --remote support. Download
++# updates manually from:
++# https://github.com/iamwrm/herdr-windows-remote/releases
++# `channel` and `version_check` remain accepted for config compatibility but
++# have no effect in this build.
+ # channel = "stable"
+-
+-# Check herdr.dev for new Herdr versions in the background.
+ # version_check = true
+ 
+-# Check herdr.dev for remote agent-detection manifest updates in the background.
++# Agent-detection manifest updates are independent of binary self-update and
++# remain enabled; they refresh detection data from herdr.dev.
+ # manifest_check = true
+ 
+ [keys]
+@@ -377,14 +378,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # resume_agents_on_restore = true
  
  [remote]
@@ -128,10 +601,20 @@ index a73423b..26dc62a 100644
  # manage_ssh_config = true
  
  [experimental]
-@@ -844,6 +842,15 @@ fn main() -> io::Result<()> {
+@@ -844,6 +844,25 @@ fn main() -> io::Result<()> {
  mod tests {
      use super::*;
  
++    #[test]
++    fn default_config_explains_disabled_fork_updates() {
++        assert!(DEFAULT_CONFIG.contains("disables binary version checks and `herdr update`"));
++        assert!(DEFAULT_CONFIG.contains("https://github.com/iamwrm/herdr-windows-remote/releases"));
++        assert!(DEFAULT_CONFIG.contains("have no effect in this build"));
++        assert!(DEFAULT_CONFIG
++            .contains("Agent-detection manifest updates are independent of binary self-update"));
++        assert!(DEFAULT_CONFIG.contains("# manifest_check = true"));
++    }
++
 +    #[test]
 +    fn default_config_explains_platform_specific_remote_behavior() {
 +        assert!(DEFAULT_CONFIG.contains("On Unix, true (default) uses a generated config"));
@@ -144,6 +627,192 @@ index a73423b..26dc62a 100644
      #[test]
      fn nested_herdr_blocks_when_env_is_set() {
          let config = config::Config::default();
+diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
+index 2c83f8f..e10e90d 100644
+--- a/src/pane/terminal.rs
++++ b/src/pane/terminal.rs
+@@ -1778,8 +1778,12 @@ impl GhosttyPaneTerminal {
+             .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+         let default_fg = colors
+             .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+-        let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+-        let resolved_bg = colors.map(|c| ghostty_color(c.background));
++        let (resolved_fg, resolved_bg) = ghostty_resolved_inverse_colors(
++            colors,
++            host_theme,
++            initial_default_foreground,
++            initial_default_background,
++        );
+         let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+ 
+         let mut row_iterator = match crate::ghostty::RowIterator::new() {
+@@ -2037,8 +2041,12 @@ fn ghostty_collect_dirty_patch(
+         .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+     let default_fg = colors
+         .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+-    let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+-    let resolved_bg = colors.map(|c| ghostty_color(c.background));
++    let (resolved_fg, resolved_bg) = ghostty_resolved_inverse_colors(
++        colors,
++        host_theme,
++        initial_default_foreground,
++        initial_default_background,
++    );
+     let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+ 
+     let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
+@@ -2601,19 +2609,35 @@ fn ghostty_cell_style(
+     if basic.style.invisible {
+         fg = bg.or(default_bg);
+     }
++    let mut host_reversed = false;
+     if basic.style.inverse {
+         // When the background is transparent (None), resolve it to the
+         // actual terminal background color before swapping.  Otherwise
+         // the swapped fg becomes None (Color::Reset) which the host
+         // terminal renders as its default foreground — the same hue as
+         // the new bg, making inverse text invisible.
+-        if bg.is_none() {
+-            bg = resolved_bg;
+-        }
+-        if fg.is_none() {
+-            fg = resolved_fg;
++        //
++        // Resolved colors are only available when they are trustworthy
++        // (host theme known, or the pane app customized its palette). When
++        // a needed side is untrustworthy — e.g. Windows clients never query
++        // the host theme, so the pane palette is just libghostty's built-in
++        // fallback — emit REVERSED instead and let the host terminal swap
++        // its real default colors. Resolving against the fallback painted
++        // white cursor blocks for TUIs that draw their cursor with reverse
++        // video (SGR 7) over default colors.
++        let bg_resolvable = bg.is_some() || resolved_bg.is_some();
++        let fg_resolvable = fg.is_some() || resolved_fg.is_some();
++        if bg_resolvable && fg_resolvable {
++            if bg.is_none() {
++                bg = resolved_bg;
++            }
++            if fg.is_none() {
++                fg = resolved_fg;
++            }
++            std::mem::swap(&mut fg, &mut bg);
++        } else {
++            host_reversed = true;
+         }
+-        std::mem::swap(&mut fg, &mut bg);
+     }
+ 
+     let mut style = ghostty_default_style(fg, bg);
+@@ -2639,10 +2663,40 @@ fn ghostty_cell_style(
+     if basic.style.strikethrough {
+         modifiers |= Modifier::CROSSED_OUT;
+     }
++    if host_reversed {
++        modifiers |= Modifier::REVERSED;
++    }
+     modifiers = crate::protocol::modifier_with_underline_style(modifiers, basic.style.underline);
+     style.add_modifier(modifiers)
+ }
+ 
++/// Concrete pane default colors for resolving inverse cells, or `None` per
++/// side when that color cannot be trusted.
++///
++/// A side is trustworthy when the host terminal theme for it is known (the
++/// pane palette was seeded/updated from real host colors) or when the pane
++/// app customized it away from the initial default (the app chose a concrete
++/// color on purpose). Otherwise the pane palette is just libghostty's
++/// built-in fallback and must not be baked into rendered cells.
++fn ghostty_resolved_inverse_colors(
++    colors: Option<crate::ghostty::RenderColors>,
++    host_theme: crate::terminal_theme::TerminalTheme,
++    initial_default_foreground: Option<crate::ghostty::RgbColor>,
++    initial_default_background: Option<crate::ghostty::RgbColor>,
++) -> (Option<Color>, Option<Color>) {
++    let resolved_fg = colors.and_then(|c| {
++        (host_theme.foreground.is_some()
++            || initial_default_foreground.is_some_and(|initial| initial != c.foreground))
++        .then(|| ghostty_color(c.foreground))
++    });
++    let resolved_bg = colors.and_then(|c| {
++        (host_theme.background.is_some()
++            || initial_default_background.is_some_and(|initial| initial != c.background))
++        .then(|| ghostty_color(c.background))
++    });
++    (resolved_fg, resolved_bg)
++}
++
+ #[derive(Debug)]
+ enum OrderedPtyResponseEvent {
+     DefaultColor(DefaultColorTrackedEvent),
+@@ -5602,6 +5656,68 @@ mod tests {
+         assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
+     }
+ 
++    #[test]
++    fn render_inverse_text_without_host_theme_defers_reversal_to_host_terminal() {
++        let (tx, _rx) = mpsc::channel(4);
++        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
++        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
++        // No host theme applied: the pane palette is libghostty's built-in
++        // fallback. TUIs like pi draw their cursor as `SGR 7` over default
++        // colors; resolving the reversal against the fallback painted a
++        // white block regardless of the real host colors (seen from Windows
++        // clients, which never query the host theme). The cell must instead
++        // keep default colors and carry REVERSED for the host terminal.
++        {
++            let mut core = pane.core.lock().unwrap();
++            core.terminal.write(b"\x1b[7mhi\x1b[27m");
++        }
++
++        let backend = ratatui::backend::TestBackend::new(20, 5);
++        let mut terminal = ratatui::Terminal::new(backend).unwrap();
++        terminal
++            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
++            .unwrap();
++
++        let buffer = terminal.backend().buffer();
++        let cell = &buffer[(0, 0)];
++        assert_eq!(cell.symbol(), "h");
++        assert_eq!(cell.style().fg, Some(Color::Reset));
++        assert_eq!(cell.style().bg, Some(Color::Reset));
++        assert!(cell.style().add_modifier.contains(Modifier::REVERSED));
++
++        // Cells outside the inverse run stay non-reversed.
++        let plain = &buffer[(3, 0)];
++        assert!(!plain.style().add_modifier.contains(Modifier::REVERSED));
++    }
++
++    #[test]
++    fn render_inverse_text_with_pane_customized_palette_still_resolves_concretely() {
++        let (tx, _rx) = mpsc::channel(4);
++        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
++        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
++        // No host theme, but the pane app set its own default colors via
++        // OSC 10/11 — those are deliberate concrete colors, so inverse must
++        // keep resolving to a concrete swap.
++        {
++            let mut core = pane.core.lock().unwrap();
++            core.terminal
++                .write(b"\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\\x1b[7mhi\x1b[27m");
++        }
++
++        let backend = ratatui::backend::TestBackend::new(20, 5);
++        let mut terminal = ratatui::Terminal::new(backend).unwrap();
++        terminal
++            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
++            .unwrap();
++
++        let buffer = terminal.backend().buffer();
++        let cell = &buffer[(0, 0)];
++        assert_eq!(cell.symbol(), "h");
++        assert_eq!(cell.style().fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
++        assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
++        assert!(!cell.style().add_modifier.contains(Modifier::REVERSED));
++    }
++
+     #[test]
+     fn trim_trailing_blank_rows_drops_empty_viewport_tail() {
+         let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
 diff --git a/src/platform/mod.rs b/src/platform/mod.rs
 index fbde21b..8647ef1 100644
 --- a/src/platform/mod.rs
@@ -331,10 +1000,10 @@ index ce4ca91..6186d83 100644
      if is_remote_auth_error(err) {
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
 new file mode 100644
-index 0000000..ffe9906
+index 0000000..dc20501
 --- /dev/null
 +++ b/src/remote/launcher.rs
-@@ -0,0 +1,2530 @@
+@@ -0,0 +1,2574 @@
 +//! Remote thin-client launcher over SSH command stdio.
 +//!
 +//! Platform-neutral: the pieces that differ between Unix and Windows (the
@@ -365,6 +1034,41 @@ index 0000000..ffe9906
 +const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 +const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 +const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
++/// When set (e.g. `HERDR_REMOTE_TIMING=1`), the launcher prints per-phase
++/// timing to stderr so slow attaches can be diagnosed. Each ssh round-trip is
++/// a fresh connection on Windows (no ControlMaster), so phase timing usually
++/// pinpoints either per-connection auth cost or a slow remote command.
++const REMOTE_TIMING_ENV_VAR: &str = "HERDR_REMOTE_TIMING";
++
++pub(crate) fn remote_timing_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var_os(REMOTE_TIMING_ENV_VAR).is_some_and(|value| !value.is_empty())
++    })
++}
++
++pub(crate) fn remote_timing(label: &str, detail: &str, elapsed: Duration) {
++    if !remote_timing_enabled() {
++        return;
++    }
++    if detail.is_empty() {
++        eprintln!("herdr: remote timing: {label} took {elapsed:.2?}");
++    } else {
++        eprintln!("herdr: remote timing: {label} [{detail}] took {elapsed:.2?}");
++    }
++}
++
++fn timed<T>(label: &str, detail: &str, run: impl FnOnce() -> T) -> T {
++    let started = Instant::now();
++    let result = run();
++    remote_timing(label, detail, started.elapsed());
++    result
++}
++
++/// First line of a remote shell script, for timing labels.
++fn script_summary(script: &str) -> &str {
++    script.lines().next().unwrap_or("").trim()
++}
 +pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 +
 +pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
@@ -494,6 +1198,7 @@ index 0000000..ffe9906
 +}
 +
 +pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
++    let launch_started = Instant::now();
 +    let session_name = crate::session::active_name()
 +        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
 +    let local_socket = sys::local_forward_socket_path(&remote.target, &session_name);
@@ -507,19 +1212,22 @@ index 0000000..ffe9906
 +        remote.keybindings,
 +        remote.live_handoff,
 +    );
-+    let manage_ssh_config = crate::config::Config::load()
-+        .config
-+        .remote
-+        .manage_ssh_config;
++    let manage_ssh_config = timed("phase: load config", "", || {
++        crate::config::Config::load().config.remote.manage_ssh_config
++    });
 +    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
-+    let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
-+    ensure_remote_server_ready(
-+        &remote_ssh,
-+        &prepared_remote.remote_herdr,
-+        prepared_remote.installed_or_replaced,
-+        prepared_remote.stop_after_install_approved,
-+        remote.live_handoff,
-+    )?;
++    let prepared_remote = timed("phase: prepare remote herdr", "", || {
++        prepare_remote_herdr(&remote_ssh, remote.live_handoff)
++    })?;
++    timed("phase: ensure remote server ready", "", || {
++        ensure_remote_server_ready(
++            &remote_ssh,
++            &prepared_remote.remote_herdr,
++            prepared_remote.installed_or_replaced,
++            prepared_remote.stop_after_install_approved,
++            remote.live_handoff,
++        )
++    })?;
 +
 +    let _bridge = sys::SshStdioBridge::start(
 +        remote.target,
@@ -529,6 +1237,7 @@ index 0000000..ffe9906
 +        remote_ssh.options(),
 +    )?;
 +
++    remote_timing("phase: setup before client", "", launch_started.elapsed());
 +    run_client_process(&local_socket, &reattach_command, remote.keybindings)
 +}
 +
@@ -770,29 +1479,33 @@ index 0000000..ffe9906
 +    }
 +
 +    fn sh_output(&self, script: &str) -> io::Result<Output> {
-+        let mut child = self
-+            .command()
-+            .arg("/bin/sh -s")
-+            .stdin(Stdio::piped())
-+            .stdout(Stdio::piped())
-+            .stderr(Stdio::piped())
-+            .spawn()?;
++        timed("ssh sh script", script_summary(script), || {
++            let mut child = self
++                .command()
++                .arg("/bin/sh -s")
++                .stdin(Stdio::piped())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped())
++                .spawn()?;
 +
-+        let write_result = if let Some(mut stdin) = child.stdin.take() {
-+            stdin.write_all(script.as_bytes())
-+        } else {
-+            Err(io::Error::new(
-+                io::ErrorKind::BrokenPipe,
-+                "ssh bootstrap stdin missing",
-+            ))
-+        };
-+        let output = child.wait_with_output()?;
-+        write_result?;
-+        Ok(output)
++            let write_result = if let Some(mut stdin) = child.stdin.take() {
++                stdin.write_all(script.as_bytes())
++            } else {
++                Err(io::Error::new(
++                    io::ErrorKind::BrokenPipe,
++                    "ssh bootstrap stdin missing",
++                ))
++            };
++            let output = child.wait_with_output()?;
++            write_result?;
++            Ok(output)
++        })
 +    }
 +
 +    fn user_shell_output(&self, command: &str) -> io::Result<Output> {
-+        self.command().arg(command).output()
++        timed("ssh user shell", command, || {
++            self.command().arg(command).output()
++        })
 +    }
 +
 +    fn install_herdr(&self, remote_herdr: &RemoteHerdr, source_path: &Path) -> io::Result<()> {
@@ -6240,10 +6953,10 @@ index 813091b..70fe163 100644
  }
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
 new file mode 100644
-index 0000000..69e9699
+index 0000000..383343c
 --- /dev/null
 +++ b/src/remote/windows.rs
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,370 @@
 +//! Windows platform pieces of remote attach.
 +//!
 +//! The local bridge socket is a named pipe served through `crate::ipc` — the
@@ -6279,7 +6992,9 @@ index 0000000..69e9699
 +
 +use interprocess::local_socket::traits::Listener as _;
 +
-+use super::launcher::{copy_flush, remote_bridge_command, sanitize_path_component, RemoteHerdr};
++use super::launcher::{
++    copy_flush, remote_bridge_command, remote_timing, sanitize_path_component, RemoteHerdr,
++};
 +use crate::ipc::LocalStream;
 +
 +/// How often the client→ssh pump checks for new client data or a stop
@@ -6451,9 +7166,11 @@ index 0000000..69e9699
 +        .stdout(Stdio::piped())
 +        .stderr(Stdio::inherit());
 +
++    let spawn_started = std::time::Instant::now();
 +    let mut child = command
 +        .spawn()
 +        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
++    remote_timing("bridge: ssh transport spawn", target, spawn_started.elapsed());
 +    let mut child_stdin = child
 +        .stdin
 +        .take()
@@ -6611,10 +7328,25 @@ index 0000000..69e9699
 +    }
 +}
 diff --git a/src/update.rs b/src/update.rs
-index eac917b..9bb764e 100644
+index eac917b..4459574 100644
 --- a/src/update.rs
 +++ b/src/update.rs
-@@ -1815,7 +1815,6 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
+@@ -24,6 +24,14 @@ use interprocess::local_socket::traits::Stream as _;
+ use serde::{Deserialize, Deserializer};
+ 
+ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
++
++/// This build is the `herdr-windows-remote` patched build. Self-update and the
++/// background version check are disabled: they compare against the *official*
++/// herdr.dev manifests and would replace this binary with an upstream build
++/// that lacks native Windows `--remote` support. Fork releases live at
++/// [`FORK_RELEASES_URL`].
++const FORK_BUILD: bool = true;
++const FORK_RELEASES_URL: &str = "https://github.com/iamwrm/herdr-windows-remote/releases";
+ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+ const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+ const HERDR_UPDATE_COMMAND: &str = "herdr update";
+@@ -1815,7 +1823,6 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
      }
  }
  
@@ -6622,6 +7354,53 @@ index eac917b..9bb764e 100644
  pub(crate) fn is_package_manager_managed_exe_path(path: &Path) -> bool {
      is_homebrew_managed_exe_path_following_links(path)
          || is_mise_managed_exe_path_following_links(path)
+@@ -1944,6 +1951,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
+ 
+ /// Manual self-update command (`herdr update`).
+ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
++    if FORK_BUILD {
++        return Err(format!(
++            "self-update is disabled for this windows-remote fork build: it would install an official upstream binary without `--remote` support on Windows.\nDownload fork builds from {FORK_RELEASES_URL} instead."
++        ));
++    }
++
+     let channel = UpdateChannel::configured();
+     #[cfg(windows)]
+     if channel == UpdateChannel::Stable {
+@@ -2079,6 +2092,14 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
+ /// Background update check: only surface availability and release notes.
+ /// Runs in a background thread at startup.
+ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
++    if FORK_BUILD {
++        // No version check against the official manifests: any "update
++        // available" notice would steer the user into replacing this fork
++        // build with an upstream binary. Watch FORK_RELEASES_URL instead.
++        tracing::info!("skipping update check: windows-remote fork build");
++        return;
++    }
++
+     crate::logging::update_check_started();
+     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
+         let version = version.trim();
+@@ -2233,6 +2254,18 @@ fn platform_target() -> (&'static str, &'static str) {
+ // Tests
+ // ---------------------------------------------------------------------------
+ 
++#[cfg(test)]
++mod fork_tests {
++    use super::*;
++
++    #[test]
++    fn fork_self_update_error_points_to_current_releases() {
++        let error = self_update(SelfUpdateOptions::default()).expect_err("fork update disabled");
++        assert!(error.contains("https://github.com/iamwrm/herdr-windows-remote/releases"));
++        assert!(!error.contains("https://github.com/iamwrm/herdr/releases"));
++    }
++}
++
+ #[cfg(all(test, unix))]
+ mod tests {
+     use super::*;
 -- 
 2.52.0.windows.1
 

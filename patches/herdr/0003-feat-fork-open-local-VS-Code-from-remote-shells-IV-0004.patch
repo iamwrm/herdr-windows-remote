@@ -1,28 +1,34 @@
-From a2bc55d22d1d2fe81ceb8b27f83ca7c7a36cabea Mon Sep 17 00:00:00 2001
+From 72a6239311388098938b1156f991882e1a6461f5 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
-Date: Mon, 20 Jul 2026 13:40:45 +0800
-Subject: [PATCH 12/17] feat(fork): open local VS Code from remote shells
+Date: Sun, 2 Aug 2026 00:03:34 +0800
+Subject: [PATCH 3/4] feat(fork): open local VS Code from remote shells
+ (IV-0004)
 
+Combine the complete IV-0004 integration:
+
+- validated OSC 52 code-open requests
+- final hcode naming
+- VS Code window-preservation behavior
 ---
- src/client/code_open.rs | 419 ++++++++++++++++++++++++++++++++++++++++
+ src/client/code_open.rs | 433 ++++++++++++++++++++++++++++++++++++++++
  src/client/mod.rs       |  20 +-
  src/config/model.rs     |  21 ++
  src/main.rs             |   3 +
  src/remote.rs           |   1 +
  src/remote/launcher.rs  |  15 +-
- 6 files changed, 476 insertions(+), 3 deletions(-)
+ 6 files changed, 490 insertions(+), 3 deletions(-)
  create mode 100644 src/client/code_open.rs
 
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
 new file mode 100644
-index 0000000..14a593c
+index 0000000..a839ddb
 --- /dev/null
 +++ b/src/client/code_open.rs
-@@ -0,0 +1,419 @@
-+//! `code .` typed on a remote herdr host opens local VS Code Remote-SSH.
+@@ -0,0 +1,433 @@
++//! `hcode .` typed on a remote herdr host opens local VS Code Remote-SSH.
 +//!
 +//! A shim script installed on the remote host (shipped as
-+//! `extras/remote-bin/code` in the patches repo) emits an OSC 52 clipboard
++//! `extras/remote-bin/hcode` in the patches repo) emits an OSC 52 clipboard
 +//! write whose payload is a magic JSON blob carrying absolute paths. The
 +//! official Linux server already forwards pane OSC 52 writes to the
 +//! foreground client as `ServerMessage::Clipboard`, so the blob arrives here
@@ -246,10 +252,21 @@ index 0000000..14a593c
 +
 +fn remote_url(target: &str, path: &str, directory: bool) -> String {
 +    let mut encoded_path = percent_encode_path(path);
-+    if directory && !encoded_path.ends_with('/') {
-+        encoded_path.push('/');
++    if directory {
++        if !encoded_path.ends_with('/') {
++            encoded_path.push('/');
++        }
++        // VS Code checks for an already-open matching workspace before
++        // applying this new-window fallback. Without it, an unmatched folder
++        // link may replace the active workspace, and several links can
++        // collapse into the same replacement window.
++        format!("vscode://vscode-remote/ssh-remote+{target}{encoded_path}?windowId=_blank")
++    } else {
++        // VS Code recognizes remote protocol paths as files only when they
++        // carry a line suffix. Its goto-line parser removes this marker before
++        // opening the file and naturally selects an existing containing window.
++        format!("vscode://vscode-remote/ssh-remote+{target}{encoded_path}:1")
 +    }
-+    format!("vscode://vscode-remote/ssh-remote+{target}{encoded_path}")
 +}
 +
 +#[cfg(test)]
@@ -289,7 +306,7 @@ index 0000000..14a593c
 +        assert_eq!(
 +            code_open.evaluate(&encode(payload), Instant::now()),
 +            Outcome::Open(vec![
-+                "vscode://vscode-remote/ssh-remote+deb1/home/u/proj/".to_string(),
++                "vscode://vscode-remote/ssh-remote+deb1/home/u/proj/?windowId=_blank".to_string(),
 +            ])
 +        );
 +    }
@@ -301,7 +318,7 @@ index 0000000..14a593c
 +        assert_eq!(
 +            code_open.evaluate(&encode(payload), Instant::now()),
 +            Outcome::Open(vec![
-+                "vscode://vscode-remote/ssh-remote+deb1/etc/hosts".to_string(),
++                "vscode://vscode-remote/ssh-remote+deb1/etc/hosts:1".to_string(),
 +            ])
 +        );
 +    }
@@ -316,7 +333,7 @@ index 0000000..14a593c
 +        };
 +        assert_eq!(
 +            urls[0],
-+            "vscode://vscode-remote/ssh-remote+deb1/home/u/my%20dir%2B%E6%96%87/"
++            "vscode://vscode-remote/ssh-remote+deb1/home/u/my%20dir%2B%E6%96%87/?windowId=_blank"
 +        );
 +    }
 +
@@ -327,7 +344,10 @@ index 0000000..14a593c
 +        let Outcome::Open(urls) = code_open.evaluate(&encode(payload), Instant::now()) else {
 +            panic!("expected URL");
 +        };
-+        assert_eq!(urls[0], "vscode://vscode-remote/ssh-remote+admin@deb1/x/");
++        assert_eq!(
++            urls[0],
++            "vscode://vscode-remote/ssh-remote+admin@deb1/x/?windowId=_blank"
++        );
 +    }
 +
 +    #[test]
@@ -423,8 +443,8 @@ index 0000000..14a593c
 +        assert_eq!(
 +            code_open.evaluate(&encode(payload), Instant::now()),
 +            Outcome::Open(vec![
-+                "vscode://vscode-remote/ssh-remote+deb1/a/".to_string(),
-+                "vscode://vscode-remote/ssh-remote+deb1/b/f.txt".to_string(),
++                "vscode://vscode-remote/ssh-remote+deb1/a/?windowId=_blank".to_string(),
++                "vscode://vscode-remote/ssh-remote+deb1/b/f.txt:1".to_string(),
 +            ])
 +        );
 +    }
@@ -439,7 +459,7 @@ index 0000000..14a593c
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 6b1f767..135da3a 100644
+index 972040e..a18c794 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,6 +12,7 @@
@@ -454,7 +474,7 @@ index 6b1f767..135da3a 100644
  struct ClientLoopConfig {
      /// `remote.predictive_echo` setting ("off" | "auto" | "always").
      predictive_echo: String,
-+    /// `remote.code_open` setting: allow the remote `code` shim to open
++    /// `remote.code_open` setting: allow the remote `hcode` shim to open
 +    /// local VS Code Remote-SSH windows (i0004).
 +    code_open: bool,
      sound_config: crate::config::SoundConfig,
@@ -472,20 +492,20 @@ index 6b1f767..135da3a 100644
          None
      };
  
-+    // `code <path>` typed on the remote host → local VS Code Remote-SSH
++    // `hcode <path>` typed on the remote host → local VS Code Remote-SSH
 +    // window (i0004). Only active for remote attach clients.
 +    let mut code_open = code_open::CodeOpen::from_client_env(config.code_open);
 +
      let mut state = ClientState {
          blit_encoder: render_ansi::BlitEncoder::new(),
          mouse_capture_active: config.mouse_capture_active,
-@@ -1608,8 +1617,15 @@ async fn run_client_loop(
+@@ -1618,8 +1627,15 @@ async fn run_client_loop(
                      handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                  }
                  ServerMessage::Clipboard { data } => {
 -                    forward_clipboard(&data);
 -                    let _ = io::stdout().flush();
-+                    // The remote `code` shim rides the OSC 52 channel; its
++                    // The remote `hcode` shim rides the OSC 52 channel; its
 +                    // magic payloads must never reach the real clipboard.
 +                    let handled = code_open
 +                        .as_mut()
@@ -498,15 +518,15 @@ index 6b1f767..135da3a 100644
                  ServerMessage::WindowTitle { title } => {
                      write_window_title(title.as_deref());
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 7843d64..2e67d21 100644
+index 7843d64..6925c6f 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
 @@ -880,6 +880,12 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
-+    /// Allow the remote `code` shim script to open local VS Code Remote-SSH
-+    /// windows for paths on the attached host (`code .` inside
++    /// Allow the remote `hcode` shim script to open local VS Code Remote-SSH
++    /// windows for paths on the attached host (`hcode .` inside
 +    /// `herdr --remote`). The client only ever launches VS Code with
 +    /// `vscode://vscode-remote/ssh-remote+<target>` URLs for the current
 +    /// attach target. Env override: `HERDR_REMOTE_CODE_OPEN=1|0`. Default: true.
@@ -544,14 +564,14 @@ index 7843d64..2e67d21 100644
      fn toast_config_parses() {
          let toml = r#"
 diff --git a/src/main.rs b/src/main.rs
-index b68ca5a..03583bc 100644
+index b68ca5a..028541b 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -393,6 +393,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # Predictive local echo for remote terminal attach: "off", "auto", or "always".
  # Auto displays predictions only after observing enough network latency.
  # predictive_echo = "auto"
-+# Allow the remote `code` shim to open local VS Code Remote-SSH windows.
++# Allow the remote `hcode` shim to open local VS Code Remote-SSH windows.
 +# code_open = true
  
  [experimental]
@@ -577,7 +597,7 @@ index 6f5de59..b632a6e 100644
  pub(crate) use tcp_relay::run_remote_tcp_relay;
  
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index 627dbc6..fb90fe2 100644
+index 627dbc6..67a31ed 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -68,6 +68,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
@@ -585,7 +605,7 @@ index 627dbc6..fb90fe2 100644
  pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
  
 +/// Ssh target of the active `herdr --remote` attach, exported to the spawned
-+/// client process so client-local integrations (the remote `code` shim →
++/// client process so client-local integrations (the remote `hcode` shim →
 +/// local VS Code Remote-SSH, i0004) know which host they are attached to.
 +pub(crate) const REMOTE_TARGET_ENV_VAR: &str = "HERDR_REMOTE_TARGET";
 +

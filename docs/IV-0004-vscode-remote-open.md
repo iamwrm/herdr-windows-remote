@@ -2,21 +2,21 @@
 
 ## Record
 
-- **Status:** implemented in patches `0012`, `0015`, and `0016`; `hcode`
-  shipped in `v0.7.5-win.01`, while the current refreshed patch export is
-  unreleased; automated tests and live deb1 request-transport verification
-  complete
+- **Status:** implemented in ownership patch `0003`; the current patch
+  representation postdates the releases, while its identical implementation
+  tree shipped as `v0.7.5-win.05` (`hcode` first shipped in
+  `v0.7.5-win.01`); automated tests and live deb1 request-transport
+  verification complete
 - **Upstream:** `checkouts/herdr`
   ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
-- **Deliverables:** `patches/herdr/0012-*`, `patches/herdr/0015-*`,
-  `patches/herdr/0016-*`,
+- **Deliverables:** `patches/herdr/0003-*-IV-0004.patch`,
   [`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode`
   release asset
-- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on patches
-  `0001`–`0011`
+- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on ownership
+  patches `0001`–`0002`
 - **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
   Windows remote client; [IV-0002](IV-0002-latency-improvements.md) owns the
-  interleaved surrounding patches
+  preceding client/transport latency patch
 
 ## Purpose
 
@@ -31,7 +31,8 @@ launch Windows VS Code in Remote-SSH mode, connected through the same ssh target
 
 ## Constraint and integration point
 
-The remote server remains the **official Linux herdr binary**. Patch 0012 makes no server or wire-protocol changes.
+The remote server remains the **official Linux herdr binary**. Ownership patch
+`0003` makes no server or wire-protocol changes.
 
 The official server already provides the needed remote-to-local side-effect channel:
 
@@ -133,7 +134,10 @@ hcode .
 
 VS Code's Remote-SSH extension must be installed locally, and the target should be a normal ssh alias/host accepted by both herdr and VS Code (for example `deb1` or `user@deb1`). Workspace Trust remains governed by VS Code.
 
-## Patch 0012 — `feat(fork): open local VS Code from remote shells`
+## Ownership patch `0003` — `feat(fork): open local VS Code from remote shells (IV-0004)`
+
+This patch contains the complete IV-0004 boundary: the initial integration,
+the final `hcode` naming, and VS Code window-preservation behavior.
 
 | File | Change |
 |---|---|
@@ -148,17 +152,17 @@ Repository-only file:
 |---|---|
 | `extras/remote-bin/hcode` | installable Linux-side command shim and release asset |
 
-## Patch 0015 — rename the remote command to `hcode`
+### Included `hcode` naming
 
-Patch `0015` updates final-tree source comments and generated-config guidance
+The patch's final-tree source comments and generated-config guidance
 to use `hcode`. The wire payload (`code-open`), Rust identifiers,
 `remote.code_open`, and `HERDR_REMOTE_CODE_OPEN` remain unchanged for backward
 compatibility; they are internal integration names and do not claim the Linux
 `code` command.
 
-## Patch 0016 — preserve existing VS Code windows
+### Included VS Code window preservation
 
-Patch `0016` adds VS Code's `windowId=_blank` URL parameter to folder links.
+The patch adds VS Code's `windowId=_blank` URL parameter to folder links.
 Exact matching workspaces are still reused and focused; unmatched folders open
 separately instead of replacing an existing workspace. It also adds the `:1`
 marker required for VS Code to route file links to a containing window.
@@ -201,10 +205,13 @@ Completed on Windows with Zig 0.15.2:
 - `cargo test --bin herdr windows_` — 126 passed;
 - `cargo test --bin herdr server::client_transport::tests` — 21 passed;
 - `cargo test --bin herdr config::` — 128 passed;
-- focused `client::code_open::tests` — 15 passed after patch `0016`, including URL encoding, folder/file new-window fallbacks, validation/rate limiting, and disabled-request consumption;
+- focused `client::code_open::tests` — 15 passed after the
+  window-preservation follow-up, including URL encoding, folder/file
+  new-window fallbacks, validation/rate limiting, and disabled-request
+  consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all 16 patches applied with `git am` to a fresh `v0.7.5`
-  worktree and exactly match the implementation checkout; the known fork-era
+- clean-room: all four ownership patches applied with `git am` to a fresh
+  `v0.7.5` worktree and exactly match the implementation checkout; the known fork-era
   CI workflow is intentionally excluded from both;
 - `git diff --check` — clean.
 
@@ -227,8 +234,8 @@ Live deb1 verification:
 - Preserve ordinary clipboard fallback for every non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
 - Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
-- Patch `0012` applies after IV-0002's `0011`; comment-only rename patch `0015`
-  applies after `0014`, and window-preservation patch `0016` applies last.
+- Ownership patch `0003` applies after IV-0002 patch `0002`; keep all
+  code-open behavior, naming, and window-preservation changes together.
 
 ## Decisions and deferred work
 
@@ -238,10 +245,17 @@ Live deb1 verification:
 
 ## Evidence log
 
-- 2026-07-20: patch `0012` implemented/exported; automated tests green; live deb1 OSC 52 request transport verified `/tmp`; VS Code Remote-SSH resolver launch verified. Launch code was then simplified to herdr's existing platform URL opener using VS Code's documented remote protocol URL.
+- 2026-07-20: the integration was implemented/exported; automated tests
+  green; live deb1 OSC 52 request transport verified `/tmp`; VS Code
+  Remote-SSH resolver launch verified. Launch code was then simplified to
+  herdr's existing platform URL opener using VS Code's documented remote
+  protocol URL.
 - 2026-07-20: renamed the Linux command from `code` to `hcode` so it cannot
   shadow the official VS Code CLI; added `hcode` to release assets and
   installed it on deb1 at `~/.cargo/bin/hcode`.
 - 2026-07-21: added the `windowId=_blank` fallback so exact existing
   workspaces are focused while unmatched folders cannot replace unrelated
   VS Code windows.
+- 2026-08-01: recombined the implementation, naming, and window-preservation
+  follow-ups into ownership patch `0003`; clean-room application preserves the
+  former stack's final tree.

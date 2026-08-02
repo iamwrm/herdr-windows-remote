@@ -11,7 +11,7 @@
 # How it works: inside a herdr pane this script emits an OSC 52 clipboard
 # write whose payload is a magic JSON blob. The herdr server forwards pane
 # OSC 52 writes to the attached client; the patched Windows client (patch
-# 0012, IV-0004) recognizes the blob and launches local VS Code with
+# 0003, IV-0004) recognizes the blob and launches local VS Code with
 # `vscode://vscode-remote/ssh-remote+<target>` URLs instead of touching the
 # clipboard. Unpatched or non-herdr terminals just get a short junk string
 # on their clipboard, nothing else.
