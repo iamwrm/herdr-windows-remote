@@ -1,7 +1,7 @@
-From 72a6239311388098938b1156f991882e1a6461f5 Mon Sep 17 00:00:00 2001
+From f9b6cc160a5b43481963ce2d17e22d11d58e29b5 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 3/4] feat(fork): open local VS Code from remote shells
+Subject: [PATCH 3/3] feat(fork): open local VS Code from remote shells
  (IV-0004)
 
 Combine the complete IV-0004 integration:
@@ -21,7 +21,7 @@ Combine the complete IV-0004 integration:
 
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
 new file mode 100644
-index 0000000..a839ddb
+index 00000000..a839ddba
 --- /dev/null
 +++ b/src/client/code_open.rs
 @@ -0,0 +1,433 @@
@@ -459,7 +459,7 @@ index 0000000..a839ddb
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 972040e..a18c794 100644
+index 3eac9c04..8b161185 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,6 +12,7 @@
@@ -480,7 +480,7 @@ index 972040e..a18c794 100644
      sound_config: crate::config::SoundConfig,
      mouse_scroll_lines: usize,
      redraw_on_focus_gained: bool,
-@@ -1136,6 +1140,7 @@ fn run_client_with_mode(
+@@ -1140,6 +1144,7 @@ fn run_client_with_mode(
          loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
      let loop_config = ClientLoopConfig {
          predictive_echo: loaded_config.config.remote.predictive_echo.clone(),
@@ -488,7 +488,7 @@ index 972040e..a18c794 100644
          sound_config: loaded_config.config.ui.sound,
          mouse_scroll_lines,
          redraw_on_focus_gained,
-@@ -1308,6 +1313,10 @@ async fn run_client_loop(
+@@ -1319,6 +1324,10 @@ async fn run_client_loop(
          None
      };
  
@@ -499,7 +499,7 @@ index 972040e..a18c794 100644
      let mut state = ClientState {
          blit_encoder: render_ansi::BlitEncoder::new(),
          mouse_capture_active: config.mouse_capture_active,
-@@ -1618,8 +1627,15 @@ async fn run_client_loop(
+@@ -1664,8 +1673,15 @@ async fn run_client_loop(
                      handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                  }
                  ServerMessage::Clipboard { data } => {
@@ -518,10 +518,10 @@ index 972040e..a18c794 100644
                  ServerMessage::WindowTitle { title } => {
                      write_window_title(title.as_deref());
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 7843d64..6925c6f 100644
+index e2bd39bb..5e638b81 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -880,6 +880,12 @@ pub struct RemoteConfig {
+@@ -892,6 +892,12 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
@@ -534,7 +534,7 @@ index 7843d64..6925c6f 100644
  }
  
  impl Default for RemoteConfig {
-@@ -888,6 +894,7 @@ impl Default for RemoteConfig {
+@@ -900,6 +906,7 @@ impl Default for RemoteConfig {
              manage_ssh_config: true,
              tcp_relay: false,
              predictive_echo: "auto".to_string(),
@@ -542,7 +542,7 @@ index 7843d64..6925c6f 100644
          }
      }
  }
-@@ -1575,6 +1582,20 @@ mouse_scroll_lines = 0
+@@ -1602,6 +1609,20 @@ mouse_scroll_lines = 0
          assert!(toml::from_str::<Config>(toml).is_err());
      }
  
@@ -564,10 +564,10 @@ index 7843d64..6925c6f 100644
      fn toast_config_parses() {
          let toml = r#"
 diff --git a/src/main.rs b/src/main.rs
-index b68ca5a..028541b 100644
+index f75d4f60..0160f090 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -393,6 +393,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -402,6 +402,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # Predictive local echo for remote terminal attach: "off", "auto", or "always".
  # Auto displays predictions only after observing enough network latency.
  # predictive_echo = "auto"
@@ -576,7 +576,7 @@ index b68ca5a..028541b 100644
  
  [experimental]
  # Allow launching herdr from inside a herdr-managed pane.
-@@ -876,6 +878,7 @@ mod tests {
+@@ -926,6 +928,7 @@ mod tests {
          assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
          assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
          assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
@@ -585,7 +585,7 @@ index b68ca5a..028541b 100644
  
      #[test]
 diff --git a/src/remote.rs b/src/remote.rs
-index 6f5de59..b632a6e 100644
+index 6f5de59f..b632a6ed 100644
 --- a/src/remote.rs
 +++ b/src/remote.rs
 @@ -14,6 +14,7 @@ mod windows;
@@ -597,7 +597,7 @@ index 6f5de59..b632a6e 100644
  pub(crate) use tcp_relay::run_remote_tcp_relay;
  
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index 627dbc6..67a31ed 100644
+index 21b4eed0..59199845 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -68,6 +68,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
@@ -634,7 +634,7 @@ index 627dbc6..67a31ed 100644
  }
  
  #[derive(Debug, Clone, PartialEq, Eq)]
-@@ -1589,6 +1600,7 @@ fn run_client_process(
+@@ -1592,6 +1603,7 @@ fn run_client_process(
      local_socket: &Path,
      reattach_command: &str,
      keybindings: RemoteKeybindings,
@@ -642,7 +642,7 @@ index 627dbc6..67a31ed 100644
  ) -> io::Result<()> {
      let exe = std::env::current_exe()?;
      let status = Command::new(exe)
-@@ -1600,6 +1612,7 @@ fn run_client_process(
+@@ -1603,6 +1615,7 @@ fn run_client_process(
          .env("HERDR_RENDER_ENCODING", "terminal-ansi")
          .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
          .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())

@@ -2,17 +2,16 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0003`; the current patch
-  representation postdates the releases, while its identical implementation
-  tree shipped as `v0.7.5-win.05` (`hcode` first shipped in
-  `v0.7.5-win.01`); automated tests and live deb1 request-transport
-  verification complete
+- **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
+  representation; the latest published implementation remains
+  `v0.7.5-win.05` (`hcode` first shipped in `v0.7.5-win.01`); automated tests
+  and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
-  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+  ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** `patches/herdr/0003-*-IV-0004.patch`,
   [`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode`
   release asset
-- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on ownership
+- **Implementation base:** `v0.8.0` (`346411fa`), stacked on ownership
   patches `0001`–`0002`
 - **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
   Windows remote client; [IV-0002](IV-0002-latency-improvements.md) owns the
@@ -199,20 +198,22 @@ This is intentionally not a general remote-to-local command execution mechanism.
 
 Completed on Windows with Zig 0.15.2:
 
-- `cargo clippy --bin herdr -- -D warnings` — clean;
-- `cargo test --bin herdr client::` — 170 passed;
-- `cargo test --bin herdr remote::` — 76 passed;
-- `cargo test --bin herdr windows_` — 126 passed;
-- `cargo test --bin herdr server::client_transport::tests` — 21 passed;
-- `cargo test --bin herdr config::` — 128 passed;
+- `cargo clippy --locked --bin herdr -- -D warnings` — clean;
+- `cargo test --locked --bin herdr client::` — 187 passed;
+- `cargo test --locked --bin herdr remote::` — 78 passed;
+- `cargo test --locked --bin herdr windows_` — 151 passed;
+- `cargo test --locked --bin herdr server::client_transport::tests` — 22 passed;
+- `cargo test --locked --bin herdr config::` — 130 passed;
+- release-equivalent `cargo build --release --locked --target
+  x86_64-pc-windows-msvc` — clean;
 - focused `client::code_open::tests` — 15 passed after the
   window-preservation follow-up, including URL encoding, folder/file
   new-window fallbacks, validation/rate limiting, and disabled-request
   consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all four ownership patches applied with `git am` to a fresh
-  `v0.7.5` worktree and exactly match the implementation checkout; the known fork-era
-  CI workflow is intentionally excluded from both;
+- clean-room: all three ownership patches applied with `git am` to a fresh
+  `v0.8.0` worktree and exactly match the implementation checkout; the known
+  fork-era CI workflow is intentionally excluded from both;
 - `git diff --check` — clean.
 
 Test binaries report nine pre-existing test-only unused-code/import warnings; production clippy with warnings denied is clean.
@@ -259,3 +260,5 @@ Live deb1 verification:
 - 2026-08-01: recombined the implementation, naming, and window-preservation
   follow-ups into ownership patch `0003`; clean-room application preserves the
   former stack's final tree.
+- 2026-08-04: refreshed patch `0003` onto `v0.8.0`; the three-patch
+  clean-room apply and current filtered test suites are green.

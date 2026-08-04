@@ -1,7 +1,7 @@
-From 9509f03af686798757b09915dde1f5efa11430d1 Mon Sep 17 00:00:00 2001
+From 867ed2028affa19d302b7262e947ae267dd56a0d Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 2/4] perf(remote): improve high-RTT latency (IV-0002)
+Subject: [PATCH 2/3] perf(remote): improve high-RTT latency (IV-0002)
 
 Combine all IV-0002 workstreams and follow-ups:
 
@@ -14,20 +14,20 @@ Combine all IV-0002 workstreams and follow-ups:
  Cargo.toml                      |    2 +
  src/client/echo_timing.rs       |  202 ++++++
  src/client/input/windows_vti.rs |   37 +-
- src/client/mod.rs               |  174 +++++-
- src/client/predict.rs           | 1041 +++++++++++++++++++++++++++++++
- src/client/screen_model.rs      |  658 +++++++++++++++++++
+ src/client/mod.rs               |  177 +++++-
+ src/client/predict.rs           | 1047 +++++++++++++++++++++++++++++++
+ src/client/screen_model.rs      |  667 ++++++++++++++++++++
  src/config/model.rs             |   20 +-
  src/ipc.rs                      |    8 +-
  src/main.rs                     |   15 +
  src/protocol/wire.rs            |   47 +-
  src/remote.rs                   |    3 +
- src/remote/launcher.rs          |  337 ++++------
- src/remote/probe.rs             |  596 ++++++++++++++++++
- src/remote/tcp_relay.rs         |  166 +++++
+ src/remote/launcher.rs          |  339 ++++------
+ src/remote/probe.rs             |  606 ++++++++++++++++++
+ src/remote/tcp_relay.rs         |  163 +++++
  src/remote/unix.rs              |    8 +-
  src/remote/windows.rs           |  223 ++++++-
- 17 files changed, 3256 insertions(+), 282 deletions(-)
+ 17 files changed, 3279 insertions(+), 286 deletions(-)
  create mode 100644 src/client/echo_timing.rs
  create mode 100644 src/client/predict.rs
  create mode 100644 src/client/screen_model.rs
@@ -35,22 +35,22 @@ Combine all IV-0002 workstreams and follow-ups:
  create mode 100644 src/remote/tcp_relay.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 6cfdbd0..a46b096 100644
+index 980fcb5d..6b16a59d 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -607,6 +607,7 @@ dependencies = [
+@@ -696,6 +696,7 @@ dependencies = [
   "toml",
   "tracing",
   "tracing-subscriber",
 + "unicode-segmentation",
   "unicode-width",
   "windows-sys",
- ]
+  "wmi",
 diff --git a/Cargo.toml b/Cargo.toml
-index e136312..fee594d 100644
+index 84949e2d..c6d89bed 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -41,6 +41,7 @@ toml = "0.8"
+@@ -43,6 +43,7 @@ toml = "0.8"
  tracing = "0.1.44"
  tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
  unicode-width = "0.2"
@@ -58,7 +58,7 @@ index e136312..fee594d 100644
  schemars = { version = "1.2.1", features = ["derive"] }
  
  [patch.crates-io]
-@@ -55,6 +56,7 @@ windows-sys = { version = "0.61.2", features = [
+@@ -59,6 +60,7 @@ windows-sys = { version = "0.61.2", features = [
      "Win32_System_Diagnostics_ToolHelp",
      "Win32_System_Console",
      "Win32_System_JobObjects",
@@ -68,7 +68,7 @@ index e136312..fee594d 100644
      "Win32_System_Ole",
 diff --git a/src/client/echo_timing.rs b/src/client/echo_timing.rs
 new file mode 100644
-index 0000000..476f39a
+index 00000000..d507893b
 --- /dev/null
 +++ b/src/client/echo_timing.rs
 @@ -0,0 +1,202 @@
@@ -177,7 +177,7 @@ index 0000000..476f39a
 +        ClientInputEvent::Key { kind, .. } => {
 +            matches!(kind, ClientKeyKind::Press | ClientKeyKind::Repeat)
 +        }
-+        ClientInputEvent::Paste { .. } => true,
++        ClientInputEvent::TextCommit(_) | ClientInputEvent::Paste { .. } => true,
 +        ClientInputEvent::Mouse { .. }
 +        | ClientInputEvent::FocusGained
 +        | ClientInputEvent::FocusLost => false,
@@ -275,10 +275,10 @@ index 0000000..476f39a
 +    }
 +}
 diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
-index 296bb91..d1cdde7 100644
+index a7a71e60..019d6de2 100644
 --- a/src/client/input/windows_vti.rs
 +++ b/src/client/input/windows_vti.rs
-@@ -67,12 +67,14 @@ fn process_platform_input_items(
+@@ -68,12 +68,14 @@ fn process_platform_input_items(
      pump: &mut WindowsInputPump,
      event_tx: &mpsc::Sender<ClientLoopEvent>,
  ) -> bool {
@@ -297,7 +297,7 @@ index 296bb91..d1cdde7 100644
  }
  
  #[cfg(windows)]
-@@ -1068,6 +1070,33 @@ fn windows_input_trace_enabled() -> bool {
+@@ -1127,6 +1129,33 @@ fn windows_input_trace_enabled() -> bool {
  mod tests {
      use super::*;
  
@@ -332,7 +332,7 @@ index 296bb91..d1cdde7 100644
          WindowsInputRecord::Key(WindowsKeyRecord {
              key_down: true,
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 6b6c621..972040e 100644
+index b686ad16..3eac9c04 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,7 +12,10 @@
@@ -355,7 +355,7 @@ index 6b6c621..972040e 100644
      sound_config: crate::config::SoundConfig,
      mouse_scroll_lines: usize,
      redraw_on_focus_gained: bool,
-@@ -1130,6 +1135,7 @@ fn run_client_with_mode(
+@@ -1134,6 +1139,7 @@ fn run_client_with_mode(
      let kitty_graphics_enabled =
          loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
      let loop_config = ClientLoopConfig {
@@ -363,7 +363,7 @@ index 6b6c621..972040e 100644
          sound_config: loaded_config.config.ui.sound,
          mouse_scroll_lines,
          redraw_on_focus_gained,
-@@ -1289,6 +1295,18 @@ async fn run_client_loop(
+@@ -1300,6 +1306,18 @@ async fn run_client_loop(
      let draw_host_cursor = attach_escape.is_none() && should_draw_host_cursor(config.host_cursor);
      #[cfg(unix)]
      let is_remote_client = is_remote_client_process();
@@ -382,15 +382,15 @@ index 6b6c621..972040e 100644
  
      let mut state = ClientState {
          blit_encoder: render_ansi::BlitEncoder::new(),
-@@ -1305,6 +1323,7 @@ async fn run_client_loop(
+@@ -1318,6 +1336,7 @@ async fn run_client_loop(
          draw_host_cursor,
      };
      debug!(?negotiated_encoding, "client render encoding active");
 +    let mut echo_timing = echo_timing::EchoTiming::from_env();
      let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
- 
-     // Channel for events from the stdin, resize, and server reader threads.
-@@ -1471,10 +1490,16 @@ async fn run_client_loop(
+     // Cell size reported by the host terminal, packed as width<<32 | height.
+     // Zero means the host has not reported one.
+@@ -1510,10 +1529,16 @@ async fn run_client_loop(
                      }
                      continue;
                  }
@@ -407,9 +407,9 @@ index 6b6c621..972040e 100644
              }
              #[cfg(windows)]
              ClientLoopEvent::StdinEvents(events) => {
-@@ -1491,10 +1516,19 @@ async fn run_client_loop(
+@@ -1530,10 +1555,19 @@ async fn run_client_loop(
                  ) {
-                     state.request_full_redraw();
+                     state.request_repaint();
                  }
 +                let prediction_output = predictor
 +                    .as_mut()
@@ -427,10 +427,14 @@ index 6b6c621..972040e 100644
              }
              #[cfg(windows)]
              ClientLoopEvent::StdinThemeReport(data) => {
-@@ -1508,6 +1542,11 @@ async fn run_client_loop(
+@@ -1547,8 +1581,14 @@ async fn run_client_loop(
              }
              ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                  state.reported_size = (new_cols, new_rows);
+-                // Resizing invalidates the host-side blit baseline.
++                // Resizing invalidates the host-side blit baseline and any
++                // pending local predictions.
+                 state.request_repaint();
 +                let prediction_output = predictor
 +                    .as_mut()
 +                    .map(predict::Predictor::on_resize)
@@ -439,10 +443,10 @@ index 6b6c621..972040e 100644
                  let msg = ClientMessage::Resize {
                      cols: new_cols,
                      rows: new_rows,
-@@ -1542,14 +1581,23 @@ async fn run_client_loop(
-                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
+@@ -1587,14 +1627,23 @@ async fn run_client_loop(
                      let _ = stdout.flush();
                      state.blit_encoder.commit(frame_data, encoded);
+                     state.repaint_pending = false;
 +                    echo_timing.on_render_received();
                  }
                  ServerMessage::Terminal(frame) => {
@@ -466,7 +470,7 @@ index 6b6c621..972040e 100644
                  }
                  ServerMessage::Graphics { bytes } => {
                      if state.kitty_graphics_enabled {
-@@ -1615,7 +1663,13 @@ async fn run_client_loop(
+@@ -1670,7 +1719,13 @@ async fn run_client_loop(
                      "server closed connection",
                  )));
              }
@@ -481,7 +485,7 @@ index 6b6c621..972040e 100644
          }
      }
  
-@@ -1978,6 +2032,73 @@ fn write_window_title(title: Option<&str>) {
+@@ -2033,6 +2088,73 @@ fn write_window_title(title: Option<&str>) {
  // Frame output
  // ---------------------------------------------------------------------------
  
@@ -555,7 +559,7 @@ index 6b6c621..972040e 100644
  fn write_encoded_frame_with_graphics(
      mut writer: impl io::Write,
      encoded: &[u8],
-@@ -2389,6 +2510,51 @@ mod tests {
+@@ -2549,6 +2671,51 @@ mod tests {
          assert_eq!(output, b"text");
      }
  
@@ -609,10 +613,10 @@ index 6b6c621..972040e 100644
          assert!(contains_kitty_graphics_bytes(b"text\x1b_Ga=p;\x1b\\"));
 diff --git a/src/client/predict.rs b/src/client/predict.rs
 new file mode 100644
-index 0000000..531469c
+index 00000000..2f0f0da3
 --- /dev/null
 +++ b/src/client/predict.rs
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1047 @@
 +//! Predictive local echo for remote attach (i0002 W3, mosh-style).
 +//!
 +//! On a high-RTT link every keystroke takes a full round trip before it
@@ -747,6 +751,7 @@ index 0000000..531469c
 +                    code,
 +                    modifiers,
 +                    kind: ClientKeyKind::Press | ClientKeyKind::Repeat,
++                    ..
 +                } => match code {
 +                    ClientKeyCode::Char(ch) if modifiers & !SHIFT == 0 => {
 +                        self.on_char(*ch, &mut out);
@@ -756,7 +761,9 @@ index 0000000..531469c
 +                    }
 +                    _ => self.on_other_input(&mut out),
 +                },
-+                ClientInputEvent::Paste { .. } | ClientInputEvent::Mouse { .. } => {
++                ClientInputEvent::TextCommit(_)
++                | ClientInputEvent::Paste { .. }
++                | ClientInputEvent::Mouse { .. } => {
 +                    self.on_other_input(&mut out);
 +                }
 +                // Key releases do not act on the remote application and must
@@ -1530,6 +1537,9 @@ index 0000000..531469c
 +            code: crate::protocol::ClientKeyCode::Char(ch),
 +            modifiers: 0,
 +            kind,
++            repeat_count: 1,
++            generated_text: Some(ch.to_string()),
++            source: crate::protocol::ClientKeySource::Synthesized,
 +        }
 +    }
 +
@@ -1656,10 +1666,10 @@ index 0000000..531469c
 +}
 diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
 new file mode 100644
-index 0000000..27dc588
+index 00000000..1dfe21d9
 --- /dev/null
 +++ b/src/client/screen_model.rs
-@@ -0,0 +1,658 @@
+@@ -0,0 +1,667 @@
 +//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
 +//!
 +//! Terminal-ansi clients normally blit server frame bytes to stdout without
@@ -1776,7 +1786,8 @@ index 0000000..27dc588
 +        if x >= self.width || y >= self.height {
 +            return None;
 +        }
-+        self.cells.get(y as usize * self.width as usize + x as usize)
++        self.cells
++            .get(y as usize * self.width as usize + x as usize)
 +    }
 +
 +    /// Replays one frame's bytes into the grid. `touched` receives the
@@ -2070,7 +2081,12 @@ index 0000000..27dc588
 +        let second = frame(
 +            4,
 +            1,
-+            vec![plain_cell("a"), plain_cell("b"), plain_cell("c"), plain_cell(" ")],
++            vec![
++                plain_cell("a"),
++                plain_cell("b"),
++                plain_cell("c"),
++                plain_cell(" "),
++            ],
 +            (3, 0),
 +        );
 +        let model = replay(&[first, second.clone()]);
@@ -2304,7 +2320,10 @@ index 0000000..27dc588
 +        let mut model = ScreenModel::new();
 +        model.ensure_size(2, 1);
 +        let mut touched = Vec::new();
-+        model.apply(b"\x1b_Ga=T;payload\x1b\\\x1b]52;c;YQ==\x07\x1b[1;1Hz", &mut touched);
++        model.apply(
++            b"\x1b_Ga=T;payload\x1b\\\x1b]52;c;YQ==\x07\x1b[1;1Hz",
++            &mut touched,
++        );
 +        assert_eq!(model.cell(0, 0).unwrap().symbol, "z");
 +    }
 +
@@ -2319,10 +2338,10 @@ index 0000000..27dc588
 +    }
 +}
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 9fbca3a..7843d64 100644
+index e56ac087..e2bd39bb 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -863,15 +863,31 @@ pub struct AdvancedConfig {
+@@ -875,15 +875,31 @@ pub struct AdvancedConfig {
  #[derive(Debug, Deserialize)]
  #[serde(default)]
  pub struct RemoteConfig {
@@ -2357,7 +2376,7 @@ index 9fbca3a..7843d64 100644
      }
  }
 diff --git a/src/ipc.rs b/src/ipc.rs
-index ce164b0..abb3549 100644
+index ce164b0f..abb3549f 100644
 --- a/src/ipc.rs
 +++ b/src/ipc.rs
 @@ -181,12 +181,10 @@ fn probe_stream_closed(stream: &mut LocalStream) -> io::Result<bool> {
@@ -2377,10 +2396,10 @@ index ce164b0..abb3549 100644
  
      let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/main.rs b/src/main.rs
-index 5d140e1..b68ca5a 100644
+index 5cf3d93c..f75d4f60 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -386,6 +386,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -395,6 +395,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # command-line keepalives that override ServerAlive* values in user config.
  # Set false to use ssh config unchanged without herdr's additions.
  # manage_ssh_config = true
@@ -2394,7 +2413,7 @@ index 5d140e1..b68ca5a 100644
  
  [experimental]
  # Allow launching herdr from inside a herdr-managed pane.
-@@ -495,6 +502,11 @@ fn main() -> io::Result<()> {
+@@ -537,6 +544,11 @@ fn main() -> io::Result<()> {
          return remote::run_remote_client_bridge();
      }
  
@@ -2406,7 +2425,7 @@ index 5d140e1..b68ca5a 100644
      if args.get(1).map(|s| s.as_str()) == Some("server") {
          return server::headless::run_server();
      }
-@@ -678,6 +690,7 @@ fn main() -> io::Result<()> {
+@@ -728,6 +740,7 @@ fn main() -> io::Result<()> {
                  "server",
                  "client",
                  "remote-client-bridge",
@@ -2414,7 +2433,7 @@ index 5d140e1..b68ca5a 100644
                  "update",
                  "status",
                  "config",
-@@ -861,6 +874,8 @@ mod tests {
+@@ -911,6 +924,8 @@ mod tests {
          assert!(DEFAULT_CONFIG.contains("On Windows, true writes no config"));
          assert!(DEFAULT_CONFIG.contains("provides no connection reuse"));
          assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
@@ -2424,10 +2443,10 @@ index 5d140e1..b68ca5a 100644
  
      #[test]
 diff --git a/src/protocol/wire.rs b/src/protocol/wire.rs
-index 9cc2924..3c7eabb 100644
+index 655f47cb..b969ea56 100644
 --- a/src/protocol/wire.rs
 +++ b/src/protocol/wire.rs
-@@ -819,19 +819,23 @@ impl From<io::Error> for FramingError {
+@@ -866,19 +866,23 @@ impl From<io::Error> for FramingError {
  /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
  /// (would be truncated by the length prefix cast).
  pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
@@ -2456,7 +2475,7 @@ index 9cc2924..3c7eabb 100644
      writer.flush()?;
      Ok(())
  }
-@@ -1443,6 +1447,39 @@ mod tests {
+@@ -1575,6 +1579,39 @@ mod tests {
          assert_eq!(msg, decoded);
      }
  
@@ -2497,7 +2516,7 @@ index 9cc2924..3c7eabb 100644
      fn framing_large_payload_roundtrip() {
          // Create a Frame message that is ≥128 KB.
 diff --git a/src/remote.rs b/src/remote.rs
-index 6186d83..6f5de59 100644
+index 6186d837..6f5de59f 100644
 --- a/src/remote.rs
 +++ b/src/remote.rs
 @@ -4,6 +4,8 @@
@@ -2518,7 +2537,7 @@ index 6186d83..6f5de59 100644
  #[cfg(unix)]
  pub(crate) use unix::run_remote_client_bridge;
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index dc20501..627dbc6 100644
+index 4ad21f9e..21b4eed0 100644
 --- a/src/remote/launcher.rs
 +++ b/src/remote/launcher.rs
 @@ -15,6 +15,7 @@ use serde::Deserialize;
@@ -2529,12 +2548,15 @@ index dc20501..627dbc6 100644
  #[cfg(unix)]
  use super::unix as sys;
  #[cfg(windows)]
-@@ -206,12 +207,19 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+@@ -206,15 +207,19 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
          remote.keybindings,
          remote.live_handoff,
      );
 -    let manage_ssh_config = timed("phase: load config", "", || {
--        crate::config::Config::load().config.remote.manage_ssh_config
+-        crate::config::Config::load()
+-            .config
+-            .remote
+-            .manage_ssh_config
 +    let remote_config = timed("phase: load config", "", || {
 +        crate::config::Config::load().config.remote
      });
@@ -2553,7 +2575,7 @@ index dc20501..627dbc6 100644
      })?;
      timed("phase: ensure remote server ready", "", || {
          ensure_remote_server_ready(
-@@ -220,8 +228,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+@@ -223,8 +228,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
              prepared_remote.installed_or_replaced,
              prepared_remote.stop_after_install_approved,
              remote.live_handoff,
@@ -2566,7 +2588,7 @@ index dc20501..627dbc6 100644
  
      let _bridge = sys::SshStdioBridge::start(
          remote.target,
-@@ -242,7 +254,22 @@ pub(crate) struct RemotePlatform {
+@@ -245,7 +254,22 @@ pub(crate) struct RemotePlatform {
  }
  
  impl RemotePlatform {
@@ -2590,7 +2612,7 @@ index dc20501..627dbc6 100644
          let os = match os.trim() {
              "Linux" => "linux",
              "Darwin" => "macos",
-@@ -405,7 +432,7 @@ struct RemoteManifestReleaseRef<'a> {
+@@ -408,7 +432,7 @@ struct RemoteManifestReleaseRef<'a> {
      assets: &'a BTreeMap<String, RemoteAssetRef>,
  }
  
@@ -2599,7 +2621,7 @@ index dc20501..627dbc6 100644
      crate::build_info::version()
  }
  
-@@ -427,6 +454,9 @@ struct PreparedRemoteHerdr {
+@@ -430,6 +454,9 @@ struct PreparedRemoteHerdr {
      remote_herdr: RemoteHerdr,
      installed_or_replaced: bool,
      stop_after_install_approved: bool,
@@ -2609,7 +2631,7 @@ index dc20501..627dbc6 100644
  }
  
  pub(crate) struct RemoteSsh {
-@@ -435,9 +465,9 @@ pub(crate) struct RemoteSsh {
+@@ -438,9 +465,9 @@ pub(crate) struct RemoteSsh {
  }
  
  impl RemoteSsh {
@@ -2621,7 +2643,7 @@ index dc20501..627dbc6 100644
                  .inspect_err(|err| {
                      tracing::debug!(%err, "could not write managed ssh config; using plain ssh");
                  })
-@@ -472,7 +502,7 @@ impl RemoteSsh {
+@@ -475,7 +502,7 @@ impl RemoteSsh {
          command
      }
  
@@ -2630,7 +2652,7 @@ index dc20501..627dbc6 100644
          timed("ssh sh script", script_summary(script), || {
              let mut child = self
                  .command()
-@@ -625,37 +655,51 @@ impl InstallSource {
+@@ -628,37 +655,51 @@ impl InstallSource {
  fn prepare_remote_herdr(
      ssh: &RemoteSsh,
      live_handoff_enabled: bool,
@@ -2699,7 +2721,7 @@ index dc20501..627dbc6 100644
          stop_after_install_approved = confirm_remote_install_with_running_server(
              ssh,
              status_probe_herdr,
-@@ -685,140 +729,10 @@ fn prepare_remote_herdr(
+@@ -688,140 +729,10 @@ fn prepare_remote_herdr(
          remote_herdr,
          installed_or_replaced: true,
          stop_after_install_approved,
@@ -2841,7 +2863,7 @@ index dc20501..627dbc6 100644
  fn remote_herdr_from_path(remote_herdr: &RemoteHerdr, path: &str) -> Option<RemoteHerdr> {
      let path = path.trim();
      if !path.starts_with('/') {
-@@ -982,8 +896,20 @@ fn ensure_remote_server_ready(
+@@ -985,8 +896,20 @@ fn ensure_remote_server_ready(
      remote_binary_changed: bool,
      stop_after_install_approved: bool,
      live_handoff_enabled: bool,
@@ -2863,7 +2885,7 @@ index dc20501..627dbc6 100644
      let RemoteServerStatus::Running {
          version,
          protocol,
-@@ -1218,6 +1144,11 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
+@@ -1221,6 +1144,11 @@ fn parse_client_status_json(status: &str) -> Option<RemoteClientStatusJson> {
      serde_json::from_str(status).ok()
  }
  
@@ -2875,7 +2897,7 @@ index dc20501..627dbc6 100644
  fn parse_remote_server_status_json(status: &str) -> io::Result<RemoteServerStatus> {
      let parsed: RemoteServerStatusJson = serde_json::from_str(status).map_err(|err| {
          io::Error::other(format!(
-@@ -1610,7 +1541,7 @@ fn reattach_command(
+@@ -1613,7 +1541,7 @@ fn reattach_command(
      command
  }
  
@@ -2884,7 +2906,7 @@ index dc20501..627dbc6 100644
      if !value.is_empty()
          && value.chars().all(|ch| {
              ch.is_ascii_alphanumeric()
-@@ -1626,7 +1557,7 @@ fn shell_quote(value: &str) -> String {
+@@ -1629,7 +1557,7 @@ fn shell_quote(value: &str) -> String {
      format!("'{}'", value.replace('\'', "'\\''"))
  }
  
@@ -2893,7 +2915,7 @@ index dc20501..627dbc6 100644
      let stderr = String::from_utf8_lossy(&output.stderr);
      let stderr = stderr.trim();
      if stderr.is_empty() {
-@@ -1988,8 +1919,8 @@ mod tests {
+@@ -1994,8 +1922,8 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -2904,7 +2926,7 @@ index dc20501..627dbc6 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2004,8 +1935,7 @@ mod tests {
+@@ -2010,8 +1938,7 @@ mod tests {
              arch: "x86_64",
          });
          let remote_herdr =
@@ -2914,7 +2936,7 @@ index dc20501..627dbc6 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2020,8 +1950,7 @@ mod tests {
+@@ -2026,8 +1953,7 @@ mod tests {
              arch: "aarch64",
          });
          let remote_herdr =
@@ -2924,7 +2946,7 @@ index dc20501..627dbc6 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2030,76 +1959,29 @@ mod tests {
+@@ -2036,76 +1962,28 @@ mod tests {
          assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
      }
  
@@ -2956,11 +2978,10 @@ index dc20501..627dbc6 100644
 -        );
  
 -        assert_eq!(candidates.len(), 1);
-+        assert!(remote_herdr_from_path(
-+            &remote_herdr,
-+            "/home/can/.local/share/mise/shims/herdr"
-+        )
-+        .is_none());
++        assert!(
++            remote_herdr_from_path(&remote_herdr, "/home/can/.local/share/mise/shims/herdr")
++                .is_none()
++        );
          assert_eq!(
 -            candidates[0].shell_path,
 +            remote_herdr_from_path(
@@ -3012,7 +3033,7 @@ index dc20501..627dbc6 100644
      #[test]
      fn remote_path_discovery_quotes_single_quotes_in_discovered_binary() {
          let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
-@@ -2107,8 +1989,7 @@ mod tests {
+@@ -2113,8 +1991,7 @@ mod tests {
              arch: "x86_64",
          });
          let remote_herdr =
@@ -3022,7 +3043,7 @@ index dc20501..627dbc6 100644
  
          assert_eq!(
              remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
-@@ -2122,7 +2003,7 @@ mod tests {
+@@ -2128,7 +2005,7 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -3031,7 +3052,7 @@ index dc20501..627dbc6 100644
  
          assert!(remote_herdr.is_none());
      }
-@@ -2133,7 +2014,7 @@ mod tests {
+@@ -2139,7 +2016,7 @@ mod tests {
              os: "linux",
              arch: "x86_64",
          });
@@ -3042,10 +3063,10 @@ index dc20501..627dbc6 100644
      }
 diff --git a/src/remote/probe.rs b/src/remote/probe.rs
 new file mode 100644
-index 0000000..dcbc6a3
+index 00000000..9eb83228
 --- /dev/null
 +++ b/src/remote/probe.rs
-@@ -0,0 +1,596 @@
+@@ -0,0 +1,606 @@
 +//! Combined remote setup probe (i0002 W2).
 +//!
 +//! The launcher historically ran 4–5 sequential ssh commands before the
@@ -3248,6 +3269,15 @@ index 0000000..dcbc6a3
 +    done
 +    unset IFS
 +fi
++# Non-POSIX login shells such as xonsh reject `command -v`; retry in the
++# /bin/sh process running this probe while retaining login-shell candidates.
++path_out=$(command -v herdr 2>/dev/null)
++IFS='
++'
++for line in $path_out; do
++    probe "$line" path_candidate
++done
++unset IFS
 +if [ -n "${HOME:-}" ]; then
 +    probe "$HOME/.local/bin/herdr" candidate
 +fi
@@ -3281,10 +3311,7 @@ index 0000000..dcbc6a3
 +/// comes from the cache, so no uname round trip is needed either).
 +pub(crate) fn fast_probe_script(cached_path: &str) -> String {
 +    let mut script = probe_script_prelude("# herdr remote probe (cached path)");
-+    script.push_str(&format!(
-+        "probe {} candidate\n",
-+        shell_quote(cached_path)
-+    ));
++    script.push_str(&format!("probe {} candidate\n", shell_quote(cached_path)));
 +    script.push_str(PROBE_SCRIPT_EPILOGUE);
 +    script
 +}
@@ -3300,7 +3327,9 @@ index 0000000..dcbc6a3
 +    };
 +
 +    for line in stdout.lines() {
-+        let Some(rest) = line.strip_prefix(SENTINEL).and_then(|rest| rest.strip_prefix(' '))
++        let Some(rest) = line
++            .strip_prefix(SENTINEL)
++            .and_then(|rest| rest.strip_prefix(' '))
 +        else {
 +            continue;
 +        };
@@ -3562,8 +3591,9 @@ index 0000000..dcbc6a3
 +
 +        assert!(script.contains("probe \"$HOME/.local/bin/herdr\" candidate"));
 +        assert!(script.contains(&format!("version={}", shell_quote(&current_version()))));
-+        assert!(script
-+            .contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/bin/herdr\""));
++        assert!(
++            script.contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/bin/herdr\"")
++        );
 +        assert!(script.contains("probe \"$HOME/.local/share/mise/installs/herdr/$version/herdr\""));
 +        assert!(script.contains(
 +            "probe \"$HOME/.local/share/mise/installs/github-ogulcancelik-herdr/$version/herdr\""
@@ -3580,7 +3610,8 @@ index 0000000..dcbc6a3
 +        // Single round trip: uname, PATH lookup, and server status are all in
 +        // the same script.
 +        assert!(script.contains("uname -s"));
-+        assert!(script.contains("command -v herdr"));
++        assert!(script.contains("\"$SHELL\" -c 'command -v herdr'"));
++        assert!(script.contains("path_out=$(command -v herdr 2>/dev/null)"));
 +        assert!(script.contains("status server --json"));
 +        assert!(script.contains("status client --json"));
 +    }
@@ -3644,10 +3675,10 @@ index 0000000..dcbc6a3
 +}
 diff --git a/src/remote/tcp_relay.rs b/src/remote/tcp_relay.rs
 new file mode 100644
-index 0000000..de7e484
+index 00000000..1df80ef5
 --- /dev/null
 +++ b/src/remote/tcp_relay.rs
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,163 @@
 +//! `herdr remote-tcp-relay <host> <port>` — a minimal ssh ProxyCommand that
 +//! owns the TCP connection with `TCP_NODELAY` set (i0002 W1).
 +//!
@@ -3697,7 +3728,10 @@ index 0000000..de7e484
 +
 +fn connect_nodelay(host: &str, port: u16) -> io::Result<TcpStream> {
 +    let addrs = (host, port).to_socket_addrs().map_err(|err| {
-+        io::Error::new(err.kind(), format!("failed to resolve {host}:{port}: {err}"))
++        io::Error::new(
++            err.kind(),
++            format!("failed to resolve {host}:{port}: {err}"),
++        )
 +    })?;
 +    let mut last_err = None;
 +    for addr in addrs {
@@ -3768,10 +3802,7 @@ index 0000000..de7e484
 +    #[test]
 +    fn parse_relay_args_accepts_host_and_port() {
 +        let args = vec!["example.com".to_string(), "22".to_string()];
-+        assert_eq!(
-+            parse_relay_args(&args),
-+            Ok(("example.com".to_string(), 22))
-+        );
++        assert_eq!(parse_relay_args(&args), Ok(("example.com".to_string(), 22)));
 +    }
 +
 +    #[test]
@@ -3780,12 +3811,9 @@ index 0000000..de7e484
 +        assert!(parse_relay_args(&["host".to_string()]).is_err());
 +        assert!(parse_relay_args(&["host".to_string(), "notaport".to_string()]).is_err());
 +        assert!(parse_relay_args(&[String::new(), "22".to_string()]).is_err());
-+        assert!(parse_relay_args(&[
-+            "host".to_string(),
-+            "22".to_string(),
-+            "extra".to_string()
-+        ])
-+        .is_err());
++        assert!(
++            parse_relay_args(&["host".to_string(), "22".to_string(), "extra".to_string()]).is_err()
++        );
 +    }
 +
 +    #[test]
@@ -3815,7 +3843,7 @@ index 0000000..de7e484
 +    }
 +}
 diff --git a/src/remote/unix.rs b/src/remote/unix.rs
-index 70fe163..6e15701 100644
+index 70fe163a..6e157019 100644
 --- a/src/remote/unix.rs
 +++ b/src/remote/unix.rs
 @@ -259,7 +259,9 @@ fn ssh_config_quote(path: &str) -> String {
@@ -3848,7 +3876,7 @@ index 70fe163..6e15701 100644
          let control_path = managed_config.options.control_path.clone();
          let ssh = RemoteSsh {
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
-index 383343c..50a630c 100644
+index 26ba022a..29a73dfb 100644
 --- a/src/remote/windows.rs
 +++ b/src/remote/windows.rs
 @@ -15,10 +15,12 @@
@@ -3946,7 +3974,7 @@ index 383343c..50a630c 100644
  }
  
  /// Nothing to tear down: no ControlMaster connection exists on Windows.
-@@ -241,6 +281,11 @@ fn bridge_connection(
+@@ -245,6 +285,11 @@ fn bridge_connection(
      let status = child.wait()?;
      let _ = download.join();
      stop.store(true, Ordering::Release);
@@ -3958,7 +3986,7 @@ index 383343c..50a630c 100644
      let _ = upload.join();
      // All Arc clones are gone here: the pipe handle closes, which the client
      // observes as a broken pipe and reports as a lost connection.
-@@ -256,8 +301,10 @@ fn bridge_connection(
+@@ -260,8 +305,10 @@ fn bridge_connection(
      }
  }
  
@@ -3971,7 +3999,7 @@ index 383343c..50a630c 100644
  fn pump_client_to_ssh(
      stream: &LocalStream,
      child_stdin: &mut (impl io::Write + Send),
-@@ -268,32 +315,53 @@ fn pump_client_to_ssh(
+@@ -272,32 +319,53 @@ fn pump_client_to_ssh(
          if stop.load(Ordering::Acquire) {
              return;
          }
@@ -4043,7 +4071,7 @@ index 383343c..50a630c 100644
  #[cfg(test)]
  mod tests {
      use super::super::launcher::RemotePlatform;
-@@ -317,9 +385,29 @@ mod tests {
+@@ -321,9 +389,29 @@ mod tests {
          );
      }
  
@@ -4074,7 +4102,7 @@ index 383343c..50a630c 100644
          let mut command = Command::new("ssh");
          apply_managed_ssh_options(&mut command, Some(config.options()));
          let args = command
-@@ -341,6 +429,79 @@ mod tests {
+@@ -345,6 +433,79 @@ mod tests {
          assert_eq!(plain.get_args().count(), 0);
      }
  

@@ -1,7 +1,7 @@
 name: Release (Windows)
 
 # Builds the native Windows herdr binary with `--remote` support by cloning
-# upstream (ogulcancelik/herdr) at the release tag pinned in
+# upstream (herdrdev/herdr) at the release tag pinned in
 # patches/herdr/BASE, verifying its commit via BASE_COMMIT, applying the patch
 # series with `git am`, and publishing
 # the Windows executable and Linux hcode shim as GitHub release assets.
@@ -17,7 +17,7 @@ permissions:
 
 env:
   RUST_TOOLCHAIN_VERSION: 1.96.1
-  UPSTREAM_REPO: https://github.com/ogulcancelik/herdr
+  UPSTREAM_REPO: https://github.com/herdrdev/herdr
   ZIG_VERSION: 0.15.2
   ZIG_SHA256: 3a0ed1e8799a2f8ce2a6e6290a9ff22e6906f8227865911fb7ddedc3cc14cb0c
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache

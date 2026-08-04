@@ -1,7 +1,7 @@
-From d8eadc086633fb6c3e6576c249232f361107011c Mon Sep 17 00:00:00 2001
+From 2ebcff541e4bf2ee2a27380808239bda76afb075 Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 1/4] feat(windows): support native remote attach (IV-0001)
+Subject: [PATCH 1/3] feat(windows): support native remote attach (IV-0001)
 
 Combine the complete IV-0001 ownership boundary:
 
@@ -10,23 +10,23 @@ Combine the complete IV-0001 ownership boundary:
 - fork update safeguards and remote attach timing diagnostics
 ---
  src/client/input.rs             |   12 +
- src/client/input/windows_vti.rs |  261 ++-
+ src/client/input/windows_vti.rs |  277 ++-
  src/client/mod.rs               |   37 +-
  src/ipc.rs                      |   10 +-
  src/main.rs                     |   49 +-
  src/pane/terminal.rs            |  136 +-
  src/platform/mod.rs             |    4 +-
  src/remote.rs                   |  156 +-
- src/remote/launcher.rs          | 2574 ++++++++++++++++++++++++
- src/remote/unix.rs              | 3252 ++++---------------------------
- src/remote/windows.rs           |  370 ++++
+ src/remote/launcher.rs          | 2580 ++++++++++++++++++++++++
+ src/remote/unix.rs              | 3262 ++++---------------------------
+ src/remote/windows.rs           |  374 ++++
  src/update.rs                   |   35 +-
- 12 files changed, 3823 insertions(+), 3073 deletions(-)
+ 12 files changed, 3845 insertions(+), 3087 deletions(-)
  create mode 100644 src/remote/launcher.rs
  create mode 100644 src/remote/windows.rs
 
 diff --git a/src/client/input.rs b/src/client/input.rs
-index 1d55754..f8d6414 100644
+index fd374491..4ecd3451 100644
 --- a/src/client/input.rs
 +++ b/src/client/input.rs
 @@ -26,6 +26,18 @@ use super::ClientLoopEvent;
@@ -49,19 +49,19 @@ index 1d55754..f8d6414 100644
  // Stdin reader thread
  // ---------------------------------------------------------------------------
 diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
-index 3b29e79..296bb91 100644
+index c95cbc43..a7a71e60 100644
 --- a/src/client/input/windows_vti.rs
 +++ b/src/client/input/windows_vti.rs
-@@ -36,7 +36,29 @@ pub(super) fn raw_console_reader_loop(
+@@ -37,9 +37,31 @@ pub(super) fn raw_console_reader_loop(
              }
              WindowsInputItems::Closed => return,
          }
 +        if !flush_pump_theme_reports(&mut pump, &event_tx) {
 +            return;
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
 +#[cfg(windows)]
 +fn flush_pump_theme_reports(
 +    pump: &mut WindowsInputPump,
@@ -75,14 +75,16 @@ index 3b29e79..296bb91 100644
 +    }
 +    if outbox.bytes.is_empty() {
 +        return true;
-     }
++    }
 +    event_tx
 +        .blocking_send(ClientLoopEvent::StdinThemeReport(outbox.bytes))
 +        .is_ok()
- }
- 
++}
++
  #[cfg(windows)]
-@@ -194,6 +216,15 @@ struct WindowsInputMapper {
+ fn process_platform_input_items(
+     items: Vec<PlatformInputItem>,
+@@ -185,6 +207,15 @@ struct WindowsInputMapper {
  struct WindowsInputPump {
      framer: crate::raw_input::RawInputFramer,
      paste_from_win32_key_records: bool,
@@ -98,7 +100,7 @@ index 3b29e79..296bb91 100644
  }
  
  impl Default for WindowsInputPump {
-@@ -201,6 +232,7 @@ impl Default for WindowsInputPump {
+@@ -192,6 +223,7 @@ impl Default for WindowsInputPump {
          Self {
              framer: crate::raw_input::RawInputFramer::for_host_input(),
              paste_from_win32_key_records: false,
@@ -106,7 +108,7 @@ index 3b29e79..296bb91 100644
          }
      }
  }
-@@ -215,7 +247,6 @@ enum PlatformInputItem {
+@@ -206,7 +238,6 @@ enum PlatformInputItem {
          win32_paste_bytes: Vec<u8>,
      },
      PasteAwareKey {
@@ -114,7 +116,7 @@ index 3b29e79..296bb91 100644
          win32_paste_bytes: Vec<u8>,
          events: Vec<crate::protocol::ClientInputEvent>,
      },
-@@ -269,17 +300,20 @@ impl WindowsInputPump {
+@@ -260,17 +291,20 @@ impl WindowsInputPump {
                  self.process_raw_events(raw_events)
              }
              PlatformInputItem::PasteAwareKey {
@@ -142,7 +144,7 @@ index 3b29e79..296bb91 100644
                      self.process_raw_events(raw_events)
                  } else {
                      let raw_events = self.framer.flush_timeout();
-@@ -306,9 +340,45 @@ impl WindowsInputPump {
+@@ -297,9 +331,46 @@ impl WindowsInputPump {
          {
              self.paste_from_win32_key_records = false;
          }
@@ -162,19 +164,20 @@ index 3b29e79..296bb91 100644
 +        match event {
 +            crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
 +                self.theme_reports.bytes.extend_from_slice(
-+                    crate::terminal_theme::osc_set_default_color_sequence(*kind, *color)
-+                        .as_bytes(),
++                    crate::terminal_theme::osc_set_default_color_sequence(*kind, *color).as_bytes(),
 +                );
 +            }
 +            crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
-+                self.theme_reports.bytes.extend_from_slice(match appearance {
-+                    crate::terminal_theme::HostAppearance::Dark => {
-+                        crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT
-+                    }
-+                    crate::terminal_theme::HostAppearance::Light => {
-+                        crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT
-+                    }
-+                });
++                self.theme_reports
++                    .bytes
++                    .extend_from_slice(match appearance {
++                        crate::terminal_theme::HostAppearance::Dark => {
++                            crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT
++                        }
++                        crate::terminal_theme::HostAppearance::Light => {
++                            crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT
++                        }
++                    });
 +                self.theme_reports.requery = true;
 +            }
 +            _ => {}
@@ -188,7 +191,7 @@ index 3b29e79..296bb91 100644
      fn raw_events_to_client_events(
          events: Vec<crate::raw_input::RawInputEvent>,
      ) -> Vec<crate::protocol::ClientInputEvent> {
-@@ -412,8 +482,7 @@ impl WindowsInputMapper {
+@@ -404,8 +475,7 @@ impl WindowsInputMapper {
                  if let Some((bytes, event)) = self.synthetic_modified_key_event(key, kind) {
                      flush_pending_win32_before_items = true;
                      items.push(PlatformInputItem::PasteAwareKey {
@@ -198,7 +201,7 @@ index 3b29e79..296bb91 100644
                          events: vec![event],
                      });
                  } else if let Some(bytes) = self.synthetic_utf16_unit_to_bytes(key.unicode) {
-@@ -430,8 +499,7 @@ impl WindowsInputMapper {
+@@ -422,8 +492,7 @@ impl WindowsInputMapper {
          let events = self.translate_semantic_key_events(key);
          let items = if let Some(bytes) = self.paste_payload_bytes_for_key(key) {
              vec![PlatformInputItem::PasteAwareKey {
@@ -208,7 +211,7 @@ index 3b29e79..296bb91 100644
                  events,
              }]
          } else {
-@@ -479,7 +547,6 @@ impl WindowsInputMapper {
+@@ -474,7 +543,6 @@ impl WindowsInputMapper {
                          });
                      } else {
                          items.push(PlatformInputItem::PasteAwareKey {
@@ -216,7 +219,7 @@ index 3b29e79..296bb91 100644
                              win32_paste_bytes,
                              events: self.translate_semantic_key_events(record),
                          })
-@@ -847,18 +914,35 @@ impl WindowsWin32InputModeFramer {
+@@ -905,18 +973,35 @@ impl WindowsWin32InputModeFramer {
      }
  }
  
@@ -261,7 +264,7 @@ index 3b29e79..296bb91 100644
      Some(WindowsKeyRecord {
          key_down,
          repeat_count,
-@@ -1160,6 +1244,46 @@ mod tests {
+@@ -1250,6 +1335,49 @@ mod tests {
          .collect()
      }
  
@@ -280,7 +283,10 @@ index 3b29e79..296bb91 100644
 +        assert_eq!(events, Vec::new(), "theme responses must not become input");
 +        let outbox = translator.pump.take_theme_reports();
 +        let reports = String::from_utf8(outbox.bytes).unwrap();
-+        assert_eq!(reports, "\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\");
++        assert_eq!(
++            reports,
++            "\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\"
++        );
 +        assert!(!outbox.requery);
 +
 +        // Reports drain once.
@@ -308,7 +314,7 @@ index 3b29e79..296bb91 100644
      #[test]
      fn vti_bracketed_paste_records_emit_single_paste() {
          let records = "\x1b[200~alpha\rbravo\rcharlie\x1b[201~"
-@@ -1188,6 +1312,90 @@ mod tests {
+@@ -1278,6 +1406,96 @@ mod tests {
          );
      }
  
@@ -325,6 +331,9 @@ index 3b29e79..296bb91 100644
 +                code: crate::protocol::ClientKeyCode::Enter,
 +                modifiers: 0,
 +                kind: crate::protocol::ClientKeyKind::Press,
++                repeat_count: 1,
++                generated_text: None,
++                source: crate::protocol::ClientKeySource::Synthesized,
 +            }]
 +        );
 +    }
@@ -341,6 +350,9 @@ index 3b29e79..296bb91 100644
 +                code: crate::protocol::ClientKeyCode::Enter,
 +                modifiers: 0,
 +                kind: crate::protocol::ClientKeyKind::Press,
++                repeat_count: 1,
++                generated_text: None,
++                source: crate::protocol::ClientKeySource::Synthesized,
 +            }]
 +        );
 +    }
@@ -399,7 +411,27 @@ index 3b29e79..296bb91 100644
      #[test]
      fn vti_win32_input_mode_decoded_paste_handles_shift_repeats_and_releases() {
          let mut records = win32_input_mode_encoded_key_bytes(b"\x1b[200~");
-@@ -1690,7 +1898,12 @@ mod tests {
+@@ -1335,7 +1553,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn vti_win32_input_mode_decoded_paste_flag_clears_after_raw_completion() {
++    fn vti_plain_paste_decodes_embedded_win32_record_after_prior_mixed_paste() {
+         let mut records = win32_input_mode_encoded_key_bytes(b"\x1b[200~");
+         records.extend("one\x1b[201~".chars().map(key_char));
+         records.extend(
+@@ -1348,9 +1566,7 @@ mod tests {
+             translate(records),
+             vec![
+                 crate::protocol::ClientInputEvent::Paste { text: "one".into() },
+-                crate::protocol::ClientInputEvent::Paste {
+-                    text: "x\x1b[65;30;97;1;0;1_y".into(),
+-                },
++                crate::protocol::ClientInputEvent::Paste { text: "xay".into() },
+             ]
+         );
+     }
+@@ -2026,7 +2242,12 @@ mod tests {
      }
  
      #[test]
@@ -413,7 +445,7 @@ index 3b29e79..296bb91 100644
          let records = "\x1b[200~alpha\x1b[13;28;13;1;16;1_bravo\x1b[201~"
              .chars()
              .map(key_char);
-@@ -1698,7 +1911,7 @@ mod tests {
+@@ -2034,7 +2255,7 @@ mod tests {
          assert_eq!(
              translate(records),
              vec![crate::protocol::ClientInputEvent::Paste {
@@ -423,10 +455,10 @@ index 3b29e79..296bb91 100644
          );
      }
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 011de93..6b6c621 100644
+index c0fe73d3..b686ad16 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -663,7 +663,6 @@ fn requested_render_encoding() -> RenderEncoding {
+@@ -667,7 +667,6 @@ fn requested_render_encoding() -> RenderEncoding {
      }
  }
  
@@ -434,7 +466,7 @@ index 011de93..6b6c621 100644
  fn is_remote_client_process() -> bool {
      std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
  }
-@@ -676,11 +675,9 @@ fn is_remote_client_process() -> bool {
+@@ -680,11 +679,9 @@ fn is_remote_client_process() -> bool {
  /// window; on a high-latency link that easily exceeds 5s, so it gets a far
  /// larger budget. See issue #753.
  const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -446,7 +478,7 @@ index 011de93..6b6c621 100644
      if is_remote_client_process() {
          return REMOTE_HANDSHAKE_READ_TIMEOUT;
      }
-@@ -806,6 +803,12 @@ enum ClientLoopEvent {
+@@ -810,6 +807,12 @@ enum ClientLoopEvent {
      /// Structured input events from platforms without Unix-style stdin bytes.
      #[cfg(windows)]
      StdinEvents(Vec<crate::protocol::ClientInputEvent>),
@@ -459,7 +491,7 @@ index 011de93..6b6c621 100644
      /// Terminal resize detected.
      Resize(u16, u16, u32, u32),
      /// Server message received.
-@@ -1493,6 +1496,16 @@ async fn run_client_loop(
+@@ -1532,6 +1535,16 @@ async fn run_client_loop(
                      return Err(ClientError::ConnectionLost(e));
                  }
              }
@@ -475,8 +507,8 @@ index 011de93..6b6c621 100644
 +            }
              ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
                  state.reported_size = (new_cols, new_rows);
-                 let msg = ClientMessage::Resize {
-@@ -2118,7 +2131,14 @@ fn query_host_terminal_theme() {
+                 // Resizing invalidates the host-side blit baseline.
+@@ -2225,7 +2238,14 @@ fn query_host_terminal_theme() {
  }
  
  fn should_query_host_terminal_theme() -> bool {
@@ -492,7 +524,7 @@ index 011de93..6b6c621 100644
  }
  
  fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
-@@ -2429,16 +2449,13 @@ mod tests {
+@@ -2589,8 +2609,8 @@ mod tests {
      }
  
      #[test]
@@ -501,6 +533,9 @@ index 011de93..6b6c621 100644
 +    fn host_terminal_theme_query_is_enabled_on_all_platforms() {
 +        assert!(should_query_host_terminal_theme());
      }
+ 
+     #[test]
+@@ -2625,10 +2645,7 @@ mod tests {
  
      #[test]
      fn color_scheme_reports_are_enabled_only_for_full_clients() {
@@ -513,7 +548,7 @@ index 011de93..6b6c621 100644
      }
  
 diff --git a/src/ipc.rs b/src/ipc.rs
-index c293a27..ce164b0 100644
+index c293a278..ce164b0f 100644
 --- a/src/ipc.rs
 +++ b/src/ipc.rs
 @@ -141,7 +141,7 @@ pub(crate) fn poll_local_stream_read(
@@ -544,7 +579,7 @@ index c293a27..ce164b0 100644
  
      let LocalStream::NamedPipe(pipe) = stream;
 diff --git a/src/main.rs b/src/main.rs
-index a73423b..5d140e1 100644
+index 27c1d92f..5cf3d93c 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -58,7 +58,6 @@ mod agent_resume;
@@ -555,7 +590,7 @@ index a73423b..5d140e1 100644
  mod checksum;
  mod cli;
  mod client;
-@@ -147,15 +146,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -148,15 +147,17 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # new_cwd = "follow"
  
  [update]
@@ -579,7 +614,7 @@ index a73423b..5d140e1 100644
  # manifest_check = true
  
  [keys]
-@@ -377,14 +378,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+@@ -386,14 +387,13 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
  # resume_agents_on_restore = true
  
  [remote]
@@ -601,7 +636,7 @@ index a73423b..5d140e1 100644
  # manage_ssh_config = true
  
  [experimental]
-@@ -844,6 +844,25 @@ fn main() -> io::Result<()> {
+@@ -894,6 +894,25 @@ fn main() -> io::Result<()> {
  mod tests {
      use super::*;
  
@@ -628,10 +663,10 @@ index a73423b..5d140e1 100644
      fn nested_herdr_blocks_when_env_is_set() {
          let config = config::Config::default();
 diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
-index 2c83f8f..e10e90d 100644
+index b90c63f1..7a2b2385 100644
 --- a/src/pane/terminal.rs
 +++ b/src/pane/terminal.rs
-@@ -1778,8 +1778,12 @@ impl GhosttyPaneTerminal {
+@@ -1933,8 +1933,12 @@ impl GhosttyPaneTerminal {
              .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
          let default_fg = colors
              .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
@@ -646,7 +681,7 @@ index 2c83f8f..e10e90d 100644
          let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
  
          let mut row_iterator = match crate::ghostty::RowIterator::new() {
-@@ -2037,8 +2041,12 @@ fn ghostty_collect_dirty_patch(
+@@ -2192,8 +2196,12 @@ fn ghostty_collect_dirty_patch(
          .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
      let default_fg = colors
          .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
@@ -661,7 +696,7 @@ index 2c83f8f..e10e90d 100644
      let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
  
      let Ok(mut row_iterator) = crate::ghostty::RowIterator::new() else {
-@@ -2601,19 +2609,35 @@ fn ghostty_cell_style(
+@@ -2770,19 +2778,35 @@ fn ghostty_cell_style(
      if basic.style.invisible {
          fg = bg.or(default_bg);
      }
@@ -703,7 +738,7 @@ index 2c83f8f..e10e90d 100644
      }
  
      let mut style = ghostty_default_style(fg, bg);
-@@ -2639,10 +2663,40 @@ fn ghostty_cell_style(
+@@ -2808,10 +2832,40 @@ fn ghostty_cell_style(
      if basic.style.strikethrough {
          modifiers |= Modifier::CROSSED_OUT;
      }
@@ -744,7 +779,7 @@ index 2c83f8f..e10e90d 100644
  #[derive(Debug)]
  enum OrderedPtyResponseEvent {
      DefaultColor(DefaultColorTrackedEvent),
-@@ -5602,6 +5656,68 @@ mod tests {
+@@ -6115,6 +6169,68 @@ mod tests {
          assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
      }
  
@@ -814,10 +849,10 @@ index 2c83f8f..e10e90d 100644
      fn trim_trailing_blank_rows_drops_empty_viewport_tail() {
          let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
 diff --git a/src/platform/mod.rs b/src/platform/mod.rs
-index fbde21b..8647ef1 100644
+index 38d797d1..661c830a 100644
 --- a/src/platform/mod.rs
 +++ b/src/platform/mod.rs
-@@ -53,7 +53,9 @@ pub(crate) struct PlatformCapabilities {
+@@ -60,7 +60,9 @@ pub(crate) struct PlatformCapabilities {
  pub(crate) const fn capabilities() -> PlatformCapabilities {
      PlatformCapabilities {
          live_handoff: cfg!(unix),
@@ -829,7 +864,7 @@ index fbde21b..8647ef1 100644
          preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
      }
 diff --git a/src/remote.rs b/src/remote.rs
-index ce4ca91..6186d83 100644
+index ce4ca91b..6186d837 100644
 --- a/src/remote.rs
 +++ b/src/remote.rs
 @@ -1,151 +1,23 @@
@@ -1000,10 +1035,10 @@ index ce4ca91..6186d83 100644
      if is_remote_auth_error(err) {
 diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
 new file mode 100644
-index 0000000..dc20501
+index 00000000..4ad21f9e
 --- /dev/null
 +++ b/src/remote/launcher.rs
-@@ -0,0 +1,2574 @@
+@@ -0,0 +1,2580 @@
 +//! Remote thin-client launcher over SSH command stdio.
 +//!
 +//! Platform-neutral: the pieces that differ between Unix and Windows (the
@@ -1213,7 +1248,10 @@ index 0000000..dc20501
 +        remote.live_handoff,
 +    );
 +    let manage_ssh_config = timed("phase: load config", "", || {
-+        crate::config::Config::load().config.remote.manage_ssh_config
++        crate::config::Config::load()
++            .config
++            .remote
++            .manage_ssh_config
 +    });
 +    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
 +    let prepared_remote = timed("phase: prepare remote herdr", "", || {
@@ -2642,7 +2680,10 @@ index 0000000..dc20501
 +    }
 +}
 +
-+pub(crate) fn copy_flush<R: io::Read, W: io::Write>(reader: &mut R, writer: &mut W) -> io::Result<u64> {
++pub(crate) fn copy_flush<R: io::Read, W: io::Write>(
++    reader: &mut R,
++    writer: &mut W,
++) -> io::Result<u64> {
 +    let mut buffer = [0_u8; 16 * 1024];
 +    let mut total = 0;
 +
@@ -3579,7 +3620,7 @@ index 0000000..dc20501
 +    }
 +}
 diff --git a/src/remote/unix.rs b/src/remote/unix.rs
-index 813091b..70fe163 100644
+index 6fe927c1..70fe163a 100644
 --- a/src/remote/unix.rs
 +++ b/src/remote/unix.rs
 @@ -1,194 +1,87 @@
@@ -3835,7 +3876,7 @@ index 813091b..70fe163 100644
  }
  
  pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
-@@ -238,2767 +131,408 @@ fn ensure_remote_server_running() -> io::Result<()> {
+@@ -238,2777 +131,408 @@ fn ensure_remote_server_running() -> io::Result<()> {
      crate::server::autodetect::wait_for_server_socket(&socket_path, Duration::from_secs(5))
  }
  
@@ -4596,6 +4637,16 @@ index 813091b..70fe163 100644
 -    remote_herdr: &RemoteHerdr,
 -) -> io::Result<Option<RemoteHerdr>> {
 -    let output = ssh.user_shell_output("command -v herdr")?;
+-    if output.status.success() {
+-        let stdout = String::from_utf8_lossy(&output.stdout);
+-        if let Some(candidate) = remote_herdr_from_path_discovery(remote_herdr, &stdout) {
+-            return Ok(Some(candidate));
+-        }
+-    }
+-
+-    // Non-POSIX login shells such as xonsh reject `command -v`; retry through
+-    // /bin/sh while retaining the login-shell probe for shell-initialized PATHs.
+-    let output = ssh.sh_output("command -v herdr\n")?;
 -    if !output.status.success() {
 -        return Ok(None);
 -    }
@@ -6930,7 +6981,7 @@ index 813091b..70fe163 100644
      fn remote_env_lock() -> &'static std::sync::Mutex<()> {
          static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
          LOCK.get_or_init(|| std::sync::Mutex::new(()))
-@@ -3082,20 +616,4 @@ mod tests {
+@@ -3092,20 +616,4 @@ mod tests {
              "expected hashed fallback, got {filename}"
          );
      }
@@ -6953,10 +7004,10 @@ index 813091b..70fe163 100644
  }
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
 new file mode 100644
-index 0000000..383343c
+index 00000000..26ba022a
 --- /dev/null
 +++ b/src/remote/windows.rs
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,374 @@
 +//! Windows platform pieces of remote attach.
 +//!
 +//! The local bridge socket is a named pipe served through `crate::ipc` — the
@@ -7170,7 +7221,11 @@ index 0000000..383343c
 +    let mut child = command
 +        .spawn()
 +        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
-+    remote_timing("bridge: ssh transport spawn", target, spawn_started.elapsed());
++    remote_timing(
++        "bridge: ssh transport spawn",
++        target,
++        spawn_started.elapsed(),
++    );
 +    let mut child_stdin = child
 +        .stdin
 +        .take()
@@ -7328,7 +7383,7 @@ index 0000000..383343c
 +    }
 +}
 diff --git a/src/update.rs b/src/update.rs
-index eac917b..4459574 100644
+index 3455841d..e2504ecf 100644
 --- a/src/update.rs
 +++ b/src/update.rs
 @@ -24,6 +24,14 @@ use interprocess::local_socket::traits::Stream as _;
@@ -7346,7 +7401,7 @@ index eac917b..4459574 100644
  const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
  const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
  const HERDR_UPDATE_COMMAND: &str = "herdr update";
-@@ -1815,7 +1823,6 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
+@@ -1823,7 +1831,6 @@ fn preview_channel_rejection_for_exe_path(path: &Path) -> Option<&'static str> {
      }
  }
  
@@ -7354,7 +7409,7 @@ index eac917b..4459574 100644
  pub(crate) fn is_package_manager_managed_exe_path(path: &Path) -> bool {
      is_homebrew_managed_exe_path_following_links(path)
          || is_mise_managed_exe_path_following_links(path)
-@@ -1944,6 +1951,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
+@@ -1952,6 +1959,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
  
  /// Manual self-update command (`herdr update`).
  pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
@@ -7367,7 +7422,7 @@ index eac917b..4459574 100644
      let channel = UpdateChannel::configured();
      #[cfg(windows)]
      if channel == UpdateChannel::Stable {
-@@ -2079,6 +2092,14 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
+@@ -2087,6 +2100,14 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
  /// Background update check: only surface availability and release notes.
  /// Runs in a background thread at startup.
  pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
@@ -7382,7 +7437,7 @@ index eac917b..4459574 100644
      crate::logging::update_check_started();
      if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
          let version = version.trim();
-@@ -2233,6 +2254,18 @@ fn platform_target() -> (&'static str, &'static str) {
+@@ -2241,6 +2262,18 @@ fn platform_target() -> (&'static str, &'static str) {
  // Tests
  // ---------------------------------------------------------------------------
  

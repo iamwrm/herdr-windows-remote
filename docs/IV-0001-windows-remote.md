@@ -2,20 +2,18 @@
 
 ## Record
 
-- **Status:** the current four-patch, initiative-owned representation postdates
-  the releases; its identical implementation tree shipped as `v0.7.5-win.05`;
-  earlier `v0.7.5` stacks shipped as `v0.7.5-win.01`–`.04`
+- **Status:** implemented and refreshed as the current three-patch `v0.8.0`
+  representation; the latest published implementation tree remains
+  `v0.7.5-win.05`
 - **Upstream:** `checkouts/herdr`
-  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+  ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0001-*-IV-0001.patch` and
   `.github/workflows/release-windows.yml`
-- **Implementation base:** upstream release tag `v0.7.5` (`ef4c23f`), pinned
+- **Implementation base:** upstream release tag `v0.8.0` (`346411fa`), pinned
   in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
 - **Consumers:** [IV-0002](IV-0002-latency-improvements.md) builds latency
   improvements on this transport; [IV-0004](IV-0004-vscode-remote-open.md)
-  adds remote-to-local VS Code opening;
-  [IV-0005](IV-0005-windows-system-notifications.md) delivers system toast
-  notifications on the Windows client
+  adds remote-to-local VS Code opening
 
 ## Purpose
 
@@ -188,8 +186,8 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: the complete four-patch series applies with `git am` to a fresh
-  worktree at `v0.7.5` and reproduces the implementation tree exactly; the
+- clean-room: the complete three-patch series applies with `git am` to a fresh
+  worktree at `v0.8.0` and reproduces the implementation tree exactly; the
   obsolete fork CI workflow remains intentionally outside the series
 
 ## Handoff
@@ -273,14 +271,14 @@ Publish:
 ```bash
 patch_stage=$(mktemp -d)
 git format-patch --filename-max-length=100 vX.Y.Z -o "$patch_stage"
-test "$(find "$patch_stage" -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
+test "$(find "$patch_stage" -maxdepth 1 -name '00*.patch' | wc -l)" -eq 3
 rm ../../patches/herdr/*.patch
 cp "$patch_stage"/*.patch ../../patches/herdr/
 rm -rf "$patch_stage"
 echo vX.Y.Z > ../../patches/herdr/BASE
 git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
 cd ../..
-test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
+test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 3
 tmp=$(mktemp -d)
 git -C checkouts/herdr worktree add --detach "$tmp" vX.Y.Z
 git -C "$tmp" am "$PWD"/patches/herdr/*.patch
@@ -331,6 +329,12 @@ Watch upstream for native Windows `--remote` support:
   to 17 and matches `https://herdr.dev/latest.json`; the patch stack was
   refreshed onto the release tag, preserving upstream's new mise install path
   discovery and hidden-console curl spawning
+- `v0.8.0` (2026-08-03): still unsupported — `platform::capabilities()` keeps
+  `remote_attach: cfg!(unix)`, and current/preview Windows docs still call
+  native Windows `herdr --remote` unsupported. Protocol 19 matches
+  `https://herdr.dev/latest.json`. The stack was refreshed to three patches;
+  the former IV-0005 patch retired because upstream now supplies Windows
+  system notifications
 
 Once upstream supports it: switch back to official binaries
 (`irm https://herdr.dev/install.ps1 | iex`), delete this repo's releases/tags,

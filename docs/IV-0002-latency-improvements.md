@@ -2,16 +2,15 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0002` of the current four-patch
-  `v0.7.5` representation, which postdates the releases; its identical
-  implementation tree shipped as `v0.7.5-win.05` (the initial latency stack
-  shipped in `v0.7.5-win.01`); live deb1
-  verification and the W1 packet-capture verdict remain pending
+- **Status:** implemented in ownership patch `0002` of the current three-patch
+  `v0.8.0` representation; the latest published implementation remains
+  `v0.7.5-win.05` (the initial latency stack shipped in `v0.7.5-win.01`);
+  live deb1 verification and the W1 packet-capture verdict remain pending
 - **Upstream:** `checkouts/herdr`
-  ([ogulcancelik/herdr](https://github.com/ogulcancelik/herdr))
+  ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0002-*-IV-0002.patch`,
   plus the deb1 network-simulation harness below
-- **Implementation base:** `v0.7.5` (`ef4c23f`), stacked on
+- **Implementation base:** `v0.8.0` (`346411fa`), stacked on
   [IV-0001](IV-0001-windows-remote.md)'s ownership patch `0001`
 - **Child consumer integration:** [IV-0003](IV-0003-pi-predictive-echo.md)
   adapts pi's input prompt to consume W3 predictive echo; read it only when
@@ -179,7 +178,8 @@ entirely on reattach.
   unchanged.
 - **As landed:** `src/remote/probe.rs` — one `ssh /bin/sh -s` script emits a
   sentinel-tagged blob (`__HERDR_PROBE__ <tag> …`) with uname, login-shell
-  PATH lookup, known-location scan, per-candidate `--version` + `status
+  PATH lookup plus a `/bin/sh` fallback for non-POSIX login shells,
+  known-location scan, per-candidate `--version` + `status
   client --json`, and `status server --json` from the best candidate.
   `ensure_remote_server_ready` consumes the probed status and only does a
   live round trip when the blob had none (fresh install). Happy path is
@@ -239,8 +239,8 @@ printable characters (and backspace) into a shell/editor.
 - **As landed (screen model):** `src/client/screen_model.rs` — instead of a full
   libghostty-vt integration, a dedicated parser for `BlitEncoder`'s narrow
   vocabulary (no scrolling or relative motion; cell runs start with CUP).
-  Upstream v0.7.5 may batch adjacent cells into one printable run, so the model
-  splits every run at Unicode extended grapheme boundaries. ASCII-leading
+  Upstream versions since v0.7.5 may batch adjacent cells into one printable
+  run, so the model splits every run at Unicode extended grapheme boundaries. ASCII-leading
   decomposed clusters such as `e` plus a combining acute accent remain one
   cell. It tracks symbols, plain-vs-styled pen, hyperlinks, cursor, and touched
   cells. Round-trip tests cover real `BlitEncoder` full and diff frames,
@@ -429,8 +429,8 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: the complete four-patch series `git am` applies to a fresh
-  `v0.7.5` worktree and reproduces the refreshed implementation tree exactly;
+- Clean-room: the complete three-patch series `git am` applies to a fresh
+  `v0.8.0` worktree and reproduces the refreshed implementation tree exactly;
   the fork-era CI workflow remains deliberately outside the series.
 
 Still pending (record results in the check log):
@@ -486,5 +486,12 @@ Still pending (record results in the check log):
   The regenerated clean-room stack reproduced the implementation tree; the
   nine known test-only unused-code/import warnings remain.
 - 2026-08-01: recombined all IV-0002 workstreams into ownership patch `0002`;
-  the four-patch clean-room apply reproduces the same final implementation
-  tree as the former unconsolidated stack.
+  the four-patch `v0.7.5` clean-room apply reproduced the same final
+  implementation tree as the former unconsolidated stack.
+- 2026-08-04: refreshed onto `v0.8.0` / protocol 19 and preserved upstream's
+  `/bin/sh` fallback for login shells that reject `command -v`. Adapted
+  prediction and echo timing to the expanded Windows input events
+  (`TextCommit`, physical-source metadata, and repeat counts). Clippy is clean;
+  filtered suites pass: remote 78, client 187, Windows 151, client transport
+  22, config 130, and wire 53. The three-patch clean-room apply reproduces the
+  implementation tree.

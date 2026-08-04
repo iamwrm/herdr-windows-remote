@@ -4,7 +4,7 @@ This repo tracks work against upstream projects **without** forks or submodules.
 
 ## Upstreams
 
-- https://github.com/ogulcancelik/herdr
+- https://github.com/herdrdev/herdr
 
 ## Layout
 
@@ -28,7 +28,7 @@ This repo replaces the earlier fork `iamwrm/herdr` for exactly these reasons.
 
 ```bash
 mkdir -p checkouts
-git clone https://github.com/ogulcancelik/herdr checkouts/herdr
+git clone https://github.com/herdrdev/herdr checkouts/herdr
 cd checkouts/herdr
 git checkout "$(cat ../../patches/herdr/BASE)"   # pinned upstream release tag
 test "$(git rev-parse HEAD)" = "$(cat ../../patches/herdr/BASE_COMMIT)"
@@ -49,10 +49,10 @@ The current herdr series has one patch per owning initiative:
 | `0001` | [IV-0001](IV-0001-windows-remote.md) | native Windows remote transport and fork safeguards |
 | `0002` | [IV-0002](IV-0002-latency-improvements.md) | high-RTT attach, transport, and predictive-input latency |
 | `0003` | [IV-0004](IV-0004-vscode-remote-open.md) | remote-shell `hcode` integration |
-| `0004` | [IV-0005](IV-0005-windows-system-notifications.md) | native Windows system toasts |
 
 [IV-0003](IV-0003-pi-predictive-echo.md) owns only a pi extension, so it has no
-herdr patch.
+herdr patch. The former IV-0005 notification patch retired in `v0.8.0`, when
+upstream implemented native Windows system notifications.
 
 ## Working on a change
 

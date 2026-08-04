@@ -1,6 +1,6 @@
 # herdr-windows-remote
 
-Patches and tooling on top of [ogulcancelik/herdr](https://github.com/ogulcancelik/herdr)
+Patches and tooling on top of [herdrdev/herdr](https://github.com/herdrdev/herdr)
 centered on **`herdr --remote <ssh-target>` from the native Windows binary**,
 which upstream ships as unsupported in the Windows beta, plus client-side
 quality-of-life improvements for that workflow. Retire this repo as soon as
@@ -17,8 +17,9 @@ submodules), and
 series, version-bump runbook, and retirement criteria. Additional initiatives
 cover [remote latency/predictive echo](docs/IV-0002-latency-improvements.md),
 its [pi compatibility child](docs/IV-0003-pi-predictive-echo.md),
-[`hcode .` → local VS Code Remote-SSH](docs/IV-0004-vscode-remote-open.md),
-and [native Windows system notifications](docs/IV-0005-windows-system-notifications.md).
+and [`hcode .` → local VS Code Remote-SSH](docs/IV-0004-vscode-remote-open.md).
+Native Windows system notifications were retired from this patch stack after
+upstream implemented them in v0.8.0.
 
 This repo replaces the retired fork `iamwrm/herdr` (see its issue #1 for the
 original fork-era notes; everything durable now lives here).
