@@ -55,7 +55,9 @@ while [ "$index" -lt "$total" ]; do
     end=$((start + chunk_size - 1))
     chunk=$(printf '%s' "$b64" | cut -c "${start}-${end}")
     title="herdr-code-open:1:$$:${index}:${total}:${chunk}"
-    if ! herdr terminal title set "$title" >/dev/null; then
+    # Suppress the transport command's own diagnostics; hcode emits one
+    # stable error below if the request could not be delivered.
+    if ! herdr terminal title set "$title" >/dev/null 2>&1; then
         echo "hcode: failed to send request to the attached herdr client" >&2
         exit 1
     fi

@@ -3,9 +3,9 @@
 ## Record
 
 - **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
-  representation; the latest publication is `v0.8.0-win.03` (`hcode` first
-  shipped in `v0.7.5-win.01`); automated tests
-  and live deb1 request-transport verification complete
+  representation; the latest publication is `v0.8.0-win.04` (`hcode` first
+  shipped in `v0.7.5-win.01`); automated tests, isolated Windows launch
+  verification, and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** `patches/herdr/0003-*-IV-0004.patch`,
@@ -99,7 +99,20 @@ active workspace. This also keeps multiple requested folders from collapsing
 into one repeatedly replaced window. File links naturally select an existing
 window containing the file, or open a new one when no workspace contains it.
 
-The client passes each URL to herdr's existing platform URL opener. On Windows that is `ShellExecuteW`, which invokes the registered `vscode` protocol handler directly—no `cmd.exe`, `code.cmd`, install-path discovery, or shell-built command is involved. This is VS Code's documented remote file/workspace protocol and lets the OS select the registered installation.
+The interactive client does not invoke the registered handler directly.
+Instead it starts the current herdr executable in a hidden broker mode with
+null stdin/stdout/stderr and, on Windows, `CREATE_NO_WINDOW`. The broker
+revalidates the fixed `vscode://vscode-remote/ssh-remote+` prefix and then
+invokes the platform URL opener. This prevents VS Code, Electron, and extension
+hosts from attaching to or inheriting the client's raw alternate-screen
+console.
+
+On Windows the broker uses `ShellExecuteExW` with `SEE_MASK_FLAG_NO_UI` to
+suppress shell-generated association/error dialogs and `SEE_MASK_NOASYNC` so
+launch delegation finishes before the short-lived broker exits. VS Code's own
+remote-link confirmation and Workspace Trust UI remain enabled. The registered
+`vscode` protocol handler is still selected directly—no `cmd.exe`, `code.cmd`,
+install-path discovery, or shell-built command is involved.
 
 ### Config and kill switches
 
@@ -154,8 +167,10 @@ the final `hcode` naming, and VS Code window-preservation behavior.
 
 | File | Change |
 |---|---|
-| `src/client/code_open.rs` | **new** — title-chunk reassembly, legacy clipboard recognition, payload validation, URL encoding, rate limiting, platform URL opening, unit tests |
-| `src/client/mod.rs` | intercept magic title chunks and legacy clipboard payloads before host rendering/forwarding |
+| `src/client/code_open.rs` | **new** — title-chunk reassembly, legacy clipboard recognition, payload validation, URL encoding, rate limiting, isolated broker launch, unit tests |
+| `src/client/mod.rs` | intercept magic title chunks and legacy clipboard payloads before host rendering/forwarding; expose the hidden broker dispatcher |
+| `src/main.rs` | dispatch the hidden broker before ordinary CLI parsing and log broker failures only to `herdr-client.log` |
+| `src/platform/mod.rs`, `src/platform/windows.rs`, `Cargo.toml` | broker-specific no-UI `ShellExecuteExW` delegation and required Windows API feature |
 | `src/remote/launcher.rs`, `src/remote.rs` | pass/re-export `HERDR_REMOTE_TARGET` for the spawned local client |
 | `src/config/model.rs` | `remote.code_open` (default true) and config tests |
 
@@ -189,6 +204,8 @@ attempt a code-open request. The client limits that capability:
 - only absolute remote paths are accepted;
 - host/path data cannot change the fixed `vscode://vscode-remote/ssh-remote+` scheme or add shell syntax;
 - no remote data is interpreted by a command shell;
+- the hidden broker accepts only the fixed VS Code Remote-SSH URL prefix and
+  has no console or terminal-facing standard handles;
 - at most eight paths per request;
 - requests are limited to one per second;
 - VS Code's remote protocol-link confirmation and Workspace Trust still apply;
@@ -216,18 +233,21 @@ This is intentionally not a general remote-to-local command execution mechanism.
 Completed on Windows with Zig 0.15.2:
 
 - `cargo clippy --locked --bin herdr -- -D warnings` — clean;
-- `cargo test --locked --bin herdr client::` — 187 passed;
+- `cargo test --locked --bin herdr client::` — 200 passed;
 - `cargo test --locked --bin herdr remote::` — 78 passed;
 - `cargo test --locked --bin herdr windows_` — 151 passed;
 - `cargo test --locked --bin herdr server::client_transport::tests` — 22 passed;
 - `cargo test --locked --bin herdr config::` — 130 passed;
 - release-equivalent `cargo build --release --locked --target
   x86_64-pc-windows-msvc` — clean;
-- focused `client::code_open::tests` — 19 passed after the terminal-safe
-  transport follow-up, including chunk reassembly/reset/timeout, ordinary
-  title passthrough, URL encoding, folder/file new-window fallbacks,
-  validation/rate limiting, and disabled-request consumption;
-- shim payload decoded and inspected successfully;
+- focused `client::code_open::tests` — 22 passed after the isolated-launch
+  follow-up, including chunk reassembly/reset/timeout, final magic-chunk
+  consumption, broker URL/argv validation, ordinary title passthrough, URL
+  encoding, folder/file new-window fallbacks, validation/rate limiting, and
+  disabled-request consumption;
+- shim payload decoded and inspected successfully; `sh -n` passes, and a
+  failing fake `herdr terminal title set` produces no stdout and only hcode's
+  single stable delivery error;
 - clean-room: all four ownership patches apply with `git am` to a fresh
   `v0.8.0` worktree and exactly match the implementation checkout; the known
   fork-era CI workflow is intentionally excluded from both;
@@ -244,7 +264,13 @@ Live deb1 verification:
   `vscode-remote://ssh-remote+deb1/tmp`;
 - the renamed `hcode` script produces the same validated payload and is now
   installed as `~/.cargo/bin/hcode`;
-- before the URL-opener refactor, VS Code Remote-SSH activated its resolver for `ssh-remote+deb1`; current launch plumbing reuses herdr's existing Windows `ShellExecuteW` URL opener and the machine's registered `vscode` handler (`Code.exe --open-url -- "%1"`);
+- before the URL-opener refactor, VS Code Remote-SSH activated its resolver for `ssh-remote+deb1`; current launch plumbing uses the machine's registered `vscode` handler (`Code.exe --open-url -- "%1"`) through the isolated broker;
+- the local VS Code 1.130.0 executable was observed emitting Node
+  `DEP0169` deprecation warnings, `[AgentHost:stderr]` lines, and `Unknown
+  channel` errors when attached to a caller's output; launching the same
+  `deb1/tmp` Remote-SSH URL from a `CREATE_NO_WINDOW` broker exited zero with
+  zero captured stdout and stderr bytes, after which the smoke-test Code
+  processes were removed;
 - VS Code's documented remote protocol-link format was checked against `vscode://vscode-remote/ssh-remote+[USER@]HOST[:PORT]/path`.
 
 ## Handoff
@@ -252,7 +278,9 @@ Live deb1 verification:
 - Preserve ordinary title rendering and clipboard fallback for every
   non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
-- Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
+- Keep launch delegation inside the no-console broker; never invoke VS Code
+  directly from the raw-screen client or route remote-derived values through a
+  command shell.
 - Ownership patch `0003` applies after IV-0002 patch `0002`; keep all
   code-open behavior, naming, and window-preservation changes together.
 
@@ -286,7 +314,10 @@ Live deb1 verification:
   clean-room apply and current filtered test suites were green.
 - 2026-08-10: replaced the current shim's OSC 52 transport with chunked
   `client.window_title` control messages. This removes the server clipboard
-  feedback that disturbed the terminal UI while preserving legacy shim
-  compatibility. Focused tests (19), the full client filter (197), script
-  syntax, a fake-server end-to-end chunk reconstruction, clean-room tree
-  reproduction, and production Clippy are green.
+  feedback while preserving legacy shim compatibility.
+- 2026-08-10: confirmed that the Windows VS Code handler can emit Electron,
+  Node deprecation, and agent-host diagnostics into its caller's console.
+  Moved protocol-handler invocation behind a null-stdio, `CREATE_NO_WINDOW`
+  broker; suppressed only shell-generated error UI; and made every prefixed
+  title chunk terminal-private. Focused tests (22), the broker launch smoke,
+  script syntax, production Clippy, and clean-room reproduction are green.

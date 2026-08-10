@@ -1,4 +1,4 @@
-From 3bf3ee97fac821f8e4c3a2a9275aece1ed88c8eb Mon Sep 17 00:00:00 2001
+From 982e298421d2072264445c17a33f5e0edd2d6438 Mon Sep 17 00:00:00 2001
 From: compare <compare@example.invalid>
 Date: Mon, 10 Aug 2026 11:55:54 +0800
 Subject: [PATCH 4/4] feat: support software-cursor predictive echo (IV-0006)

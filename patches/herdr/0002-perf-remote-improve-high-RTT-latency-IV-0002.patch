@@ -1,7 +1,7 @@
 From 867ed2028affa19d302b7262e947ae267dd56a0d Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 2/3] perf(remote): improve high-RTT latency (IV-0002)
+Subject: [PATCH 2/4] perf(remote): improve high-RTT latency (IV-0002)
 
 Combine all IV-0002 workstreams and follow-ups:
 
