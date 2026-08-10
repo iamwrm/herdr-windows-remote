@@ -1,0 +1,823 @@
+From e2fc89606497fea44bdddd4372660ec9f328c7a7 Mon Sep 17 00:00:00 2001
+From: compare <compare@example.invalid>
+Date: Mon, 10 Aug 2026 11:55:54 +0800
+Subject: [PATCH] feat: support software-cursor predictive echo (IV-0006)
+
+---
+ src/client/predict.rs      | 395 ++++++++++++++++++++++++++++++++-----
+ src/client/screen_model.rs | 211 +++++++++++++++++++-
+ 2 files changed, 548 insertions(+), 58 deletions(-)
+
+diff --git a/src/client/predict.rs b/src/client/predict.rs
+index 2f0f0da3..37503f11 100644
+--- a/src/client/predict.rs
++++ b/src/client/predict.rs
+@@ -1,8 +1,9 @@
+ //! Predictive local echo for remote attach (i0002 W3, mosh-style).
+ //!
+ //! On a high-RTT link every keystroke takes a full round trip before it
+-//! echoes. When the typing context is safe (plain unstyled cells, visible
+-//! cursor, room before the right margin) the client draws the typed
++//! echoes. When the typing context is safe (plain cells with a visible
++//! hardware cursor, or matching color-only cells with a reverse-video
++//! software cursor, plus room before the right margin) the client draws the typed
+ //! character immediately — underlined, like mosh — and reconciles against
+ //! the frames the server sends later:
+ //!
+@@ -31,6 +32,7 @@
+ 
+ use std::collections::VecDeque;
+ use std::io::Write;
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ use super::screen_model::ScreenModel;
+@@ -72,11 +74,18 @@ impl PredictiveEchoMode {
+     }
+ }
+ 
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum PredictionCursor {
++    Hardware,
++    Software { base_sgr: Arc<str> },
++}
++
+ #[derive(Debug)]
+ struct Prediction {
+     x: u16,
+     y: u16,
+     ch: char,
++    cursor: PredictionCursor,
+     /// Whether the local underlined overlay is still visible. A matching
+     /// server cell write clears it even if FIFO retirement is blocked by an
+     /// earlier cursor-only prediction.
+@@ -189,35 +198,53 @@ impl Predictor {
+             self.stop_predicting_until_frame(out);
+             return;
+         }
+-        if ch.is_control() || ch.width() != Some(1) || !self.model.cursor_visible() {
++        if ch.is_control() || ch.width() != Some(1) {
+             self.stop_predicting_until_frame(out);
+             return;
+         }
++        let Some(cursor) = self.prediction_cursor() else {
++            self.stop_predicting_until_frame(out);
++            return;
++        };
+         let (x, y) = self.insertion_point();
+-        // Same-row typing with room before the right margin; the target and
+-        // the cell we push the cursor into must both be unstyled.
+-        if y != self.model.cursor().1
+-            || x + 1 >= self.model.width()
+-            || !self.cell_is_plain(x, y)
+-            || !self.cell_is_plain(x + 1, y)
+-        {
++        if y != self.model.cursor().1 || x + 1 >= self.model.width() {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        let safe_target = match &cursor {
++            PredictionCursor::Hardware => self.cell_is_plain(x, y) && self.cell_is_plain(x + 1, y),
++            PredictionCursor::Software { base_sgr } => {
++                let first = self.pending.is_empty();
++                self.cell_has_base_style(x, y, base_sgr, first)
++                    && self.cell_has_base_style(x + 1, y, base_sgr, false)
++            }
++        };
++        if !safe_target {
+             self.stop_predicting_until_frame(out);
+             return;
+         }
+ 
+         let drawn = self.display_unlocked;
+         if drawn {
+-            let _ = write!(
+-                out,
+-                "\x1b[{};{}H{UNDERLINE_SGR}{ch}{PLAIN_SGR}",
+-                y + 1,
+-                x + 1
+-            );
++            match &cursor {
++                PredictionCursor::Hardware => {
++                    let _ = write!(
++                        out,
++                        "\x1b[{};{}H{UNDERLINE_SGR}{ch}{PLAIN_SGR}",
++                        y + 1,
++                        x + 1
++                    );
++                }
++                PredictionCursor::Software { base_sgr } => {
++                    self.draw_software_prediction(out, x, y, ch, base_sgr);
++                }
++            }
+         }
+         self.pending.push_back(Prediction {
+             x,
+             y,
+             ch,
++            cursor,
+             drawn,
+             observed: false,
+             sent_at: Instant::now(),
+@@ -231,13 +258,18 @@ impl Predictor {
+             return;
+         };
+         if prediction.drawn {
+-            let symbol = self.model_symbol(prediction.x, prediction.y);
+-            let _ = write!(
+-                out,
+-                "\x1b[{row};{col}H{PLAIN_SGR}{symbol}\x1b[{row};{col}H",
+-                row = prediction.y + 1,
+-                col = prediction.x + 1,
+-            );
++            self.repaint_model_cell(out, prediction.x, prediction.y);
++            match prediction.cursor {
++                PredictionCursor::Hardware => {
++                    let _ = write!(
++                        out,
++                        "\x1b[{row};{col}H",
++                        row = prediction.y + 1,
++                        col = prediction.x + 1,
++                    );
++                }
++                PredictionCursor::Software { .. } => self.redraw_software_pending(out),
++            }
+         }
+     }
+ 
+@@ -289,16 +321,26 @@ impl Predictor {
+         // cleanup cannot overwrite cells the raw frame already styled. Cursor
+         // progress acknowledges unchanged cells such as a blank space.
+         let (server_x, server_y) = self.model.cursor();
+-        let server_cursor_visible = self.model.cursor_visible();
++        let cursor_valid = self.server_cursor_matches_chain();
+         let model = &self.model;
+         let mut observed_mismatch = false;
+         for prediction in &mut self.pending {
+             let cell_touched = touched.contains(&(prediction.x, prediction.y));
+-            let cursor_passed =
+-                server_cursor_visible && server_y == prediction.y && server_x > prediction.x;
++            let cursor_passed = cursor_valid && server_y == prediction.y && server_x > prediction.x;
++            let software_caret_waiting =
++                matches!(prediction.cursor, PredictionCursor::Software { .. })
++                    && cursor_valid
++                    && server_x == prediction.x
++                    && server_y == prediction.y;
+             if cell_touched {
+                 prediction.drawn = false;
+             }
++            if software_caret_waiting {
++                // Prime Agent repaints its reverse-video caret over the first
++                // unacknowledged prediction. It is cursor state, not a
++                // conflicting character write; redraw the local suffix below.
++                continue;
++            }
+             if !cell_touched && !cursor_passed {
+                 continue;
+             }
+@@ -312,12 +354,12 @@ impl Predictor {
+             }
+         }
+ 
+-        // A hidden or row-jumped server cursor is not a safe continuation of
+-        // same-line prediction. This also handles transient TUI renders that
+-        // omit their hardware-cursor marker.
++        // A row jump or cursor representation change is not a safe
++        // continuation of this prediction chain. Software-cursor chains
++        // deliberately accept a hidden hardware cursor only while the model
++        // contains the matching reverse-video caret at that position.
+         if !self.pending.is_empty()
+-            && (!server_cursor_visible
+-                || server_y != self.pending.front().expect("pending exists").y)
++            && (!cursor_valid || server_y != self.pending.front().expect("pending exists").y)
+         {
+             self.stop_predicting_until_frame(&mut out);
+             self.touched_scratch = touched;
+@@ -335,13 +377,7 @@ impl Predictor {
+             if front.drawn {
+                 // A cursor-only acknowledgement did not repaint the local
+                 // underline. Explicitly restore the now-confirmed cell.
+-                let symbol = self.model_symbol(front.x, front.y);
+-                let _ = write!(
+-                    out,
+-                    "\x1b[{};{}H{PLAIN_SGR}{symbol}",
+-                    front.y + 1,
+-                    front.x + 1,
+-                );
++                self.repaint_model_cell(&mut out, front.x, front.y);
+                 repainted_confirmation = true;
+             }
+             if now.saturating_duration_since(front.sent_at) >= AUTO_MIN_LATENCY {
+@@ -356,14 +392,26 @@ impl Predictor {
+ 
+         if mispredicted {
+             self.stop_predicting_until_frame(&mut out);
++        } else if self.display_unlocked
++            && matches!(
++                self.pending.front().map(|prediction| &prediction.cursor),
++                Some(PredictionCursor::Software { .. })
++            )
++        {
++            // A server frame can overwrite the application's software caret and
++            // the first pending overlay, so redraw the whole suffix.
++            self.redraw_software_pending(&mut out);
+         } else if self.pending.iter().any(|prediction| prediction.drawn) {
+-            // A frame always parks the host cursor at the server's position.
+-            // Matching cell writes already removed their local overlays; only
+-            // the predicted cursor needs restoration.
++            // Hardware-cursor predictions retain their cheaper cursor-only
++            // reanchor when matching server writes removed earlier overlays.
+             self.reanchor_pending(&mut out);
+         } else if repainted_confirmation {
+             let (x, y) = self.model.cursor();
+-            let _ = write!(out, "{PLAIN_SGR}\x1b[{};{}H", y + 1, x + 1);
++            let sgr = self
++                .model
++                .cell(x, y)
++                .map_or(PLAIN_SGR, |cell| cell.sgr.as_ref());
++            let _ = write!(out, "{sgr}\x1b[{};{}H", y + 1, x + 1);
+         }
+         self.touched_scratch = touched;
+         out
+@@ -401,6 +449,49 @@ impl Predictor {
+         self.model.cell(x, y).is_some_and(|cell| cell.plain)
+     }
+ 
++    fn cell_has_base_style(&self, x: u16, y: u16, base_sgr: &str, reversed: bool) -> bool {
++        self.model
++            .cell(x, y)
++            .and_then(|cell| cell.prediction_style.as_ref())
++            .is_some_and(|style| style.base_sgr.as_ref() == base_sgr && style.reversed == reversed)
++    }
++
++    fn prediction_cursor(&self) -> Option<PredictionCursor> {
++        if let Some(prediction) = self.pending.front() {
++            return Some(prediction.cursor.clone());
++        }
++        if self.model.cursor_visible() {
++            return Some(PredictionCursor::Hardware);
++        }
++        let (x, y) = self.model.cursor();
++        if x + 1 >= self.model.width() {
++            return None;
++        }
++        let caret = self.model.cell(x, y)?.prediction_style.as_ref()?;
++        let next = self.model.cell(x + 1, y)?.prediction_style.as_ref()?;
++        (caret.reversed && !next.reversed && caret.base_sgr == next.base_sgr).then(|| {
++            PredictionCursor::Software {
++                base_sgr: caret.base_sgr.clone(),
++            }
++        })
++    }
++
++    fn server_cursor_matches_chain(&self) -> bool {
++        let Some(prediction) = self.pending.front() else {
++            return true;
++        };
++        match &prediction.cursor {
++            PredictionCursor::Hardware => self.model.cursor_visible(),
++            PredictionCursor::Software { base_sgr } => {
++                if self.model.cursor_visible() {
++                    return false;
++                }
++                let (x, y) = self.model.cursor();
++                self.cell_has_base_style(x, y, base_sgr, true)
++            }
++        }
++    }
++
+     fn model_symbol(&self, x: u16, y: u16) -> String {
+         match self.model.cell(x, y) {
+             Some(cell) if !cell.symbol.is_empty() => cell.symbol.clone(),
+@@ -408,21 +499,90 @@ impl Predictor {
+         }
+     }
+ 
++    fn repaint_model_cell(&self, out: &mut impl Write, x: u16, y: u16) {
++        let symbol = self.model_symbol(x, y);
++        let sgr = self
++            .model
++            .cell(x, y)
++            .map_or(PLAIN_SGR, |cell| cell.sgr.as_ref());
++        let _ = write!(out, "\x1b[{};{}H{sgr}{symbol}", y + 1, x + 1);
++    }
++
++    fn sgr_with_modifier(base_sgr: &str, modifier: &str) -> String {
++        base_sgr.replacen("\x1b[0;", &format!("\x1b[0;{modifier};"), 1)
++    }
++
++    fn draw_software_prediction(
++        &self,
++        out: &mut impl Write,
++        x: u16,
++        y: u16,
++        ch: char,
++        base_sgr: &str,
++    ) {
++        let underline_sgr = Self::sgr_with_modifier(base_sgr, "4");
++        let reverse_sgr = Self::sgr_with_modifier(base_sgr, "7");
++        let caret_symbol = self.model_symbol(x + 1, y);
++        let _ = write!(
++            out,
++            "\x1b[{};{}H{underline_sgr}{ch}{reverse_sgr}{caret_symbol}{base_sgr}\x1b[{};{}H",
++            y + 1,
++            x + 1,
++            y + 1,
++            x + 2,
++        );
++    }
++
++    fn redraw_software_pending(&mut self, out: &mut impl Write) {
++        let Some(PredictionCursor::Software { base_sgr }) = self
++            .pending
++            .front()
++            .map(|prediction| prediction.cursor.clone())
++        else {
++            return;
++        };
++        let underline_sgr = Self::sgr_with_modifier(&base_sgr, "4");
++        for prediction in &mut self.pending {
++            let _ = write!(
++                out,
++                "\x1b[{};{}H{underline_sgr}{}",
++                prediction.y + 1,
++                prediction.x + 1,
++                prediction.ch,
++            );
++            prediction.drawn = true;
++        }
++        let (x, y) = self.insertion_point();
++        let reverse_sgr = Self::sgr_with_modifier(&base_sgr, "7");
++        let symbol = self.model_symbol(x, y);
++        let _ = write!(
++            out,
++            "\x1b[{};{}H{reverse_sgr}{symbol}{base_sgr}\x1b[{};{}H",
++            y + 1,
++            x + 1,
++            y + 1,
++            x + 1,
++        );
++    }
++
+     /// Repaints every drawn prediction with the model's (server-truth)
+     /// content and parks the host cursor back at the server's position.
+     fn flush_repaint(&mut self, out: &mut impl Write) {
++        let software_caret = self.pending.front().and_then(|prediction| {
++            (self.display_unlocked
++                && matches!(prediction.cursor, PredictionCursor::Software { .. }))
++            .then(|| self.insertion_point())
++        });
+         let mut wrote = false;
+         while let Some(prediction) = self.pending.pop_front() {
+             if !prediction.drawn {
+                 continue;
+             }
+-            let symbol = self.model_symbol(prediction.x, prediction.y);
+-            let _ = write!(
+-                out,
+-                "\x1b[{};{}H{PLAIN_SGR}{symbol}",
+-                prediction.y + 1,
+-                prediction.x + 1,
+-            );
++            self.repaint_model_cell(out, prediction.x, prediction.y);
++            wrote = true;
++        }
++        if let Some((x, y)) = software_caret {
++            self.repaint_model_cell(out, x, y);
+             wrote = true;
+         }
+         if wrote {
+@@ -510,6 +670,43 @@ mod tests {
+         }
+     }
+ 
++    const PRIME_BG: u32 = 0x01_00_00_04; // indexed blue
++    const REVERSED: u16 = 1 << 6;
++
++    /// Prime Agent's editor uses a hidden hardware cursor and paints a
++    /// reverse-video cell over a colored input surface.
++    fn prime_editor_frame(text: &str, cursor_x: u16) -> FrameData {
++        let width = 12;
++        let mut cells = vec![
++            CellData {
++                bg: PRIME_BG,
++                ..plain_cell(" ")
++            };
++            width as usize
++        ];
++        for (offset, ch) in text.chars().enumerate() {
++            cells[2 + offset] = CellData {
++                symbol: ch.to_string(),
++                bg: PRIME_BG,
++                ..plain_cell(" ")
++            };
++        }
++        cells[cursor_x as usize].modifier = REVERSED;
++        FrameData {
++            cells,
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: cursor_x,
++                y: 0,
++                visible: false,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
+     /// Drives frames through a real `BlitEncoder` into the predictor.
+     struct Harness {
+         encoder: BlitEncoder,
+@@ -581,6 +778,106 @@ mod tests {
+         assert_eq!(harness.predictor.pending.len(), 1);
+     }
+ 
++    #[test]
++    fn prime_software_cursor_draws_with_colored_editor_style() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('a', &mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert_eq!(harness.predictor.pending.len(), 1);
++        assert!(
++            out.contains("\x1b[0;4;39;48;5;4ma"),
++            "colored underlined prediction: {out:?}"
++        );
++        assert!(
++            out.contains("\x1b[0;7;39;48;5;4m "),
++            "reverse-video software caret: {out:?}"
++        );
++        assert!(out.ends_with("\x1b[1;4H"), "caret anchor: {out:?}");
++    }
++
++    #[test]
++    fn prime_software_cursor_reconciles_abc_one_ack_at_a_time() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        for ch in "abc".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        for (text, cursor_x, expected_pending) in [("a", 3, 2), ("ab", 4, 1), ("abc", 5, 0)] {
++            let out =
++                String::from_utf8(harness.feed(&prime_editor_frame(text, cursor_x))).expect("utf8");
++            assert_eq!(harness.predictor.pending.len(), expected_pending, "{text}");
++            if expected_pending > 0 {
++                assert!(
++                    out.contains("\x1b[0;4;39;48;5;4m"),
++                    "pending suffix redrawn after {text}: {out:?}"
++                );
++                assert!(
++                    out.ends_with("\x1b[1;6H"),
++                    "local caret remains after c: {out:?}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn prime_software_cursor_confirms_coalesced_abc_space_def() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        let out = String::from_utf8(harness.feed(&prime_editor_frame("abc def", 9))).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            out.contains("\x1b[0;39;48;5;4m "),
++            "unchanged space underline removed with editor colors: {out:?}"
++        );
++        assert!(
++            out.ends_with("\x1b[1;10H"),
++            "server caret restored: {out:?}"
++        );
++    }
++
++    #[test]
++    fn prime_software_cursor_mismatch_restores_colored_server_truth() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        let out = String::from_utf8(harness.feed(&prime_editor_frame("X", 3))).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(
++            out.contains("\x1b[1;5H\x1b[0;39;48;5;4m "),
++            "stale local caret restored with editor colors: {out:?}"
++        );
++    }
++
++    #[test]
++    fn hidden_multi_cell_selection_is_not_mistaken_for_software_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        let mut selection = prime_editor_frame("xy", 2);
++        selection.cells[3].modifier = REVERSED;
++        harness.feed(&selection);
++        harness.predictor.on_char('z', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "two-cell selection");
++
++        let mut mixed_modifier = prime_editor_frame("", 2);
++        mixed_modifier.cells[2].modifier = REVERSED | 1; // reverse + bold
++        harness.feed(&mixed_modifier);
++        harness.predictor.on_char('z', &mut Vec::new());
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "reverse plus another modifier"
++        );
++    }
++
+     #[test]
+     fn prediction_confirms_when_server_echoes_same_char() {
+         let mut harness = Harness::new(PredictiveEchoMode::Always);
+diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
+index 1dfe21d9..ebdc2820 100644
+--- a/src/client/screen_model.rs
++++ b/src/client/screen_model.rs
+@@ -16,8 +16,146 @@
+ //! else. Round-trip tests validate the model against `BlitEncoder` output of
+ //! reference frames.
+ 
+-/// The SGR parameter list `build_sgr` emits for a completely unstyled cell.
+-const PLAIN_SGR_PARAMS: &str = "0;39;49";
++use std::sync::Arc;
++
++/// The SGR sequence `build_sgr` emits for a completely unstyled cell.
++const PLAIN_SGR: &str = "\x1b[0;39;49m";
++
++/// A cell style safe for predictive echo. Colors are preserved, while the
++/// only accepted modifier is reverse video (used by software cursors).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct PredictionStyle {
++    pub(crate) base_sgr: Arc<str>,
++    pub(crate) reversed: bool,
++}
++
++#[derive(Clone, Debug)]
++struct PenStyle {
++    sgr: Arc<str>,
++    prediction: Option<PredictionStyle>,
++}
++
++impl PenStyle {
++    fn plain() -> Self {
++        Self {
++            sgr: Arc::from(PLAIN_SGR),
++            prediction: Some(PredictionStyle {
++                base_sgr: Arc::from(PLAIN_SGR),
++                reversed: false,
++            }),
++        }
++    }
++
++    fn unknown() -> Self {
++        Self {
++            sgr: Arc::from(PLAIN_SGR),
++            prediction: None,
++        }
++    }
++}
++
++/// Parses the complete canonical SGR emitted by `render_ansi::build_sgr`.
++/// Retaining only colors and an optional reverse modifier keeps software
++/// cursor detection strict while supporting indexed and RGB themes.
++fn parse_pen_style(params: &str) -> PenStyle {
++    if matches!(params, "" | "0") {
++        return PenStyle::plain();
++    }
++
++    let sgr: Arc<str> = format!("\x1b[{params}m").into();
++    let parts = params.split(';').collect::<Vec<_>>();
++    if parts.first() != Some(&"0") {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let Some(fg_start) = parts
++        .iter()
++        .enumerate()
++        .skip(1)
++        .find_map(|(index, part)| is_fg_start(part).then_some(index))
++    else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++
++    let modifiers = &parts[1..fg_start];
++    let reversed = modifiers == ["7"];
++    if !modifiers.is_empty() && !reversed {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let Some(fg_end) = color_end(&parts, fg_start, true) else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++    let Some(bg_end) = color_end(&parts, fg_end, false) else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++    if bg_end != parts.len() {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let base_sgr: Arc<str> = format!(
++        "\x1b[0;{};{}m",
++        parts[fg_start..fg_end].join(";"),
++        parts[fg_end..bg_end].join(";")
++    )
++    .into();
++    PenStyle {
++        sgr,
++        prediction: Some(PredictionStyle { base_sgr, reversed }),
++    }
++}
++
++fn is_fg_start(part: &str) -> bool {
++    part.parse::<u16>()
++        .is_ok_and(|value| (30..=39).contains(&value) || (90..=97).contains(&value))
++}
++
++fn is_bg_start(part: &str) -> bool {
++    part.parse::<u16>()
++        .is_ok_and(|value| (40..=49).contains(&value) || (100..=107).contains(&value))
++}
++
++fn color_end(parts: &[&str], start: usize, foreground: bool) -> Option<usize> {
++    let part = *parts.get(start)?;
++    let extended = if foreground { "38" } else { "48" };
++    if part == extended {
++        return match parts.get(start + 1).copied() {
++            Some("5") if parts.get(start + 2)?.parse::<u8>().is_ok() => Some(start + 3),
++            Some("2")
++                if parts.get(start + 2)?.parse::<u8>().is_ok()
++                    && parts.get(start + 3)?.parse::<u8>().is_ok()
++                    && parts.get(start + 4)?.parse::<u8>().is_ok() =>
++            {
++                Some(start + 5)
++            }
++            _ => None,
++        };
++    }
++    let simple = if foreground {
++        is_fg_start(part)
++    } else {
++        is_bg_start(part)
++    };
++    simple.then_some(start + 1)
++}
+ 
+ /// One mirrored cell.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -25,8 +163,13 @@ pub(crate) struct ModelCell {
+     /// Grapheme cluster displayed in the cell. Blank cells hold `" "`.
+     pub(crate) symbol: String,
+     /// Whether the cell was written with the plain pen (default colors, no
+-    /// modifiers, no hyperlink). Predictions only ever target plain cells.
++    /// modifiers, no hyperlink).
+     pub(crate) plain: bool,
++    /// Exact canonical SGR emitted before this cell.
++    pub(crate) sgr: Arc<str>,
++    /// Safe colors and reverse-video state, if no other modifier or hyperlink
++    /// makes local prediction ambiguous.
++    pub(crate) prediction_style: Option<PredictionStyle>,
+ }
+ 
+ impl ModelCell {
+@@ -34,6 +177,8 @@ impl ModelCell {
+         Self {
+             symbol: " ".to_string(),
+             plain: true,
++            sgr: Arc::from(PLAIN_SGR),
++            prediction_style: PenStyle::plain().prediction,
+         }
+     }
+ 
+@@ -42,6 +187,8 @@ impl ModelCell {
+         Self {
+             symbol: String::new(),
+             plain: false,
++            sgr: Arc::from(PLAIN_SGR),
++            prediction_style: None,
+         }
+     }
+ }
+@@ -53,8 +200,8 @@ pub(crate) struct ScreenModel {
+     /// 0-based (col, row) of the host cursor after the last applied frame.
+     cursor: (u16, u16),
+     cursor_visible: bool,
+-    /// Whether the current pen is the plain SGR.
+-    pen_plain: bool,
++    /// Current canonical SGR and its prediction-safe interpretation.
++    pen: PenStyle,
+     /// Whether an OSC 8 hyperlink is currently open.
+     hyperlink_open: bool,
+     /// False after standalone zero-width output, whose host-terminal cell
+@@ -70,7 +217,7 @@ impl ScreenModel {
+             cells: Vec::new(),
+             cursor: (0, 0),
+             cursor_visible: false,
+-            pen_plain: false,
++            pen: PenStyle::unknown(),
+             hyperlink_open: false,
+             prediction_safe: true,
+         }
+@@ -200,7 +347,7 @@ impl ScreenModel {
+                 );
+             }
+             b'm' => {
+-                self.pen_plain = matches!(params, "" | "0" | PLAIN_SGR_PARAMS);
++                self.pen = parse_pen_style(params);
+             }
+             b'J' => {
+                 if params == "2" {
+@@ -270,9 +417,19 @@ impl ScreenModel {
+             self.prediction_safe = false;
+             return;
+         }
+-        let plain = self.pen_plain && !self.hyperlink_open;
++        let prediction_style = (!self.hyperlink_open)
++            .then(|| self.pen.prediction.clone())
++            .flatten();
++        let plain = prediction_style
++            .as_ref()
++            .is_some_and(|style| !style.reversed && style.base_sgr.as_ref() == PLAIN_SGR);
+         let index = y as usize * self.width as usize + x as usize;
+-        self.cells[index] = ModelCell { symbol, plain };
++        self.cells[index] = ModelCell {
++            symbol,
++            plain,
++            sgr: self.pen.sgr.clone(),
++            prediction_style,
++        };
+         touched.push((x, y));
+         for offset in 1..width {
+             let column = x + offset;
+@@ -578,6 +735,42 @@ mod tests {
+         assert!(model.cell(1, 0).unwrap().plain, "cell after link close");
+     }
+ 
++    #[test]
++    fn colored_reverse_cell_retains_safe_base_style() {
++        let mut cells = vec![plain_cell(" "); 3];
++        cells[0] = CellData {
++            fg: 0x02_FF_80_40,
++            bg: 0x01_00_00_04,
++            modifier: 1 << 6,
++            ..plain_cell(" ")
++        };
++        cells[1] = CellData {
++            fg: 0x02_FF_80_40,
++            bg: 0x01_00_00_04,
++            ..plain_cell(" ")
++        };
++        let mut reference = frame(3, 1, cells, (0, 0));
++        reference.cursor.as_mut().expect("cursor").visible = false;
++
++        let model = replay(std::slice::from_ref(&reference));
++        let caret = model
++            .cell(0, 0)
++            .unwrap()
++            .prediction_style
++            .as_ref()
++            .expect("reverse-only style is safe");
++        let neighbor = model
++            .cell(1, 0)
++            .unwrap()
++            .prediction_style
++            .as_ref()
++            .expect("color-only style is safe");
++        assert!(caret.reversed);
++        assert!(!neighbor.reversed);
++        assert_eq!(caret.base_sgr, neighbor.base_sgr);
++        assert_eq!(caret.base_sgr.as_ref(), "\x1b[0;38;2;255;128;64;48;5;4m");
++    }
++
+     #[test]
+     fn hidden_cursor_is_reported_hidden() {
+         let mut reference = frame(2, 1, vec![plain_cell("a"), plain_cell(" ")], (0, 0));
+-- 
+2.52.0.windows.1
+

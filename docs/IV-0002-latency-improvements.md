@@ -2,19 +2,20 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0002` of the current three-patch
-  `v0.8.0` representation; the latest published implementation remains
-  `v0.7.5-win.05` (the initial latency stack shipped in `v0.7.5-win.01`);
-  live deb1 verification and the W1 packet-capture verdict remain pending
+- **Status:** implemented in ownership patch `0002` of the current four-patch
+  `v0.8.0` representation; the latest publication is `v0.8.0-win.02` (the
+  initial latency stack shipped in `v0.7.5-win.01`); live deb1 verification
+  and the W1 packet-capture verdict remain pending
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0002-*-IV-0002.patch`,
   plus the deb1 network-simulation harness below
 - **Implementation base:** `v0.8.0` (`346411fa`), stacked on
   [IV-0001](IV-0001-windows-remote.md)'s ownership patch `0001`
-- **Child consumer integration:** [IV-0003](IV-0003-pi-predictive-echo.md)
-  adapts pi's input prompt to consume W3 predictive echo; read it only when
-  working on pi compatibility
+- **Consumer compatibility:** [IV-0006](IV-0006-software-cursor-predictive-echo.md)
+  owns automatic hidden software-cursor support for Prime Agent and pi;
+  [IV-0003](IV-0003-pi-predictive-echo.md) retains the superseded pi-side
+  adapter for older builds
 - **Related initiative:** [IV-0004](IV-0004-vscode-remote-open.md) owns the
   following patch, `0003`; no IV-0004 changes are mixed into this patch
 
@@ -256,13 +257,15 @@ printable characters (and backspace) into a shell/editor.
   cursor re-anchored past them. Active only for remote full-app
   terminal-ansi clients.
 
-#### Child consumer integration: pi
+#### Software-cursor consumers
 
-Pi's stock input prompt hides the hardware cursor and styles its software
-caret, so it cannot pass W3's safety gates. The pi-side rendering adapter,
-installation instructions, and independent upstream retirement path live in
-[IV-0003](IV-0003-pi-predictive-echo.md). This initiative continues to own
-all predictor and reconciliation behavior.
+The original W3 gates excluded stock pi and Prime Agent because they hide the
+hardware cursor and paint a reverse-video software caret. Automatic,
+style-preserving support now lives in
+[IV-0006](IV-0006-software-cursor-predictive-echo.md) and ownership patch
+`0004`. This initiative continues to own the base predictor and reconciliation
+behavior. [IV-0003](IV-0003-pi-predictive-echo.md)'s pi-side rendering adapter
+is retained only for older herdr builds.
 
 ### W3 follow-up — cursor-only reconciliation and input batching
 
@@ -429,7 +432,7 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: the complete three-patch series `git am` applies to a fresh
+- Clean-room: the complete four-patch series `git am` applies to a fresh
   `v0.8.0` worktree and reproduces the refreshed implementation tree exactly;
   the fork-era CI workflow remains deliberately outside the series.
 
@@ -493,5 +496,9 @@ Still pending (record results in the check log):
   prediction and echo timing to the expanded Windows input events
   (`TextCommit`, physical-source metadata, and repeat counts). Clippy is clean;
   filtered suites pass: remote 78, client 187, Windows 151, client transport
-  22, config 130, and wire 53. The three-patch clean-room apply reproduces the
-  implementation tree.
+  22, config 130, and wire 53. The then-three-patch clean-room apply reproduced
+  the implementation tree.
+- 2026-08-10: IV-0006 added automatic hidden reverse-video software-cursor
+  support as ownership patch `0004`. Prime-shaped real-encoder regressions,
+  all 193 client tests, and production Clippy pass; Prime Agent and pi require
+  no extension in `v0.8.0-win.02`.

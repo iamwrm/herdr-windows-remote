@@ -3,8 +3,8 @@
 ## Record
 
 - **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
-  representation; the latest published implementation remains
-  `v0.7.5-win.05` (`hcode` first shipped in `v0.7.5-win.01`); automated tests
+  representation; the latest publication is `v0.8.0-win.02` (`hcode` first
+  shipped in `v0.7.5-win.01`); automated tests
   and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
@@ -260,5 +260,5 @@ Live deb1 verification:
 - 2026-08-01: recombined the implementation, naming, and window-preservation
   follow-ups into ownership patch `0003`; clean-room application preserves the
   former stack's final tree.
-- 2026-08-04: refreshed patch `0003` onto `v0.8.0`; the three-patch
-  clean-room apply and current filtered test suites are green.
+- 2026-08-04: refreshed patch `0003` onto `v0.8.0`; the then-three-patch
+  clean-room apply and current filtered test suites were green.

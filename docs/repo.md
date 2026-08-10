@@ -49,10 +49,12 @@ The current herdr series has one patch per owning initiative:
 | `0001` | [IV-0001](IV-0001-windows-remote.md) | native Windows remote transport and fork safeguards |
 | `0002` | [IV-0002](IV-0002-latency-improvements.md) | high-RTT attach, transport, and predictive-input latency |
 | `0003` | [IV-0004](IV-0004-vscode-remote-open.md) | remote-shell `hcode` integration |
+| `0004` | [IV-0006](IV-0006-software-cursor-predictive-echo.md) | safe predictive echo for hidden reverse-video software cursors |
 
-[IV-0003](IV-0003-pi-predictive-echo.md) owns only a pi extension, so it has no
-herdr patch. The former IV-0005 notification patch retired in `v0.8.0`, when
-upstream implemented native Windows system notifications.
+[IV-0003](IV-0003-pi-predictive-echo.md) owns a legacy pi extension for older
+builds; patch `0004` supersedes it for current builds. The former IV-0005
+notification patch retired in `v0.8.0`, when upstream implemented native
+Windows system notifications.
 
 ## Working on a change
 

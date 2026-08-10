@@ -2,9 +2,8 @@
 
 ## Record
 
-- **Status:** implemented and refreshed as the current three-patch `v0.8.0`
-  representation; the latest published implementation tree remains
-  `v0.7.5-win.05`
+- **Status:** implemented as the current four-patch `v0.8.0` representation;
+  the latest publication is `v0.8.0-win.02`
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0001-*-IV-0001.patch` and
@@ -186,7 +185,7 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: the complete three-patch series applies with `git am` to a fresh
+- clean-room: the complete four-patch series applies with `git am` to a fresh
   worktree at `v0.8.0` and reproduces the implementation tree exactly; the
   obsolete fork CI workflow remains intentionally outside the series
 
@@ -271,14 +270,14 @@ Publish:
 ```bash
 patch_stage=$(mktemp -d)
 git format-patch --filename-max-length=100 vX.Y.Z -o "$patch_stage"
-test "$(find "$patch_stage" -maxdepth 1 -name '00*.patch' | wc -l)" -eq 3
+test "$(find "$patch_stage" -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
 rm ../../patches/herdr/*.patch
 cp "$patch_stage"/*.patch ../../patches/herdr/
 rm -rf "$patch_stage"
 echo vX.Y.Z > ../../patches/herdr/BASE
 git rev-parse 'vX.Y.Z^{commit}' > ../../patches/herdr/BASE_COMMIT
 cd ../..
-test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 3
+test "$(find patches/herdr -maxdepth 1 -name '00*.patch' | wc -l)" -eq 4
 tmp=$(mktemp -d)
 git -C checkouts/herdr worktree add --detach "$tmp" vX.Y.Z
 git -C "$tmp" am "$PWD"/patches/herdr/*.patch

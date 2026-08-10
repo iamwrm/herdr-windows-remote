@@ -2,8 +2,9 @@
 
 ## Record
 
-- **Status:** proof of concept implemented and deployed to deb1; high-RTT
-  retest of the parent predictor remains pending
+- **Status:** superseded for current builds by
+  [IV-0006](IV-0006-software-cursor-predictive-echo.md); the extension remains
+  available only for older herdr releases
 - **Role:** child consumer-integration document of
   [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-landed),
   not an independent predictive-echo implementation
@@ -15,11 +16,12 @@
 
 ## Purpose
 
-Adapt pi's input-prompt rendering so the predictive echo owned by
-[IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-landed)
-works over a 200 ms link without weakening its safety gates. This child owns
-only the pi extension, its deployment, and its pi-upstream retirement path;
-the parent owns prediction, reconciliation, and transport behavior.
+Historically, adapt pi's input-prompt rendering so the predictive echo owned
+by [IV-0002 W3](IV-0002-latency-improvements.md#w3--predictive-local-echo-mosh-style-landed)
+worked over a 200 ms link without weakening its safety gates. Current builds
+instead recognize pi's stock software cursor in herdr through
+[IV-0006](IV-0006-software-cursor-predictive-echo.md), so this child now owns
+only the legacy extension and its historical evidence.
 
 ## Root cause
 
@@ -35,7 +37,7 @@ is just opaque to them.
 | | Approach | Verdict |
 |---|---|---|
 | A | herdr client heuristic: treat a reversed cell as a drawn cursor and predict by shifting the block | Rejected: cannot distinguish the caret from selections/status cells, and the server's *moving* block breaks typeahead — the block repainted at x+1 (reversed `" "`) arrives before the echo of the second typed char, which the reconciler correctly flags as a misprediction → flush storm |
-| B | **pi extension** that makes pi's rendering prediction-friendly | **Chosen** (this initiative) |
+| B | **pi extension** that makes pi's rendering prediction-friendly | Chosen for older builds; superseded by IV-0006 |
 | C | Upstream pi change: `showHardwareCursor` also suppresses the software caret | The long-term home; B is the PoC of C (see [Upstream path](#upstream-path)) |
 | D | Local echo inside pi | Impossible: pi runs on the far side of the RTT; only the thin client can beat it |
 
@@ -100,9 +102,11 @@ the same cell today).
   the authoritative status belongs in the
   [IV-0002 evidence log](IV-0002-latency-improvements.md#evidence-log).
 
-## Install
+## Install on older herdr builds only
 
-Copy `extras/pi-extensions/predictive-echo-cursor.ts` to
+Do not install this extension for `v0.8.0-win.02` or newer; IV-0006 handles
+stock pi automatically. For an older build, copy
+`extras/pi-extensions/predictive-echo-cursor.ts` to
 `~/.pi/agent/extensions/` on every host you attach to with
 `herdr --remote`, then `/reload` or restart pi. Remove the file to restore
 pi's stock block caret.
@@ -135,3 +139,6 @@ the same pattern as [IV-0001's retirement criteria](IV-0001-windows-remote.md#wh
 - 2026-07-20: live typing proved the extension reached the predictor and
   exposed a client reconciliation defect rather than an extension defect.
   Implementation details and regression evidence are owned by IV-0002 W3.
+- 2026-08-10: IV-0006 moved safe hidden reverse-video caret support into
+  herdr. Prime Agent and stock pi no longer require an extension in
+  `v0.8.0-win.02`; this artifact remains for older releases only.
