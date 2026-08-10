@@ -3,7 +3,7 @@
 ## Record
 
 - **Status:** implemented as the current four-patch `v0.8.0` representation;
-  the latest publication is `v0.8.0-win.02`
+  the latest publication is `v0.8.0-win.03`
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0001-*-IV-0001.patch` and

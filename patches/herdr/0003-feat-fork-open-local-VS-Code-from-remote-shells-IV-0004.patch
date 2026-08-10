@@ -1,7 +1,7 @@
-From f9b6cc160a5b43481963ce2d17e22d11d58e29b5 Mon Sep 17 00:00:00 2001
+From 3aec916c1de09978a5ebd1a5843fab007a8c327b Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 3/3] feat(fork): open local VS Code from remote shells
+Subject: [PATCH 3/4] feat(fork): open local VS Code from remote shells
  (IV-0004)
 
 Combine the complete IV-0004 integration:
@@ -10,36 +10,37 @@ Combine the complete IV-0004 integration:
 - final hcode naming
 - VS Code window-preservation behavior
 ---
- src/client/code_open.rs | 433 ++++++++++++++++++++++++++++++++++++++++
- src/client/mod.rs       |  20 +-
+ src/client/code_open.rs | 638 ++++++++++++++++++++++++++++++++++++++++
+ src/client/mod.rs       |  34 ++-
  src/config/model.rs     |  21 ++
  src/main.rs             |   3 +
  src/remote.rs           |   1 +
  src/remote/launcher.rs  |  15 +-
- 6 files changed, 490 insertions(+), 3 deletions(-)
+ 6 files changed, 707 insertions(+), 5 deletions(-)
  create mode 100644 src/client/code_open.rs
 
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
 new file mode 100644
-index 00000000..a839ddba
+index 00000000..8498328c
 --- /dev/null
 +++ b/src/client/code_open.rs
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,638 @@
 +//! `hcode .` typed on a remote herdr host opens local VS Code Remote-SSH.
 +//!
 +//! A shim script installed on the remote host (shipped as
-+//! `extras/remote-bin/hcode` in the patches repo) emits an OSC 52 clipboard
-+//! write whose payload is a magic JSON blob carrying absolute paths. The
-+//! official Linux server already forwards pane OSC 52 writes to the
-+//! foreground client as `ServerMessage::Clipboard`, so the blob arrives here
-+//! with no wire-protocol change. When the decoded payload starts with the
-+//! magic prefix, the client opens a
++//! `extras/remote-bin/hcode` in the patches repo) sends a chunked magic JSON
++//! blob through the existing `herdr terminal title set` API. The official
++//! Linux server forwards those reliable control messages to the foreground
++//! client as `ServerMessage::WindowTitle`, so the request arrives here with no
++//! wire-protocol change and without triggering clipboard-feedback UI. Legacy
++//! OSC 52 requests from older installed shims remain accepted. When the
++//! decoded payload starts with the magic prefix, the client opens a
 +//! `vscode://vscode-remote/ssh-remote+<target>/<path>` URL instead of touching
 +//! the local clipboard. The platform URL handler launches the user's
 +//! registered VS Code installation without a shell or launcher discovery.
 +//!
-+//! Safety posture — any remote program can emit the sequence, so the client
-+//! keeps control of everything that matters:
++//! Safety posture — any remote pane process can invoke the local server API,
++//! so the client keeps control of everything that matters:
 +//! - the ssh authority comes from `HERDR_REMOTE_TARGET` (set by the local
 +//!   launcher), never from the payload;
 +//! - paths must be absolute, control-character-free, and bounded in count
@@ -56,9 +57,12 @@ index 00000000..a839ddba
 +use tracing::{info, warn};
 +
 +/// Decoded payloads must start with these exact bytes to be treated as a
-+/// code-open request; everything else is a normal clipboard write. The shim
-+/// script emits its JSON with this exact key order.
++/// code-open request. The shim emits its JSON with this exact key order;
++/// legacy clipboard payloads without it remain ordinary clipboard writes.
 +const MAGIC_PREFIX: &[u8] = b"{\"herdr\":\"code-open\"";
++/// Prefix carried in `ServerMessage::WindowTitle`. The rest is
++/// `<version>:<request-id>:<index>:<total>:<base64-chunk>`.
++const TITLE_PREFIX: &str = "herdr-code-open:";
 +/// Overrides `remote.code_open` for testing: `HERDR_REMOTE_CODE_OPEN=1`
 +/// forces the feature on, `=0` forces it off.
 +const ENV_VAR: &str = "HERDR_REMOTE_CODE_OPEN";
@@ -69,6 +73,9 @@ index 00000000..a839ddba
 +/// Minimum time between launches, so a hostile remote loop cannot spawn an
 +/// unbounded number of VS Code windows.
 +const MIN_LAUNCH_INTERVAL: Duration = Duration::from_secs(1);
++const TITLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
++const MAX_TITLE_CHUNKS: usize = 512;
++const MAX_ENCODED_PAYLOAD_LEN: usize = 64 * 1024;
 +
 +#[derive(serde::Deserialize)]
 +struct Payload {
@@ -84,7 +91,7 @@ index 00000000..a839ddba
 +    dir: bool,
 +}
 +
-+/// What a clipboard payload turned out to be.
++/// What a decoded code-open transport payload turned out to be.
 +#[derive(Debug, PartialEq, Eq)]
 +enum Outcome {
 +    /// Not a code-open payload; forward it to the clipboard as usual.
@@ -96,16 +103,33 @@ index 00000000..a839ddba
 +    Open(Vec<String>),
 +}
 +
++#[derive(Debug, PartialEq, Eq)]
++enum TitleChunkResult {
++    NotOurs,
++    Pending,
++    Complete(Outcome),
++    Rejected(String),
++}
++
++struct PendingTitleRequest {
++    id: String,
++    total: usize,
++    next_index: usize,
++    encoded: String,
++    updated_at: Instant,
++}
++
 +pub(crate) struct CodeOpen {
 +    target: String,
 +    enabled: bool,
 +    last_launch: Option<Instant>,
++    pending_title: Option<PendingTitleRequest>,
 +}
 +
 +impl CodeOpen {
 +    /// Build the handler for this client process. Returns `None` only when
 +    /// this is not a remote attach; disabled handlers still consume magic
-+    /// payloads so they never overwrite the real clipboard.
++    /// payloads so they never reach the host title or clipboard.
 +    pub(crate) fn from_client_env(config_enabled: bool) -> Option<Self> {
 +        let enabled = match std::env::var(ENV_VAR) {
 +            Ok(value) => match value.trim() {
@@ -117,11 +141,12 @@ index 00000000..a839ddba
 +        };
 +        let target = std::env::var(crate::remote::REMOTE_TARGET_ENV_VAR).ok()?;
 +        // Keep a handler even when disabled or the target is unsupported so
-+        // magic requests are consumed rather than copied into the clipboard.
++        // magic requests are consumed rather than rendered by the host.
 +        Some(Self {
 +            target,
 +            enabled,
 +            last_launch: None,
++            pending_title: None,
 +        })
 +    }
 +
@@ -134,14 +159,35 @@ index 00000000..a839ddba
 +            target,
 +            enabled: true,
 +            last_launch: None,
++            pending_title: None,
 +        })
 +    }
 +
-+    /// Handle a `ServerMessage::Clipboard` payload (base64). Returns true
-+    /// when the payload was a code-open request (whether or not it launched);
-+    /// false means it is a normal clipboard write for the caller to forward.
-+    pub(crate) fn try_handle(&mut self, data: &str) -> bool {
-+        match self.evaluate(data, Instant::now()) {
++    /// Handle a legacy `ServerMessage::Clipboard` payload (base64). Returns
++    /// true when it was a code-open request; false forwards ordinary clipboard
++    /// traffic unchanged.
++    pub(crate) fn try_handle_clipboard(&mut self, data: &str) -> bool {
++        let outcome = self.evaluate(data, Instant::now());
++        self.handle_outcome(outcome)
++    }
++
++    /// Handle the chunked title-control transport used by current `hcode`.
++    /// Magic chunks are always consumed so transport data never becomes the
++    /// host terminal's visible title.
++    pub(crate) fn try_handle_window_title(&mut self, title: &str) -> bool {
++        match self.ingest_title_chunk(title, Instant::now()) {
++            TitleChunkResult::NotOurs => false,
++            TitleChunkResult::Pending => true,
++            TitleChunkResult::Complete(outcome) => self.handle_outcome(outcome),
++            TitleChunkResult::Rejected(reason) => {
++                warn!(reason, "ignored code-open title request from remote");
++                true
++            }
++        }
++    }
++
++    fn handle_outcome(&mut self, outcome: Outcome) -> bool {
++        match outcome {
 +            Outcome::NotOurs => false,
 +            Outcome::Rejected(reason) => {
 +                warn!(reason, "ignored code-open request from remote");
@@ -157,6 +203,89 @@ index 00000000..a839ddba
 +                true
 +            }
 +        }
++    }
++
++    fn ingest_title_chunk(&mut self, title: &str, now: Instant) -> TitleChunkResult {
++        let Some(encoded_header) = title.strip_prefix(TITLE_PREFIX) else {
++            return TitleChunkResult::NotOurs;
++        };
++        if self.pending_title.as_ref().is_some_and(|pending| {
++            now.saturating_duration_since(pending.updated_at) >= TITLE_CHUNK_TIMEOUT
++        }) {
++            self.pending_title = None;
++        }
++
++        let mut fields = encoded_header.splitn(5, ':');
++        let Some((version, id, index, total, chunk)) = fields
++            .next()
++            .zip(fields.next())
++            .zip(fields.next())
++            .zip(fields.next())
++            .zip(fields.next())
++            .map(|((((version, id), index), total), chunk)| (version, id, index, total, chunk))
++        else {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("malformed title chunk".to_string());
++        };
++        if version != "1"
++            || id.is_empty()
++            || id.len() > 32
++            || !id
++                .bytes()
++                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
++        {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("invalid title chunk header".to_string());
++        }
++        let (Ok(index), Ok(total)) = (index.parse::<usize>(), total.parse::<usize>()) else {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("invalid title chunk numbers".to_string());
++        };
++        if total == 0
++            || total > MAX_TITLE_CHUNKS
++            || index >= total
++            || chunk.is_empty()
++            || !chunk
++                .bytes()
++                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
++        {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("invalid title chunk bounds".to_string());
++        }
++
++        if index == 0 {
++            self.pending_title = Some(PendingTitleRequest {
++                id: id.to_string(),
++                total,
++                next_index: 0,
++                encoded: String::new(),
++                updated_at: now,
++            });
++        }
++        let Some(pending) = self.pending_title.as_mut() else {
++            return TitleChunkResult::Rejected("title chunk without a start".to_string());
++        };
++        if pending.id != id || pending.total != total || pending.next_index != index {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("out-of-order title chunk".to_string());
++        }
++        if pending.encoded.len().saturating_add(chunk.len()) > MAX_ENCODED_PAYLOAD_LEN {
++            self.pending_title = None;
++            return TitleChunkResult::Rejected("title request too large".to_string());
++        }
++        pending.encoded.push_str(chunk);
++        pending.next_index += 1;
++        pending.updated_at = now;
++        if pending.next_index < pending.total {
++            return TitleChunkResult::Pending;
++        }
++
++        let encoded = self
++            .pending_title
++            .take()
++            .expect("completed title request exists")
++            .encoded;
++        TitleChunkResult::Complete(self.evaluate(&encoded, now))
 +    }
 +
 +    fn evaluate(&mut self, data: &str, now: Instant) -> Outcome {
@@ -281,6 +410,22 @@ index 00000000..a839ddba
 +        base64::engine::general_purpose::STANDARD.encode(json)
 +    }
 +
++    fn title_chunks(json: &str, id: &str, chunk_size: usize) -> Vec<String> {
++        let encoded = encode(json);
++        let chunks = encoded.as_bytes().chunks(chunk_size).collect::<Vec<_>>();
++        chunks
++            .iter()
++            .enumerate()
++            .map(|(index, chunk)| {
++                format!(
++                    "{TITLE_PREFIX}1:{id}:{index}:{}:{}",
++                    chunks.len(),
++                    std::str::from_utf8(chunk).expect("base64 is ASCII")
++                )
++            })
++            .collect()
++    }
++
 +    #[test]
 +    fn plain_clipboard_payload_is_not_ours() {
 +        let mut code_open = handler();
@@ -297,6 +442,66 @@ index 00000000..a839ddba
 +            code_open.evaluate("not-base64!!!", Instant::now()),
 +            Outcome::NotOurs
 +        );
++    }
++
++    #[test]
++    fn title_chunks_reassemble_without_becoming_window_titles() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/home/u/project with spaces","dir":true}]}"#;
++        let chunks = title_chunks(payload, "1234", 24);
++        let now = Instant::now();
++        for chunk in &chunks[..chunks.len() - 1] {
++            assert_eq!(
++                code_open.ingest_title_chunk(chunk, now),
++                TitleChunkResult::Pending
++            );
++        }
++        assert_eq!(
++            code_open.ingest_title_chunk(chunks.last().unwrap(), now),
++            TitleChunkResult::Complete(Outcome::Open(vec![
++                "vscode://vscode-remote/ssh-remote+deb1/home/u/project%20with%20spaces/?windowId=_blank"
++                    .to_string(),
++            ]))
++        );
++    }
++
++    #[test]
++    fn normal_window_title_is_not_consumed() {
++        let mut code_open = handler();
++        assert_eq!(
++            code_open.ingest_title_chunk("shell: ~/project", Instant::now()),
++            TitleChunkResult::NotOurs
++        );
++    }
++
++    #[test]
++    fn malformed_and_out_of_order_title_chunks_are_consumed_and_reset() {
++        let mut code_open = handler();
++        let now = Instant::now();
++        assert!(matches!(
++            code_open.ingest_title_chunk("herdr-code-open:bad", now),
++            TitleChunkResult::Rejected(_)
++        ));
++        assert!(matches!(
++            code_open.ingest_title_chunk("herdr-code-open:1:req:1:2:YWJj", now),
++            TitleChunkResult::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn stale_title_request_cannot_accept_late_chunks() {
++        let mut code_open = handler();
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/x","dir":true}]}"#;
++        let chunks = title_chunks(payload, "req", 20);
++        let now = Instant::now();
++        assert_eq!(
++            code_open.ingest_title_chunk(&chunks[0], now),
++            TitleChunkResult::Pending
++        );
++        assert!(matches!(
++            code_open.ingest_title_chunk(&chunks[1], now + TITLE_CHUNK_TIMEOUT),
++            TitleChunkResult::Rejected(_)
++        ));
 +    }
 +
 +    #[test]
@@ -459,7 +664,7 @@ index 00000000..a839ddba
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 3eac9c04..8b161185 100644
+index 3eac9c04..990b3101 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -12,6 +12,7 @@
@@ -499,24 +704,40 @@ index 3eac9c04..8b161185 100644
      let mut state = ClientState {
          blit_encoder: render_ansi::BlitEncoder::new(),
          mouse_capture_active: config.mouse_capture_active,
-@@ -1664,8 +1673,15 @@ async fn run_client_loop(
+@@ -1664,12 +1673,29 @@ async fn run_client_loop(
                      handle_notify(kind, &message, body.as_deref(), &state.sound_config);
                  }
                  ServerMessage::Clipboard { data } => {
 -                    forward_clipboard(&data);
 -                    let _ = io::stdout().flush();
-+                    // The remote `hcode` shim rides the OSC 52 channel; its
-+                    // magic payloads must never reach the real clipboard.
++                    // Older installed `hcode` shims used OSC 52; keep their
++                    // magic payloads away from the real clipboard.
 +                    let handled = code_open
 +                        .as_mut()
-+                        .is_some_and(|code_open| code_open.try_handle(&data));
++                        .is_some_and(|code_open| code_open.try_handle_clipboard(&data));
 +                    if !handled {
 +                        forward_clipboard(&data);
 +                        let _ = io::stdout().flush();
 +                    }
                  }
                  ServerMessage::WindowTitle { title } => {
-                     write_window_title(title.as_deref());
+-                    write_window_title(title.as_deref());
+-                    let _ = io::stdout().flush();
++                    // Current `hcode` uses chunked title-control messages so
++                    // the official server does not show clipboard feedback.
++                    // Consume those chunks before touching the host title.
++                    let handled = title.as_deref().is_some_and(|title| {
++                        code_open
++                            .as_mut()
++                            .is_some_and(|code_open| code_open.try_handle_window_title(title))
++                    });
++                    if !handled {
++                        write_window_title(title.as_deref());
++                        let _ = io::stdout().flush();
++                    }
+                 }
+                 ServerMessage::ReloadSoundConfig => {
+                     reload_local_client_config(
 diff --git a/src/config/model.rs b/src/config/model.rs
 index e2bd39bb..5e638b81 100644
 --- a/src/config/model.rs

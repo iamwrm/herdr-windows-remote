@@ -3,7 +3,7 @@
 ## Record
 
 - **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
-  representation; the latest publication is `v0.8.0-win.02` (`hcode` first
+  representation; the latest publication is `v0.8.0-win.03` (`hcode` first
   shipped in `v0.7.5-win.01`); automated tests
   and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
@@ -33,17 +33,22 @@ launch Windows VS Code in Remote-SSH mode, connected through the same ssh target
 The remote server remains the **official Linux herdr binary**. Ownership patch
 `0003` makes no server or wire-protocol changes.
 
-The official server already provides the needed remote-to-local side-effect channel:
+The official server already provides a terminal-safe remote-to-local control
+channel:
 
 ```text
-pane child OSC 52 write
-  → src/pane/osc.rs parses and base64-decodes it
-  → AppEvent::ClipboardWrite
-  → headless server sends ServerMessage::Clipboard to foreground client
-  → local client normally writes it to the host clipboard
+hcode invokes `herdr terminal title set <magic-chunk>`
+  → official server API validates and caps the title message
+  → ServerMessage::WindowTitle reaches the foreground client reliably
+  → patched client consumes magic chunks before host-title rendering
 ```
 
-A remote `hcode` shim emits an OSC 52 write containing a recognizable JSON request. The patched local client intercepts that request before ordinary clipboard forwarding, validates it, and starts local VS Code. Every non-magic OSC 52 payload follows the existing clipboard path unchanged.
+The request is chunked because the official API caps titles at 200 characters.
+The client validates and reassembles the chunks, validates the decoded JSON,
+and starts local VS Code. Ordinary window-title messages remain unchanged.
+Older OSC 52 requests remain accepted so an already-installed legacy `hcode`
+continues to work, but current shims no longer trigger the server's clipboard
+feedback toast.
 
 ## Implemented design
 
@@ -57,7 +62,8 @@ also publish this script as the `hcode` asset.
 - requires `HERDR_ENV=1` (exported by herdr panes), so invoking the shim in a plain ssh shell fails with an explanation;
 - treats no arguments as `.`, resolves each argument with `realpath -m`, and marks existing directories as folders (other paths as files);
 - accepts at most eight paths;
-- emits `OSC 52 ; c ; <base64 JSON> BEL`, for example:
+- base64-encodes and splits the JSON into 128-character chunks, then sends
+  each with `herdr terminal title set`; for example, the decoded payload is:
 
   ```json
   {"herdr":"code-open","v":1,"paths":[{"p":"/home/user/project","dir":true}]}
@@ -65,7 +71,13 @@ also publish this script as the `hcode` asset.
 
 ### Local launcher and client
 
-The remote launcher passes the original ssh target to its child client as `HERDR_REMOTE_TARGET`. The client creates a code-open handler only for such remote clients.
+The remote launcher passes the original ssh target to its child client as
+`HERDR_REMOTE_TARGET`. The client creates a code-open handler only for such
+remote clients. Magic title chunks are intercepted before `write_window_title`,
+so neither protocol data nor launch failures can overwrite the terminal UI.
+Incomplete, stale, oversized, malformed, and out-of-order chunk sequences are
+consumed and discarded. Legacy magic clipboard payloads are still intercepted
+before ordinary clipboard forwarding.
 
 For a valid request, `src/client/code_open.rs` builds a registered VS Code Remote-SSH URL:
 
@@ -103,7 +115,9 @@ Overrides:
 - `HERDR_REMOTE_CODE_OPEN=0` disables launches;
 - `HERDR_REMOTE_CODE_OPEN=1` forces them on.
 
-Disabled, malformed, unsupported-version, invalid-target, invalid-path, and rate-limited magic requests are consumed rather than copied into the real clipboard.
+Disabled, malformed, unsupported-version, invalid-target, invalid-path, and
+rate-limited magic requests are consumed rather than displayed as a terminal
+title or copied into the real clipboard.
 
 ## Install the remote shim
 
@@ -140,8 +154,8 @@ the final `hcode` naming, and VS Code window-preservation behavior.
 
 | File | Change |
 |---|---|
-| `src/client/code_open.rs` | **new** — payload recognition/validation, URL encoding, rate limiting, platform URL opening, unit tests |
-| `src/client/mod.rs` | intercept magic clipboard payloads before ordinary OSC 52 forwarding |
+| `src/client/code_open.rs` | **new** — title-chunk reassembly, legacy clipboard recognition, payload validation, URL encoding, rate limiting, platform URL opening, unit tests |
+| `src/client/mod.rs` | intercept magic title chunks and legacy clipboard payloads before host rendering/forwarding |
 | `src/remote/launcher.rs`, `src/remote.rs` | pass/re-export `HERDR_REMOTE_TARGET` for the spawned local client |
 | `src/config/model.rs` | `remote.code_open` (default true) and config tests |
 
@@ -168,7 +182,8 @@ marker required for VS Code to route file links to a containing window.
 
 ## Security properties
 
-A process running in the remote pane can emit OSC 52, so it can attempt a code-open request. The client limits that capability:
+A process running in the remote pane can invoke the local herdr API, so it can
+attempt a code-open request. The client limits that capability:
 
 - host is fixed to the current local ssh target;
 - only absolute remote paths are accepted;
@@ -184,7 +199,9 @@ This is intentionally not a general remote-to-local command execution mechanism.
 ## Known caveats
 
 - VS Code normally asks for confirmation before opening a remote protocol link. This adds one local confirmation to `hcode .`; users can govern it with VS Code's `security.promptForRemoteFileProtocolHandling` setting.
-- The official server shows its normal **“copied to clipboard”** toast when it receives the shim's OSC 52 request, even though the patched client intercepts the magic payload and does not modify the Windows clipboard. Suppressing that server-side cosmetic toast would require an official-server change or a new wire message, both intentionally out of scope.
+- Legacy installed shims still use OSC 52 and therefore still cause the
+  official server's “copied to clipboard” feedback. Replace the shim with the
+  current release asset to use the title-control transport.
 
 ## Non-goals
 
@@ -206,12 +223,12 @@ Completed on Windows with Zig 0.15.2:
 - `cargo test --locked --bin herdr config::` — 130 passed;
 - release-equivalent `cargo build --release --locked --target
   x86_64-pc-windows-msvc` — clean;
-- focused `client::code_open::tests` — 15 passed after the
-  window-preservation follow-up, including URL encoding, folder/file
-  new-window fallbacks, validation/rate limiting, and disabled-request
-  consumption;
+- focused `client::code_open::tests` — 19 passed after the terminal-safe
+  transport follow-up, including chunk reassembly/reset/timeout, ordinary
+  title passthrough, URL encoding, folder/file new-window fallbacks,
+  validation/rate limiting, and disabled-request consumption;
 - shim payload decoded and inspected successfully;
-- clean-room: all three ownership patches applied with `git am` to a fresh
+- clean-room: all four ownership patches apply with `git am` to a fresh
   `v0.8.0` worktree and exactly match the implementation checkout; the known
   fork-era CI workflow is intentionally excluded from both;
 - `git diff --check` — clean.
@@ -232,7 +249,8 @@ Live deb1 verification:
 
 ## Handoff
 
-- Preserve ordinary clipboard fallback for every non-magic payload.
+- Preserve ordinary title rendering and clipboard fallback for every
+  non-magic payload.
 - Preserve the official-Linux-server/no-protocol-change constraint.
 - Keep launch delegation on the platform URL opener; do not route remote-derived values through a command shell.
 - Ownership patch `0003` applies after IV-0002 patch `0002`; keep all
@@ -241,7 +259,11 @@ Live deb1 verification:
 ## Decisions and deferred work
 
 - Manual shim install was chosen over modifying the remote herdr installation. It keeps the feature explicit and avoids placing unrelated commands on every target.
-- OSC 52 was chosen because the official server already forwards it as a typed protocol message; arbitrary terminal escape passthrough would not survive server-side rendering.
+- OSC 52 was initially chosen because the official server forwards it as a
+  typed protocol message, but its unavoidable clipboard-feedback toast
+  disturbed the terminal interface. The existing title API is also a reliable
+  typed control path, has no feedback toast, and requires only client-side
+  chunk reassembly; OSC 52 remains a backward-compatibility input.
 - Auto-provisioning the shim and broader VS Code CLI compatibility are deferred until live usage demonstrates they are needed.
 
 ## Evidence log
@@ -262,3 +284,9 @@ Live deb1 verification:
   former stack's final tree.
 - 2026-08-04: refreshed patch `0003` onto `v0.8.0`; the then-three-patch
   clean-room apply and current filtered test suites were green.
+- 2026-08-10: replaced the current shim's OSC 52 transport with chunked
+  `client.window_title` control messages. This removes the server clipboard
+  feedback that disturbed the terminal UI while preserving legacy shim
+  compatibility. Focused tests (19), the full client filter (197), script
+  syntax, a fake-server end-to-end chunk reconstruction, clean-room tree
+  reproduction, and production Clippy are green.

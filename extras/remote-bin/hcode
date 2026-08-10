@@ -8,13 +8,12 @@
 #
 # (~/.local/bin must be on PATH.)
 #
-# How it works: inside a herdr pane this script emits an OSC 52 clipboard
-# write whose payload is a magic JSON blob. The herdr server forwards pane
-# OSC 52 writes to the attached client; the patched Windows client (patch
-# 0003, IV-0004) recognizes the blob and launches local VS Code with
-# `vscode://vscode-remote/ssh-remote+<target>` URLs instead of touching the
-# clipboard. Unpatched or non-herdr terminals just get a short junk string
-# on their clipboard, nothing else.
+# How it works: inside a herdr pane this script sends a chunked magic JSON
+# blob through `herdr terminal title set`. The official server forwards those
+# reliable control messages to the attached client; the patched Windows client
+# (patch 0003, IV-0004) consumes them before they reach the host title and
+# launches local VS Code with `vscode://vscode-remote/ssh-remote+<target>` URLs.
+# This avoids the server's normal OSC 52 "copied to clipboard" feedback.
 
 set -eu
 
@@ -47,4 +46,18 @@ done
 json="${json}]}"
 
 b64=$(printf '%s' "$json" | base64 | tr -d '\n')
-printf '\033]52;c;%s\007' "$b64"
+chunk_size=128
+length=${#b64}
+total=$(( (length + chunk_size - 1) / chunk_size ))
+index=0
+while [ "$index" -lt "$total" ]; do
+    start=$((index * chunk_size + 1))
+    end=$((start + chunk_size - 1))
+    chunk=$(printf '%s' "$b64" | cut -c "${start}-${end}")
+    title="herdr-code-open:1:$$:${index}:${total}:${chunk}"
+    if ! herdr terminal title set "$title" >/dev/null; then
+        echo "hcode: failed to send request to the attached herdr client" >&2
+        exit 1
+    fi
+    index=$((index + 1))
+done
