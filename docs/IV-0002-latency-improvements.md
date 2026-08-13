@@ -3,7 +3,7 @@
 ## Record
 
 - **Status:** implemented in ownership patch `0002` of the current four-patch
-  `v0.8.0` representation; the latest publication is `v0.8.0-win.04` (the
+  `v0.8.0` representation; the latest publication is `v0.8.0-win.05` (the
   initial latency stack shipped in `v0.7.5-win.01`); live deb1 verification
   and the W1 packet-capture verdict remain pending
 - **Upstream:** `checkouts/herdr`

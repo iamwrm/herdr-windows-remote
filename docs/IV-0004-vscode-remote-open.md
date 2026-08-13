@@ -3,7 +3,7 @@
 ## Record
 
 - **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
-  representation; the latest publication is `v0.8.0-win.04` (`hcode` first
+  representation; the latest publication is `v0.8.0-win.05` (`hcode` first
   shipped in `v0.7.5-win.01`); automated tests, isolated Windows launch
   verification, and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
@@ -105,7 +105,9 @@ null stdin/stdout/stderr and, on Windows, `CREATE_NO_WINDOW`. The broker
 revalidates the fixed `vscode://vscode-remote/ssh-remote+` prefix and then
 invokes the platform URL opener. This prevents VS Code, Electron, and extension
 hosts from attaching to or inheriting the client's raw alternate-screen
-console.
+console. The client monitors the broker and reports launch or handler failures
+with a rate-limited native notification while retaining details in
+`herdr-client.log`.
 
 On Windows the broker uses `ShellExecuteExW` with `SEE_MASK_FLAG_NO_UI` to
 suppress shell-generated association/error dialogs and `SEE_MASK_NOASYNC` so
@@ -130,7 +132,10 @@ Overrides:
 
 Disabled, malformed, unsupported-version, invalid-target, invalid-path, and
 rate-limited magic requests are consumed rather than displayed as a terminal
-title or copied into the real clipboard.
+title or copied into the real clipboard. Rejections and launch failures produce
+at most one native failure notification per 30 seconds; normal success stays
+silent. Default info logs record only the ssh target and path count, not remote
+absolute paths or complete VS Code URLs.
 
 ## Install the remote shim
 
@@ -216,6 +221,12 @@ This is intentionally not a general remote-to-local command execution mechanism.
 ## Known caveats
 
 - VS Code normally asks for confirmation before opening a remote protocol link. This adds one local confirmation to `hcode .`; users can govern it with VS Code's `security.promptForRemoteFileProtocolHandling` setting.
+- `hcode` treats a successful API exchange with `changed = false` as a delivery
+  failure, reports the bounded sanitized response, and exits nonzero instead of
+  claiming that a detached client accepted the request.
+- Up to eight title requests can be reassembled concurrently. Additional
+  in-flight requests are rejected and notified rather than allowing an
+  unbounded remote process to consume client memory.
 - Legacy installed shims still use OSC 52 and therefore still cause the
   official server's “copied to clipboard” feedback. Replace the shim with the
   current release asset to use the title-control transport.
@@ -240,11 +251,11 @@ Completed on Windows with Zig 0.15.2:
 - `cargo test --locked --bin herdr config::` — 130 passed;
 - release-equivalent `cargo build --release --locked --target
   x86_64-pc-windows-msvc` — clean;
-- focused `client::code_open::tests` — 22 passed after the isolated-launch
-  follow-up, including chunk reassembly/reset/timeout, final magic-chunk
-  consumption, broker URL/argv validation, ordinary title passthrough, URL
-  encoding, folder/file new-window fallbacks, validation/rate limiting, and
-  disabled-request consumption;
+- focused `client::code_open::tests` — 26 passed after the failure-visibility
+  follow-up, including interleaved bounded chunk reassembly/reset/timeout,
+  final magic-chunk consumption, broker URL/argv validation, notification
+  throttling, ordinary title passthrough, URL encoding, folder/file new-window
+  fallbacks, validation/rate limiting, and disabled-request consumption;
 - shim payload decoded and inspected successfully; `sh -n` passes, and a
   failing fake `herdr terminal title set` produces no stdout and only hcode's
   single stable delivery error;
@@ -321,3 +332,11 @@ Live deb1 verification:
   broker; suppressed only shell-generated error UI; and made every prefixed
   title chunk terminal-private. Focused tests (22), the broker launch smoke,
   script syntax, production Clippy, and clean-room reproduction are green.
+- 2026-08-13: hardened failure visibility and concurrency. `hcode` now rejects
+  `changed = false` API responses and preserves bounded sanitized transport
+  errors; the client monitors broker exit, emits rate-limited native failure
+  notifications, avoids logging full remote paths at info, and reassembles up
+  to eight interleaved request IDs independently. Focused tests (26), shim
+  success/no-client/transport-failure smoke cases, production Clippy with
+  warnings denied, formatting, clean-room reproduction, and whitespace checks
+  are green.

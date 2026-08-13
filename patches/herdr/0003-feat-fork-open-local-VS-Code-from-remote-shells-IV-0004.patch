@@ -1,4 +1,4 @@
-From 51da32794d692c87173cb973304452ad03c96538 Mon Sep 17 00:00:00 2001
+From c0f15aa3c6a3fdbe413dfb5136c73c77751f3edc Mon Sep 17 00:00:00 2001
 From: iamwrm <iamwrm@gmail.com>
 Date: Sun, 2 Aug 2026 00:03:34 +0800
 Subject: [PATCH 3/4] feat(fork): open local VS Code from remote shells
@@ -11,15 +11,15 @@ Combine the complete IV-0004 integration:
 - no-console Windows broker for terminal-safe protocol-handler launches
 ---
  Cargo.toml              |   1 +
- src/client/code_open.rs | 744 ++++++++++++++++++++++++++++++++++++++++
+ src/client/code_open.rs | 953 ++++++++++++++++++++++++++++++++++++++++
  src/client/mod.rs       |  35 +-
- src/config/model.rs     |  21 ++
+ src/config/model.rs     |  21 +
  src/main.rs             |  14 +
  src/platform/mod.rs     |   5 +
  src/platform/windows.rs |  32 +-
  src/remote.rs           |   1 +
  src/remote/launcher.rs  |  15 +-
- 9 files changed, 859 insertions(+), 9 deletions(-)
+ 9 files changed, 1068 insertions(+), 9 deletions(-)
  create mode 100644 src/client/code_open.rs
 
 diff --git a/Cargo.toml b/Cargo.toml
@@ -36,10 +36,10 @@ index c6d89bed..a7498577 100644
      "Win32_UI_Input_KeyboardAndMouse",
 diff --git a/src/client/code_open.rs b/src/client/code_open.rs
 new file mode 100644
-index 00000000..3e738f16
+index 00000000..ad3da98d
 --- /dev/null
 +++ b/src/client/code_open.rs
-@@ -0,0 +1,744 @@
+@@ -0,0 +1,953 @@
 +//! `hcode .` typed on a remote herdr host opens local VS Code Remote-SSH.
 +//!
 +//! A shim script installed on the remote host (shipped as
@@ -68,13 +68,15 @@ index 00000000..3e738f16
 +//!   feature entirely.
 +
 +use std::{
++    collections::HashMap,
 +    path::Path,
 +    process::{Command, Stdio},
++    sync::{Mutex, OnceLock},
 +    time::{Duration, Instant},
 +};
 +
 +use base64::Engine;
-+use tracing::{info, warn};
++use tracing::{debug, info, warn};
 +
 +/// Decoded payloads must start with these exact bytes to be treated as a
 +/// code-open request. The shim emits its JSON with this exact key order;
@@ -99,8 +101,13 @@ index 00000000..3e738f16
 +/// unbounded number of VS Code windows.
 +const MIN_LAUNCH_INTERVAL: Duration = Duration::from_secs(1);
 +const TITLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
++const MAX_PENDING_TITLE_REQUESTS: usize = 8;
 +const MAX_TITLE_CHUNKS: usize = 512;
 +const MAX_ENCODED_PAYLOAD_LEN: usize = 64 * 1024;
++const FAILURE_NOTIFICATION_INTERVAL: Duration = Duration::from_secs(30);
++
++#[cfg_attr(test, allow(dead_code))]
++static LAST_FAILURE_NOTIFICATION: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 +
 +#[derive(serde::Deserialize)]
 +struct Payload {
@@ -137,11 +144,70 @@ index 00000000..3e738f16
 +}
 +
 +struct PendingTitleRequest {
-+    id: String,
 +    total: usize,
 +    next_index: usize,
 +    encoded: String,
 +    updated_at: Instant,
++}
++
++fn failure_notification_due(last_notification: &mut Option<Instant>, now: Instant) -> bool {
++    if last_notification
++        .is_some_and(|last| now.saturating_duration_since(last) < FAILURE_NOTIFICATION_INTERVAL)
++    {
++        return false;
++    }
++    *last_notification = Some(now);
++    true
++}
++
++fn notify_code_open_failure(body: &'static str) {
++    #[cfg(test)]
++    let _ = body;
++
++    #[cfg(not(test))]
++    notify_code_open_failure_with(body, Instant::now(), |title, body| {
++        crate::platform::show_desktop_notification(title, Some(body))
++    });
++}
++
++#[cfg(not(test))]
++fn notify_code_open_failure_with(
++    body: &'static str,
++    now: Instant,
++    notify: impl FnOnce(&str, &str) -> std::io::Result<bool> + Send + 'static,
++) {
++    let last_notification = LAST_FAILURE_NOTIFICATION.get_or_init(|| Mutex::new(None));
++    let should_notify = last_notification
++        .lock()
++        .map(|mut last| failure_notification_due(&mut last, now))
++        .unwrap_or(false);
++    if !should_notify {
++        return;
++    }
++
++    if let Err(err) = std::thread::Builder::new()
++        .name("herdr-code-open-notification".into())
++        .spawn(move || match notify("hcode could not open VS Code", body) {
++            Ok(true) => {}
++            Ok(false) => debug!("desktop notifications are unavailable for hcode failure"),
++            Err(err) => warn!(%err, "failed to show hcode failure notification"),
++        })
++    {
++        warn!(%err, "failed to start hcode failure notification thread");
++    }
++}
++
++fn rejection_notification_body(reason: &str) -> &'static str {
++    match reason {
++        "disabled by remote.code_open" => {
++            "Opening VS Code from hcode is disabled by remote.code_open."
++        }
++        "rate limited" => "Too many hcode requests were sent; the latest request was ignored.",
++        "unsupported ssh target syntax" => {
++            "The active SSH target cannot be represented in a VS Code Remote-SSH URL."
++        }
++        _ => "The hcode request was rejected. See herdr-client.log for details.",
++    }
 +}
 +
 +/// Run the hidden URL-opening broker when this is its exact invocation.
@@ -193,7 +259,24 @@ index 00000000..3e738f16
 +        ));
 +    }
 +    let executable = std::env::current_exe()?;
-+    broker_command(&executable, url).spawn()?;
++    let mut child = broker_command(&executable, url).spawn()?;
++    std::thread::Builder::new()
++        .name("herdr-code-open-broker-monitor".into())
++        .spawn(move || match child.wait() {
++            Ok(status) if status.success() => {}
++            Ok(status) => {
++                warn!(%status, "isolated VS Code URL broker failed");
++                notify_code_open_failure(
++                    "Windows could not open the VS Code Remote-SSH link. See herdr-client.log for details.",
++                );
++            }
++            Err(err) => {
++                warn!(%err, "failed to wait for isolated VS Code URL broker");
++                notify_code_open_failure(
++                    "The VS Code launch result could not be checked. See herdr-client.log for details.",
++                );
++            }
++        })?;
 +    Ok(())
 +}
 +
@@ -201,7 +284,7 @@ index 00000000..3e738f16
 +    target: String,
 +    enabled: bool,
 +    last_launch: Option<Instant>,
-+    pending_title: Option<PendingTitleRequest>,
++    pending_titles: HashMap<String, PendingTitleRequest>,
 +}
 +
 +impl CodeOpen {
@@ -224,7 +307,7 @@ index 00000000..3e738f16
 +            target,
 +            enabled,
 +            last_launch: None,
-+            pending_title: None,
++            pending_titles: HashMap::new(),
 +        })
 +    }
 +
@@ -237,7 +320,7 @@ index 00000000..3e738f16
 +            target,
 +            enabled: true,
 +            last_launch: None,
-+            pending_title: None,
++            pending_titles: HashMap::new(),
 +        })
 +    }
 +
@@ -256,14 +339,24 @@ index 00000000..3e738f16
 +        match self.ingest_title_chunk(title, Instant::now()) {
 +            TitleChunkResult::NotOurs => false,
 +            TitleChunkResult::Pending => true,
++            TitleChunkResult::Complete(Outcome::NotOurs) => {
++                warn!("ignored code-open title request with an unrecognized payload");
++                notify_code_open_failure(
++                    "The hcode request payload was not recognized. Update the remote hcode shim.",
++                );
++                true
++            }
 +            TitleChunkResult::Complete(outcome) => {
 +                // Once a message used our transport prefix, consume its final
-+                // chunk even if the reassembled payload is not ours.
++                // chunk even if the reassembled payload is rejected.
 +                self.handle_outcome(outcome);
 +                true
 +            }
 +            TitleChunkResult::Rejected(reason) => {
 +                warn!(reason, "ignored code-open title request from remote");
++                notify_code_open_failure(
++                    "The hcode request could not be reconstructed. See herdr-client.log for details.",
++                );
 +                true
 +            }
 +        }
@@ -273,14 +366,26 @@ index 00000000..3e738f16
 +        match outcome {
 +            Outcome::NotOurs => false,
 +            Outcome::Rejected(reason) => {
-+                warn!(reason, "ignored code-open request from remote");
++                if reason == "rate limited" {
++                    debug!(reason, "ignored code-open request from remote");
++                } else {
++                    warn!(reason, "ignored code-open request from remote");
++                }
++                notify_code_open_failure(rejection_notification_body(&reason));
 +                true
 +            }
 +            Outcome::Open(urls) => {
-+                info!(?urls, "opening VS Code for remote code-open request");
++                info!(
++                    target = %self.target,
++                    path_count = urls.len(),
++                    "opening VS Code for remote code-open request"
++                );
 +                for url in urls {
 +                    if let Err(err) = open_url_from_isolated_broker(&url) {
 +                        warn!(%err, "failed to start isolated VS Code URL broker");
++                        notify_code_open_failure(
++                            "The isolated VS Code launcher could not be started. See herdr-client.log for details.",
++                        );
 +                    }
 +                }
 +                true
@@ -292,11 +397,9 @@ index 00000000..3e738f16
 +        let Some(encoded_header) = title.strip_prefix(TITLE_PREFIX) else {
 +            return TitleChunkResult::NotOurs;
 +        };
-+        if self.pending_title.as_ref().is_some_and(|pending| {
-+            now.saturating_duration_since(pending.updated_at) >= TITLE_CHUNK_TIMEOUT
-+        }) {
-+            self.pending_title = None;
-+        }
++        self.pending_titles.retain(|_, pending| {
++            now.saturating_duration_since(pending.updated_at) < TITLE_CHUNK_TIMEOUT
++        });
 +
 +        let mut fields = encoded_header.splitn(5, ':');
 +        let Some((version, id, index, total, chunk)) = fields
@@ -307,21 +410,21 @@ index 00000000..3e738f16
 +            .zip(fields.next())
 +            .map(|((((version, id), index), total), chunk)| (version, id, index, total, chunk))
 +        else {
-+            self.pending_title = None;
 +            return TitleChunkResult::Rejected("malformed title chunk".to_string());
 +        };
-+        if version != "1"
-+            || id.is_empty()
-+            || id.len() > 32
-+            || !id
++        let valid_id = !id.is_empty()
++            && id.len() <= 32
++            && id
 +                .bytes()
-+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-+        {
-+            self.pending_title = None;
++                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
++        if version != "1" || !valid_id {
++            if valid_id {
++                self.pending_titles.remove(id);
++            }
 +            return TitleChunkResult::Rejected("invalid title chunk header".to_string());
 +        }
 +        let (Ok(index), Ok(total)) = (index.parse::<usize>(), total.parse::<usize>()) else {
-+            self.pending_title = None;
++            self.pending_titles.remove(id);
 +            return TitleChunkResult::Rejected("invalid title chunk numbers".to_string());
 +        };
 +        if total == 0
@@ -332,30 +435,44 @@ index 00000000..3e738f16
 +                .bytes()
 +                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 +        {
-+            self.pending_title = None;
++            self.pending_titles.remove(id);
 +            return TitleChunkResult::Rejected("invalid title chunk bounds".to_string());
 +        }
 +
 +        if index == 0 {
-+            self.pending_title = Some(PendingTitleRequest {
-+                id: id.to_string(),
-+                total,
-+                next_index: 0,
-+                encoded: String::new(),
-+                updated_at: now,
-+            });
++            if !self.pending_titles.contains_key(id)
++                && self.pending_titles.len() >= MAX_PENDING_TITLE_REQUESTS
++            {
++                return TitleChunkResult::Rejected(
++                    "too many concurrent title requests".to_string(),
++                );
++            }
++            self.pending_titles.insert(
++                id.to_string(),
++                PendingTitleRequest {
++                    total,
++                    next_index: 0,
++                    encoded: String::new(),
++                    updated_at: now,
++                },
++            );
 +        }
-+        let Some(pending) = self.pending_title.as_mut() else {
++        let Some(pending) = self.pending_titles.get(id) else {
 +            return TitleChunkResult::Rejected("title chunk without a start".to_string());
 +        };
-+        if pending.id != id || pending.total != total || pending.next_index != index {
-+            self.pending_title = None;
++        if pending.total != total || pending.next_index != index {
++            self.pending_titles.remove(id);
 +            return TitleChunkResult::Rejected("out-of-order title chunk".to_string());
 +        }
 +        if pending.encoded.len().saturating_add(chunk.len()) > MAX_ENCODED_PAYLOAD_LEN {
-+            self.pending_title = None;
++            self.pending_titles.remove(id);
 +            return TitleChunkResult::Rejected("title request too large".to_string());
 +        }
++
++        let pending = self
++            .pending_titles
++            .get_mut(id)
++            .expect("validated title request exists");
 +        pending.encoded.push_str(chunk);
 +        pending.next_index += 1;
 +        pending.updated_at = now;
@@ -364,8 +481,8 @@ index 00000000..3e738f16
 +        }
 +
 +        let encoded = self
-+            .pending_title
-+            .take()
++            .pending_titles
++            .remove(id)
 +            .expect("completed title request exists")
 +            .encoded;
 +        TitleChunkResult::Complete(self.evaluate(&encoded, now))
@@ -403,9 +520,9 @@ index 00000000..3e738f16
 +        }
 +
 +        let mut urls = Vec::with_capacity(payload.paths.len());
-+        for path in &payload.paths {
++        for (index, path) in payload.paths.iter().enumerate() {
 +            if let Err(reason) = validate_remote_path(&path.p) {
-+                return Outcome::Rejected(format!("rejected path {:?}: {reason}", path.p));
++                return Outcome::Rejected(format!("rejected path {index}: {reason}"));
 +            }
 +            urls.push(remote_url(&self.target, &path.p, path.dir));
 +        }
@@ -610,6 +727,97 @@ index 00000000..3e738f16
 +    }
 +
 +    #[test]
++    fn interleaved_title_requests_reassemble_independently() {
++        let mut code_open = handler();
++        let first = title_chunks(
++            r#"{"herdr":"code-open","v":1,"paths":[{"p":"/a","dir":true}]}"#,
++            "first",
++            24,
++        );
++        let second = title_chunks(
++            r#"{"herdr":"code-open","v":1,"paths":[{"p":"/b","dir":true}]}"#,
++            "second",
++            24,
++        );
++        let now = Instant::now();
++        // Test chunk reassembly independently from the launch-rate policy.
++        code_open.last_launch = Some(now - MIN_LAUNCH_INTERVAL);
++
++        let mut first_result = None;
++        let mut second_result = None;
++        for index in 0..first.len().max(second.len()) {
++            if let Some(chunk) = first.get(index) {
++                let result = code_open.ingest_title_chunk(chunk, now);
++                if index + 1 == first.len() {
++                    first_result = Some(result);
++                    code_open.last_launch = Some(now - MIN_LAUNCH_INTERVAL);
++                } else {
++                    assert_eq!(result, TitleChunkResult::Pending);
++                }
++            }
++            if let Some(chunk) = second.get(index) {
++                let result = code_open.ingest_title_chunk(chunk, now);
++                if index + 1 == second.len() {
++                    second_result = Some(result);
++                } else {
++                    assert_eq!(result, TitleChunkResult::Pending);
++                }
++            }
++        }
++
++        assert!(matches!(
++            first_result,
++            Some(TitleChunkResult::Complete(Outcome::Open(_)))
++        ));
++        assert!(matches!(
++            second_result,
++            Some(TitleChunkResult::Complete(Outcome::Open(_)))
++        ));
++    }
++
++    #[test]
++    fn concurrent_title_requests_are_bounded() {
++        let mut code_open = handler();
++        let now = Instant::now();
++        for index in 0..MAX_PENDING_TITLE_REQUESTS {
++            assert_eq!(
++                code_open.ingest_title_chunk(&format!("{TITLE_PREFIX}1:req{index}:0:2:YWJj"), now,),
++                TitleChunkResult::Pending
++            );
++        }
++        assert!(matches!(
++            code_open.ingest_title_chunk(&format!("{TITLE_PREFIX}1:overflow:0:2:YWJj"), now,),
++            TitleChunkResult::Rejected(_)
++        ));
++    }
++
++    #[test]
++    fn failure_notifications_are_rate_limited() {
++        let now = Instant::now();
++        let mut last = None;
++        assert!(failure_notification_due(&mut last, now));
++        assert!(!failure_notification_due(
++            &mut last,
++            now + FAILURE_NOTIFICATION_INTERVAL - Duration::from_millis(1)
++        ));
++        assert!(failure_notification_due(
++            &mut last,
++            now + FAILURE_NOTIFICATION_INTERVAL
++        ));
++    }
++
++    #[test]
++    fn rejection_notifications_explain_actionable_cases_without_private_data() {
++        assert!(rejection_notification_body("disabled by remote.code_open")
++            .contains("remote.code_open"));
++        assert!(rejection_notification_body("rate limited").contains("Too many"));
++        assert!(
++            !rejection_notification_body("rejected path 0: not absolute")
++                .contains("private-project")
++        );
++    }
++
++    #[test]
 +    fn stale_title_request_cannot_accept_late_chunks() {
 +        let mut code_open = handler();
 +        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"/x","dir":true}]}"#;
@@ -677,13 +885,14 @@ index 00000000..3e738f16
 +    }
 +
 +    #[test]
-+    fn relative_path_is_rejected() {
++    fn relative_path_is_rejected_without_echoing_the_path() {
 +        let mut code_open = handler();
-+        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"proj","dir":true}]}"#;
-+        assert!(matches!(
-+            code_open.evaluate(&encode(payload), Instant::now()),
-+            Outcome::Rejected(_)
-+        ));
++        let payload = r#"{"herdr":"code-open","v":1,"paths":[{"p":"private-project","dir":true}]}"#;
++        let Outcome::Rejected(reason) = code_open.evaluate(&encode(payload), Instant::now()) else {
++            panic!("expected rejection");
++        };
++        assert_eq!(reason, "rejected path 0: not absolute");
++        assert!(!reason.contains("private-project"));
 +    }
 +
 +    #[test]

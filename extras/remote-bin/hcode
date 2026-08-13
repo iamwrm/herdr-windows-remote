@@ -55,10 +55,18 @@ while [ "$index" -lt "$total" ]; do
     end=$((start + chunk_size - 1))
     chunk=$(printf '%s' "$b64" | cut -c "${start}-${end}")
     title="herdr-code-open:1:$$:${index}:${total}:${chunk}"
-    # Suppress the transport command's own diagnostics; hcode emits one
-    # stable error below if the request could not be delivered.
-    if ! herdr terminal title set "$title" >/dev/null 2>&1; then
-        echo "hcode: failed to send request to the attached herdr client" >&2
+    # Keep successful API JSON out of the pane, but preserve a concise,
+    # sanitized reason when the server rejects or cannot deliver the chunk.
+    if response=$(herdr terminal title set "$title" 2>&1); then
+        :
+    else
+        detail=$(printf '%s' "$response" | tr '\r\n\t' '   ' | LC_ALL=C tr -cd '[:print:]' | cut -c 1-240)
+        echo "hcode: failed to send request to the attached herdr client${detail:+: $detail}" >&2
+        exit 1
+    fi
+    if ! printf '%s' "$response" | grep -Eq '"changed"[[:space:]]*:[[:space:]]*true([,}])'; then
+        detail=$(printf '%s' "$response" | tr '\r\n\t' '   ' | LC_ALL=C tr -cd '[:print:]' | cut -c 1-240)
+        echo "hcode: no attached herdr client accepted the request${detail:+: $detail}" >&2
         exit 1
     fi
     index=$((index + 1))
