@@ -1,4 +1,4 @@
-From caa464db04ff51ab30e7b4f9b2566e2d98d6263a Mon Sep 17 00:00:00 2001
+From 18e97318f3b79871b8baae0cedb2041ea5c3b35a Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Fri, 14 Aug 2026 02:14:40 -0700
 Subject: [PATCH] feat(remote): bridge Windows clipboard images (IV-0007)
@@ -1206,7 +1206,7 @@ index 6e157019..f50ef790 100644
          .expect("start bridge listener");
  
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
-index 29a73dfb..c612b071 100644
+index 29a73dfb..5e9e16bd 100644
 --- a/src/remote/windows.rs
 +++ b/src/remote/windows.rs
 @@ -23,9 +23,9 @@
@@ -1527,9 +1527,9 @@ index 29a73dfb..c612b071 100644
 +            .stdin
 +            .as_mut()
 +            .ok_or_else(|| StoreFailure::Unavailable(io::Error::other("image store is closed")))?;
-+        write!(
++        writeln!(
 +            stdin,
-+            "{REMOTE_IMAGE_STORE_PROTOCOL} {size} {extension} {capacity_bytes}\n"
++            "{REMOTE_IMAGE_STORE_PROTOCOL} {size} {extension} {capacity_bytes}"
 +        )
 +        .and_then(|()| stdin.write_all(data))
 +        .and_then(|()| stdin.flush())
