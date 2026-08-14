@@ -1,25 +1,25 @@
-From 7a568698c43c021d19e258074c9209deb2d5072f Mon Sep 17 00:00:00 2001
+From 3821c3a4b3f164dfc3cfd95b2a1dc472830d94fb Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Fri, 14 Aug 2026 02:14:40 -0700
 Subject: [PATCH] feat(remote): bridge Windows clipboard images (IV-0007)
 
 ---
- src/client/mod.rs                         | 271 +++++++++--
- src/config/model.rs                       |  60 ++-
+ src/client/mod.rs                         | 270 +++++++++--
+ src/config/model.rs                       |  58 ++-
  src/main.rs                               |   4 +
  src/platform/mod.rs                       |   5 +
  src/platform/windows.rs                   |  80 +++-
- src/platform/windows_clipboard.rs         | 325 +++++++++++++
+ src/platform/windows_clipboard.rs         | 328 ++++++++++++++
  src/remote/launcher.rs                    |   7 +
  src/remote/linux_clipboard_image_store.sh | 131 ++++++
  src/remote/unix.rs                        |   2 +
- src/remote/windows.rs                     | 546 ++++++++++++++++++++--
- 10 files changed, 1361 insertions(+), 70 deletions(-)
+ src/remote/windows.rs                     | 528 ++++++++++++++++++++--
+ 10 files changed, 1343 insertions(+), 70 deletions(-)
  create mode 100644 src/platform/windows_clipboard.rs
  create mode 100644 src/remote/linux_clipboard_image_store.sh
 
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 3ece6315..1ea93719 100644
+index 3ece6315..c70d1603 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
 @@ -42,7 +42,6 @@ use tracing::{debug, info, warn};
@@ -53,21 +53,18 @@ index 3ece6315..1ea93719 100644
      /// Whether outer focus gain should force a full host-terminal redraw.
      redraw_on_focus_gained: bool,
      /// Whether the next semantic frame must repaint every cell without clearing the surface.
-@@ -1139,8 +1141,12 @@ fn run_client_with_mode(
+@@ -1139,8 +1141,9 @@ fn run_client_with_mode(
      let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
      let host_cursor = loaded_config.config.ui.host_cursor;
      let direct_attach_requested = attach_request.is_some();
 -    #[cfg(unix)]
      let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
 +    #[cfg(windows)]
-+    let clipboard_image_buffer_bytes = loaded_config
-+        .config
-+        .remote
-+        .clipboard_image_buffer_bytes();
++    let clipboard_image_buffer_bytes = loaded_config.config.remote.clipboard_image_buffer_bytes();
      let kitty_graphics_enabled =
          loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
      let loop_config = ClientLoopConfig {
-@@ -1152,8 +1158,9 @@ fn run_client_with_mode(
+@@ -1152,8 +1155,9 @@ fn run_client_with_mode(
          host_cursor,
          kitty_graphics_enabled,
          mouse_capture_active: mouse_capture,
@@ -78,7 +75,7 @@ index 3ece6315..1ea93719 100644
      };
  
      let socket_path = client_socket_path();
-@@ -1339,8 +1346,9 @@ async fn run_client_loop(
+@@ -1339,8 +1343,9 @@ async fn run_client_loop(
          attach_escape,
          #[cfg(unix)]
          mouse_scroll_lines: config.mouse_scroll_lines,
@@ -89,7 +86,7 @@ index 3ece6315..1ea93719 100644
          redraw_on_focus_gained: config.redraw_on_focus_gained,
          repaint_pending: false,
          draw_host_cursor,
-@@ -1555,29 +1563,69 @@ async fn run_client_loop(
+@@ -1555,29 +1560,69 @@ async fn run_client_loop(
                  if state.attach_escape.is_some() {
                      continue;
                  }
@@ -181,7 +178,7 @@ index 3ece6315..1ea93719 100644
              }
              #[cfg(windows)]
              ClientLoopEvent::StdinThemeReport(data) => {
-@@ -1703,7 +1751,6 @@ async fn run_client_loop(
+@@ -1703,7 +1748,6 @@ async fn run_client_loop(
                          &mut state.sound_config,
                          &mut state.redraw_on_focus_gained,
                          &mut state.draw_host_cursor,
@@ -189,7 +186,7 @@ index 3ece6315..1ea93719 100644
                          &mut state.remote_image_paste_key,
                      );
                  }
-@@ -1828,11 +1875,98 @@ fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<
+@@ -1828,11 +1872,97 @@ fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<
      protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
  }
  
@@ -264,14 +261,13 @@ index 3ece6315..1ea93719 100644
 +    let mut before = Vec::new();
 +    let mut after = Vec::new();
 +    for (index, event) in events.into_iter().enumerate() {
-+        let matches_binding = configured_key.is_some_and(|configured_key| {
-+            match event.to_raw_input_event() {
++        let matches_binding =
++            configured_key.is_some_and(|configured_key| match event.to_raw_input_event() {
 +                crate::raw_input::RawInputEvent::Key(key) => {
 +                    crate::config::terminal_key_matches_combo(&key, configured_key)
 +                }
 +                _ => false,
-+            }
-+        });
++            });
 +        if index < trigger_index {
 +            before.push(event);
 +        } else if index > trigger_index && !matches_binding {
@@ -289,7 +285,7 @@ index 3ece6315..1ea93719 100644
  fn client_remote_image_paste_key(
      config: &crate::config::Config,
  ) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
-@@ -1853,7 +1987,7 @@ fn reload_local_client_config(
+@@ -1853,7 +1983,7 @@ fn reload_local_client_config(
      sound_config: &mut crate::config::SoundConfig,
      redraw_on_focus_gained: &mut bool,
      draw_host_cursor: &mut bool,
@@ -298,7 +294,7 @@ index 3ece6315..1ea93719 100644
          crossterm::event::KeyCode,
          crossterm::event::KeyModifiers,
      )>,
-@@ -1863,15 +1997,11 @@ fn reload_local_client_config(
+@@ -1863,15 +1993,11 @@ fn reload_local_client_config(
              for diagnostic in loaded.config.ui.sound.diagnostics() {
                  warn!(diagnostic = %diagnostic, "local sound config diagnostic");
              }
@@ -315,7 +311,7 @@ index 3ece6315..1ea93719 100644
              debug!("reloaded local client config");
          }
          Err(diagnostics) => {
-@@ -2590,6 +2720,73 @@ mod tests {
+@@ -2590,6 +2716,76 @@ mod tests {
          ));
      }
  
@@ -383,13 +379,16 @@ index 3ece6315..1ea93719 100644
 +        let events = [crate::protocol::ClientInputEvent::Paste {
 +            text: String::new(),
 +        }];
-+        assert_eq!(remote_image_paste_trigger_index(&events, true, None), Some(0));
++        assert_eq!(
++            remote_image_paste_trigger_index(&events, true, None),
++            Some(0)
++        );
 +    }
 +
      #[cfg(unix)]
      struct TempImageFile {
          path: std::path::PathBuf,
-@@ -3174,14 +3371,12 @@ mod tests {
+@@ -3174,14 +3370,12 @@ mod tests {
          let mut sound_config = crate::config::SoundConfig::default();
          let mut redraw_on_focus_gained = true;
          let mut draw_host_cursor = false;
@@ -405,7 +404,7 @@ index 3ece6315..1ea93719 100644
          );
  
 diff --git a/src/config/model.rs b/src/config/model.rs
-index 5e638b81..9c49df36 100644
+index 5e638b81..2ea49293 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
 @@ -10,6 +10,8 @@ use super::{
@@ -433,7 +432,7 @@ index 5e638b81..9c49df36 100644
      /// Allow the remote `hcode` shim script to open local VS Code Remote-SSH
      /// windows for paths on the attached host (`hcode .` inside
      /// `herdr --remote`). The client only ever launches VS Code with
-@@ -906,11 +917,38 @@ impl Default for RemoteConfig {
+@@ -906,11 +917,36 @@ impl Default for RemoteConfig {
              manage_ssh_config: true,
              tcp_relay: false,
              predictive_echo: "auto".to_string(),
@@ -449,9 +448,7 @@ index 5e638b81..9c49df36 100644
 +    }
 +}
 +
-+fn deserialize_remote_clipboard_image_buffer_mb<'de, D>(
-+    deserializer: D,
-+) -> Result<u64, D::Error>
++fn deserialize_remote_clipboard_image_buffer_mb<'de, D>(deserializer: D) -> Result<u64, D::Error>
 +where
 +    D: Deserializer<'de>,
 +{
@@ -472,7 +469,7 @@ index 5e638b81..9c49df36 100644
  #[derive(Debug, Default, Deserialize)]
  #[serde(default)]
  pub struct ExperimentalConfig {
-@@ -1610,19 +1648,39 @@ mouse_scroll_lines = 0
+@@ -1610,19 +1646,39 @@ mouse_scroll_lines = 0
      }
  
      #[test]
@@ -484,7 +481,10 @@ index 5e638b81..9c49df36 100644
 +            config.remote.clipboard_image_buffer_mb,
 +            DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB
 +        );
-+        assert_eq!(config.remote.clipboard_image_buffer_bytes(), 64 * 1024 * 1024);
++        assert_eq!(
++            config.remote.clipboard_image_buffer_bytes(),
++            64 * 1024 * 1024
++        );
  
          let toml = r#"
  [remote]
@@ -499,10 +499,7 @@ index 5e638b81..9c49df36 100644
  
 +    #[test]
 +    fn remote_clipboard_image_buffer_rejects_zero_and_excessive_values() {
-+        assert!(toml::from_str::<Config>(
-+            "[remote]\nclipboard_image_buffer_mb = 0\n"
-+        )
-+        .is_err());
++        assert!(toml::from_str::<Config>("[remote]\nclipboard_image_buffer_mb = 0\n").is_err());
 +        assert!(toml::from_str::<Config>(&format!(
 +            "[remote]\nclipboard_image_buffer_mb = {}\n",
 +            MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB + 1
@@ -552,7 +549,7 @@ index a6a106aa..3da1e440 100644
  mod fallback;
  #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 diff --git a/src/platform/windows.rs b/src/platform/windows.rs
-index 7450b05b..0120e27f 100644
+index 7450b05b..7d4f90f6 100644
 --- a/src/platform/windows.rs
 +++ b/src/platform/windows.rs
 @@ -22,7 +22,10 @@ use windows_sys::{
@@ -634,8 +631,8 @@ index 7450b05b..0120e27f 100644
 +    }
 +
 +    for format in [CF_DIBV5 as u32, CF_DIB as u32] {
-+        if let Some(bytes) = clipboard_format_bytes(format)
-+            .and_then(|bytes| windows_clipboard::dib_to_png(&bytes))
++        if let Some(bytes) =
++            clipboard_format_bytes(format).and_then(|bytes| windows_clipboard::dib_to_png(&bytes))
 +        {
 +            return Some(ClipboardImage {
 +                bytes,
@@ -674,10 +671,10 @@ index 7450b05b..0120e27f 100644
      let url = wide_null(url);
 diff --git a/src/platform/windows_clipboard.rs b/src/platform/windows_clipboard.rs
 new file mode 100644
-index 00000000..612ce383
+index 00000000..e117201e
 --- /dev/null
 +++ b/src/platform/windows_clipboard.rs
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,328 @@
 +//! Pure Windows clipboard bitmap decoding.
 +//!
 +//! Kept free of Win32 calls so the DIB parser can be exercised by the normal
@@ -836,9 +833,14 @@ index 00000000..612ce383
 +    compression: u32,
 +) -> Option<usize> {
 +    let mut offset = header_size;
-+    if header_size == BITMAPINFOHEADER_SIZE && matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS)
++    if header_size == BITMAPINFOHEADER_SIZE
++        && matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS)
 +    {
-+        offset = offset.checked_add(if compression == BI_ALPHABITFIELDS { 16 } else { 12 })?;
++        offset = offset.checked_add(if compression == BI_ALPHABITFIELDS {
++            16
++        } else {
++            12
++        })?;
 +    }
 +
 +    // CF_DIBV5 may place an embedded color profile between its header and
@@ -950,9 +952,7 @@ index 00000000..612ce383
 +        assert_eq!((width, height), (2, 2));
 +        assert_eq!(
 +            rgba,
-+            vec![
-+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
-+            ]
++            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,]
 +        );
 +    }
 +
@@ -1193,7 +1193,7 @@ index 6e157019..f50ef790 100644
          .expect("start bridge listener");
  
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
-index 29a73dfb..b4b67ef6 100644
+index 29a73dfb..9ec3fd0e 100644
 --- a/src/remote/windows.rs
 +++ b/src/remote/windows.rs
 @@ -23,9 +23,9 @@
@@ -1277,7 +1277,7 @@ index 29a73dfb..b4b67ef6 100644
          // Dropping `child_stdin` closes the remote bridge's stdin so the
          // remote side detaches this client.
      });
-@@ -305,41 +327,361 @@ fn bridge_connection(
+@@ -305,39 +327,351 @@ fn bridge_connection(
      }
  }
  
@@ -1375,9 +1375,7 @@ index 29a73dfb..b4b67ef6 100644
 +    if payload_len > MAX_GRAPHICS_FRAME_SIZE {
 +        return Err(io::Error::new(
 +            io::ErrorKind::InvalidData,
-+            format!(
-+                "client frame size {payload_len} exceeds maximum {MAX_GRAPHICS_FRAME_SIZE}"
-+            ),
++            format!("client frame size {payload_len} exceeds maximum {MAX_GRAPHICS_FRAME_SIZE}"),
 +        ));
 +    }
 +    frame.resize(FRAME_LENGTH_PREFIX_BYTES + payload_len, 0);
@@ -1395,7 +1393,7 @@ index 29a73dfb..b4b67ef6 100644
 +            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
 +            Err(err) => return Err(err),
 +        }
-+    }
+     }
 +    Ok(true)
 +}
 +
@@ -1443,11 +1441,7 @@ index 29a73dfb..b4b67ef6 100644
 +}
 +
 +impl RemoteClipboardImageStore {
-+    fn new(
-+        target: String,
-+        ssh_options: Option<ManagedSshOptions>,
-+        capacity_bytes: u64,
-+    ) -> Self {
++    fn new(target: String, ssh_options: Option<ManagedSshOptions>, capacity_bytes: u64) -> Self {
 +        Self {
 +            target,
 +            ssh_options,
@@ -1538,9 +1532,9 @@ index 29a73dfb..b4b67ef6 100644
 +                "remote store returned duplicate READY response",
 +            ))),
 +        }
-     }
- }
- 
++    }
++}
++
 +impl ClipboardImageStore for RemoteClipboardImageStore {
 +    fn store(&mut self, extension: &str, data: &[u8]) -> Result<String, StoreFailure> {
 +        let result = self.store_once(extension, data);
@@ -1617,9 +1611,7 @@ index 29a73dfb..b4b67ef6 100644
 +fn normalized_image_extension(extension: &str) -> Option<&'static str> {
 +    if extension.eq_ignore_ascii_case("png") {
 +        Some("png")
-+    } else if extension.eq_ignore_ascii_case("jpg")
-+        || extension.eq_ignore_ascii_case("jpeg")
-+    {
++    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
 +        Some("jpg")
 +    } else if extension.eq_ignore_ascii_case("gif") {
 +        Some("gif")
@@ -1652,12 +1644,10 @@ index 29a73dfb..b4b67ef6 100644
 +
 +fn remote_image_store_command() -> String {
 +    format!("exec /bin/sh -c {}", shell_quote(REMOTE_IMAGE_STORE_SCRIPT))
-+}
-+
+ }
+ 
  /// Repeatedly cancels in-flight I/O on the pipe until the pump thread exits.
- /// The caller must have set the pump's stop flag first, so a cancel that
- /// lands between two reads is followed by a clean flag-observed exit instead
-@@ -469,22 +811,171 @@ mod tests {
+@@ -469,22 +803,161 @@ mod tests {
          let stop = Arc::new(AtomicBool::new(false));
          let pump_stop = Arc::clone(&stop);
          let pump = thread::spawn(move || {
@@ -1717,12 +1707,7 @@ index 29a73dfb..b4b67ef6 100644
 +                calls: captured_calls,
 +                result: Some(Ok("/tmp/herdr-ren/clipboard-abc.png".to_owned())),
 +            };
-+            pump_client_to_ssh(
-+                &server,
-+                &mut pump_sink,
-+                &pump_stop,
-+                Some(&mut store),
-+            );
++            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop, Some(&mut store));
 +        });
 +
 +        crate::protocol::write_message(
@@ -1788,12 +1773,7 @@ index 29a73dfb..b4b67ef6 100644
 +                    "ssh unavailable",
 +                )))),
 +            };
-+            pump_client_to_ssh(
-+                &server,
-+                &mut pump_sink,
-+                &pump_stop,
-+                Some(&mut store),
-+            );
++            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop, Some(&mut store));
 +        });
 +        let image = ClientMessage::ClipboardImage {
 +            extension: "png".to_owned(),
@@ -1833,7 +1813,7 @@ index 29a73dfb..b4b67ef6 100644
      #[test]
      fn pump_blocked_in_read_is_released_by_cancel() {
          let (client, server) = pipe_pair("cancel");
-@@ -493,7 +984,7 @@ mod tests {
+@@ -493,7 +966,7 @@ mod tests {
          let stop = Arc::new(AtomicBool::new(false));
          let pump_stop = Arc::clone(&stop);
          let pump = thread::spawn(move || {
@@ -1842,7 +1822,7 @@ index 29a73dfb..b4b67ef6 100644
          });
  
          // Let the pump enter its blocking read, then stop it the way
-@@ -522,6 +1013,7 @@ mod tests {
+@@ -522,6 +995,7 @@ mod tests {
              socket.clone(),
              "default".to_string(),
              None,
