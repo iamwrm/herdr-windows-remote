@@ -1,4 +1,4 @@
-From 3821c3a4b3f164dfc3cfd95b2a1dc472830d94fb Mon Sep 17 00:00:00 2001
+From caa464db04ff51ab30e7b4f9b2566e2d98d6263a Mon Sep 17 00:00:00 2001
 From: Codex <codex@openai.com>
 Date: Fri, 14 Aug 2026 02:14:40 -0700
 Subject: [PATCH] feat(remote): bridge Windows clipboard images (IV-0007)
@@ -8,13 +8,13 @@ Subject: [PATCH] feat(remote): bridge Windows clipboard images (IV-0007)
  src/config/model.rs                       |  58 ++-
  src/main.rs                               |   4 +
  src/platform/mod.rs                       |   5 +
- src/platform/windows.rs                   |  80 +++-
+ src/platform/windows.rs                   |  86 +++-
  src/platform/windows_clipboard.rs         | 328 ++++++++++++++
  src/remote/launcher.rs                    |   7 +
  src/remote/linux_clipboard_image_store.sh | 131 ++++++
  src/remote/unix.rs                        |   2 +
  src/remote/windows.rs                     | 528 ++++++++++++++++++++--
- 10 files changed, 1343 insertions(+), 70 deletions(-)
+ 10 files changed, 1343 insertions(+), 76 deletions(-)
  create mode 100644 src/platform/windows_clipboard.rs
  create mode 100644 src/remote/linux_clipboard_image_store.sh
 
@@ -549,7 +549,7 @@ index a6a106aa..3da1e440 100644
  mod fallback;
  #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 diff --git a/src/platform/windows.rs b/src/platform/windows.rs
-index 7450b05b..7d4f90f6 100644
+index 7450b05b..1c270c16 100644
 --- a/src/platform/windows.rs
 +++ b/src/platform/windows.rs
 @@ -22,7 +22,10 @@ use windows_sys::{
@@ -669,6 +669,19 @@ index 7450b05b..7d4f90f6 100644
  pub fn open_url(url: &str) -> std::io::Result<()> {
      let operation = wide_null("open");
      let url = wide_null(url);
+@@ -1266,12 +1338,6 @@ pub(crate) fn open_url_from_isolated_broker(url: &str) -> std::io::Result<()> {
+     }
+ }
+ 
+-// Windows does not wire clipboard-image bridging into semantic input yet.
+-#[cfg_attr(windows, allow(dead_code))]
+-pub fn read_clipboard_image() -> Option<ClipboardImage> {
+-    None
+-}
+-
+ pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
+     let title = title.to_owned();
+     let body = body.unwrap_or(&title).to_owned();
 diff --git a/src/platform/windows_clipboard.rs b/src/platform/windows_clipboard.rs
 new file mode 100644
 index 00000000..e117201e
@@ -1193,7 +1206,7 @@ index 6e157019..f50ef790 100644
          .expect("start bridge listener");
  
 diff --git a/src/remote/windows.rs b/src/remote/windows.rs
-index 29a73dfb..9ec3fd0e 100644
+index 29a73dfb..c612b071 100644
 --- a/src/remote/windows.rs
 +++ b/src/remote/windows.rs
 @@ -23,9 +23,9 @@
@@ -1201,7 +1214,7 @@ index 29a73dfb..9ec3fd0e 100644
  
  use std::fs;
 -use std::io::{self, Read as _};
-+use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
++use std::io::{self, BufRead as _, BufReader, Write as _};
  use std::path::PathBuf;
 -use std::process::{Command, Stdio};
 +use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
