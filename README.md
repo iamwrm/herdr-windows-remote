@@ -1,5 +1,7 @@
 # herdr-windows-remote
 
+[![Latest version](https://img.shields.io/github/v/tag/iamwrm/herdr-windows-remote?filter=v%2A-win.%2A&sort=date&label=latest%20version)](https://github.com/iamwrm/herdr-windows-remote/releases)
+
 Patches and tooling on top of [herdrdev/herdr](https://github.com/herdrdev/herdr)
 centered on **`herdr --remote <ssh-target>` from the native Windows binary**,
 which upstream ships as unsupported in the Windows beta, plus client-side
