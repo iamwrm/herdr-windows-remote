@@ -2,7 +2,7 @@
 
 ## Record
 
-- **Status:** implemented as the current four-patch `v0.8.0` representation;
+- **Status:** implemented as the current five-patch `v0.8.0` representation;
   the latest publication is `v0.8.0-win.05`
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
@@ -185,7 +185,7 @@ labelled) for diagnosing slow attaches.
 - expected cosmetic warning if the remote login shell's PATH lacks
   `~/.local/bin`: *"remote shell does not resolve `herdr` to that path"* —
   harmless, the launcher always uses the absolute path
-- clean-room: the complete four-patch series applies with `git am` to a fresh
+- clean-room: the complete five-patch series applies with `git am` to a fresh
   worktree at `v0.8.0` and reproduces the implementation tree exactly; the
   obsolete fork CI workflow remains intentionally outside the series
 

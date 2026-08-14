@@ -136,7 +136,7 @@ Landing results:
   round-trip through the real encoder;
 - complete client filter: 193 passed;
 - production Clippy: clean with `-D warnings`;
-- the complete four-patch series applies to a fresh detached `v0.8.0`
+- the complete five-patch series applies to a fresh detached `v0.8.0`
   worktree and reproduces the implementation tree exactly.
 
 The disposable Prime Agent checkout remained unmodified. A live installed

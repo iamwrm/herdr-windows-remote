@@ -2,7 +2,7 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0002` of the current four-patch
+- **Status:** implemented in ownership patch `0002` of the current five-patch
   `v0.8.0` representation; the latest publication is `v0.8.0-win.05` (the
   initial latency stack shipped in `v0.7.5-win.01`); live deb1 verification
   and the W1 packet-capture verdict remain pending
@@ -432,7 +432,7 @@ Done at landing time (Windows dev machine, Zig 0.15.2 via `ZIG=`):
   cursor-only space confirmation, timeout, hidden/cross-row/full frames,
   stale IME-anchor replacement, one-write framing, and one-message console
   batches.
-- Clean-room: the complete four-patch series `git am` applies to a fresh
+- Clean-room: the complete five-patch series `git am` applies to a fresh
   `v0.8.0` worktree and reproduces the refreshed implementation tree exactly;
   the fork-era CI workflow remains deliberately outside the series.
 
