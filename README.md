@@ -18,6 +18,9 @@ series, version-bump runbook, and retirement criteria. Additional initiatives
 cover [remote latency/predictive echo](docs/IV-0002-latency-improvements.md),
 [automatic software-cursor compatibility for Prime Agent and pi](docs/IV-0006-software-cursor-predictive-echo.md),
 and [`hcode .` → local VS Code Remote-SSH](docs/IV-0004-vscode-remote-open.md).
+The Windows remote client can also
+[copy clipboard images into a bounded per-user Linux FIFO](docs/IV-0007-windows-clipboard-images.md)
+and paste the resulting `/tmp/herdr-<user>/...` path into the active pane.
 The former [pi-side cursor adapter](docs/IV-0003-pi-predictive-echo.md) remains
 only for older builds.
 Native Windows system notifications were retired from this patch stack after

@@ -50,6 +50,7 @@ The current herdr series has one patch per owning initiative:
 | `0002` | [IV-0002](IV-0002-latency-improvements.md) | high-RTT attach, transport, and predictive-input latency |
 | `0003` | [IV-0004](IV-0004-vscode-remote-open.md) | remote-shell `hcode` integration |
 | `0004` | [IV-0006](IV-0006-software-cursor-predictive-echo.md) | safe predictive echo for hidden reverse-video software cursors |
+| `0005` | [IV-0007](IV-0007-windows-clipboard-images.md) | Windows clipboard images into a bounded per-user Linux FIFO |
 
 [IV-0003](IV-0003-pi-predictive-echo.md) owns a legacy pi extension for older
 builds; patch `0004` supersedes it for current builds. The former IV-0005

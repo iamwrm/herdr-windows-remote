@@ -1,0 +1,1855 @@
+From 7a568698c43c021d19e258074c9209deb2d5072f Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Fri, 14 Aug 2026 02:14:40 -0700
+Subject: [PATCH] feat(remote): bridge Windows clipboard images (IV-0007)
+
+---
+ src/client/mod.rs                         | 271 +++++++++--
+ src/config/model.rs                       |  60 ++-
+ src/main.rs                               |   4 +
+ src/platform/mod.rs                       |   5 +
+ src/platform/windows.rs                   |  80 +++-
+ src/platform/windows_clipboard.rs         | 325 +++++++++++++
+ src/remote/launcher.rs                    |   7 +
+ src/remote/linux_clipboard_image_store.sh | 131 ++++++
+ src/remote/unix.rs                        |   2 +
+ src/remote/windows.rs                     | 546 ++++++++++++++++++++--
+ 10 files changed, 1361 insertions(+), 70 deletions(-)
+ create mode 100644 src/platform/windows_clipboard.rs
+ create mode 100644 src/remote/linux_clipboard_image_store.sh
+
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 3ece6315..1ea93719 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -42,7 +42,6 @@ use tracing::{debug, info, warn};
+ 
+ use crate::ipc::LocalStream;
+ use crate::protocol::render_ansi;
+-#[cfg(unix)]
+ use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
+ use crate::protocol::{
+     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
+@@ -69,8 +68,9 @@ struct ClientLoopConfig {
+     host_cursor: crate::config::HostCursorModeConfig,
+     kitty_graphics_enabled: bool,
+     mouse_capture_active: bool,
+-    #[cfg(unix)]
+     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
++    #[cfg(windows)]
++    clipboard_image_buffer_bytes: u64,
+ }
+ 
+ /// State tracking for the thin client.
+@@ -93,8 +93,10 @@ struct ClientState {
+     #[cfg(unix)]
+     mouse_scroll_lines: usize,
+     /// Local-client shortcut that sends a clipboard image to a remote Herdr session.
+-    #[cfg(unix)]
+     remote_image_paste_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
++    /// Configured aggregate budget for images staged by a Windows remote attach.
++    #[cfg(windows)]
++    clipboard_image_buffer_bytes: u64,
+     /// Whether outer focus gain should force a full host-terminal redraw.
+     redraw_on_focus_gained: bool,
+     /// Whether the next semantic frame must repaint every cell without clearing the surface.
+@@ -1139,8 +1141,12 @@ fn run_client_with_mode(
+     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
+     let host_cursor = loaded_config.config.ui.host_cursor;
+     let direct_attach_requested = attach_request.is_some();
+-    #[cfg(unix)]
+     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
++    #[cfg(windows)]
++    let clipboard_image_buffer_bytes = loaded_config
++        .config
++        .remote
++        .clipboard_image_buffer_bytes();
+     let kitty_graphics_enabled =
+         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
+     let loop_config = ClientLoopConfig {
+@@ -1152,8 +1158,9 @@ fn run_client_with_mode(
+         host_cursor,
+         kitty_graphics_enabled,
+         mouse_capture_active: mouse_capture,
+-        #[cfg(unix)]
+         remote_image_paste_key,
++        #[cfg(windows)]
++        clipboard_image_buffer_bytes,
+     };
+ 
+     let socket_path = client_socket_path();
+@@ -1339,8 +1346,9 @@ async fn run_client_loop(
+         attach_escape,
+         #[cfg(unix)]
+         mouse_scroll_lines: config.mouse_scroll_lines,
+-        #[cfg(unix)]
+         remote_image_paste_key: config.remote_image_paste_key,
++        #[cfg(windows)]
++        clipboard_image_buffer_bytes: config.clipboard_image_buffer_bytes,
+         redraw_on_focus_gained: config.redraw_on_focus_gained,
+         repaint_pending: false,
+         draw_host_cursor,
+@@ -1555,29 +1563,69 @@ async fn run_client_loop(
+                 if state.attach_escape.is_some() {
+                     continue;
+                 }
+-                let raw_events = events
+-                    .iter()
+-                    .map(crate::protocol::ClientInputEvent::to_raw_input_event)
+-                    .collect::<Vec<_>>();
+-                if crate::raw_input::events_require_host_surface_redraw(
+-                    &raw_events,
+-                    state.redraw_on_focus_gained,
+-                ) {
+-                    state.request_repaint();
+-                }
+-                let prediction_output = predictor
+-                    .as_mut()
+-                    .map(|predictor| predictor.on_input_events(&events))
+-                    .unwrap_or_default();
+-                write_prediction_output(&prediction_output);
+-                let probe_input = events.iter().any(echo_timing::is_key_or_paste_event);
+-                let msg = ClientMessage::InputEvents { events };
+-                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+-                    return Err(ClientError::ConnectionLost(e));
+-                }
+-                if probe_input {
+-                    echo_timing.on_key_input_sent();
++                let image_trigger = remote_image_paste_trigger_index(
++                    &events,
++                    is_remote_client_process(),
++                    state.remote_image_paste_key,
++                );
++                if let Some(trigger_index) = image_trigger {
++                    if let Some(image) = crate::platform::read_clipboard_image() {
++                        let (before, after) = events_around_remote_image_paste_trigger(
++                            events,
++                            trigger_index,
++                            state.remote_image_paste_key,
++                        );
++                        forward_windows_input_events(
++                            before,
++                            &mut state,
++                            &mut predictor,
++                            &mut echo_timing,
++                            &mut write_stream,
++                        )?;
++
++                        let configured_max = usize::try_from(state.clipboard_image_buffer_bytes)
++                            .unwrap_or(usize::MAX);
++                        let max_bytes = MAX_CLIPBOARD_IMAGE_PAYLOAD.min(configured_max);
++                        if image.bytes.len() <= max_bytes {
++                            info!(
++                                bytes = image.bytes.len(),
++                                extension = image.extension,
++                                "bridging Windows clipboard image to remote Linux host"
++                            );
++                            write_to_server(
++                                &mut write_stream,
++                                &ClientMessage::ClipboardImage {
++                                    extension: image.extension.to_owned(),
++                                    data: image.bytes,
++                                },
++                            )
++                            .map_err(ClientError::ConnectionLost)?;
++                            echo_timing.on_key_input_sent();
++                        } else {
++                            warn!(
++                                bytes = image.bytes.len(),
++                                max = max_bytes,
++                                "local clipboard image exceeds the configured remote FIFO budget"
++                            );
++                        }
++
++                        forward_windows_input_events(
++                            after,
++                            &mut state,
++                            &mut predictor,
++                            &mut echo_timing,
++                            &mut write_stream,
++                        )?;
++                        continue;
++                    }
+                 }
++                forward_windows_input_events(
++                    events,
++                    &mut state,
++                    &mut predictor,
++                    &mut echo_timing,
++                    &mut write_stream,
++                )?;
+             }
+             #[cfg(windows)]
+             ClientLoopEvent::StdinThemeReport(data) => {
+@@ -1703,7 +1751,6 @@ async fn run_client_loop(
+                         &mut state.sound_config,
+                         &mut state.redraw_on_focus_gained,
+                         &mut state.draw_host_cursor,
+-                        #[cfg(unix)]
+                         &mut state.remote_image_paste_key,
+                     );
+                 }
+@@ -1828,11 +1875,98 @@ fn write_to_server(stream: &mut LocalStream, msg: &ClientMessage) -> io::Result<
+     protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
+ }
+ 
++#[cfg(windows)]
++fn forward_windows_input_events(
++    events: Vec<crate::protocol::ClientInputEvent>,
++    state: &mut ClientState,
++    predictor: &mut Option<predict::Predictor>,
++    echo_timing: &mut echo_timing::EchoTiming,
++    write_stream: &mut LocalStream,
++) -> Result<(), ClientError> {
++    if events.is_empty() {
++        return Ok(());
++    }
++    let raw_events = events
++        .iter()
++        .map(crate::protocol::ClientInputEvent::to_raw_input_event)
++        .collect::<Vec<_>>();
++    if crate::raw_input::events_require_host_surface_redraw(
++        &raw_events,
++        state.redraw_on_focus_gained,
++    ) {
++        state.request_repaint();
++    }
++    let prediction_output = predictor
++        .as_mut()
++        .map(|predictor| predictor.on_input_events(&events))
++        .unwrap_or_default();
++    write_prediction_output(&prediction_output);
++    let probe_input = events.iter().any(echo_timing::is_key_or_paste_event);
++    write_to_server(write_stream, &ClientMessage::InputEvents { events })
++        .map_err(ClientError::ConnectionLost)?;
++    if probe_input {
++        echo_timing.on_key_input_sent();
++    }
++    Ok(())
++}
++
++#[cfg(any(windows, test))]
++fn remote_image_paste_trigger_index(
++    events: &[crate::protocol::ClientInputEvent],
++    is_remote_client: bool,
++    configured_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
++) -> Option<usize> {
++    if !is_remote_client {
++        return None;
++    }
++    events.iter().position(|event| match event {
++        crate::protocol::ClientInputEvent::Paste { text } if text.is_empty() => true,
++        _ => {
++            let Some(configured_key) = configured_key else {
++                return false;
++            };
++            let crate::raw_input::RawInputEvent::Key(key) = event.to_raw_input_event() else {
++                return false;
++            };
++            key.kind == crossterm::event::KeyEventKind::Press
++                && crate::config::terminal_key_matches_combo(&key, configured_key)
++        }
++    })
++}
++
++#[cfg(any(windows, test))]
++fn events_around_remote_image_paste_trigger(
++    events: Vec<crate::protocol::ClientInputEvent>,
++    trigger_index: usize,
++    configured_key: Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
++) -> (
++    Vec<crate::protocol::ClientInputEvent>,
++    Vec<crate::protocol::ClientInputEvent>,
++) {
++    let mut before = Vec::new();
++    let mut after = Vec::new();
++    for (index, event) in events.into_iter().enumerate() {
++        let matches_binding = configured_key.is_some_and(|configured_key| {
++            match event.to_raw_input_event() {
++                crate::raw_input::RawInputEvent::Key(key) => {
++                    crate::config::terminal_key_matches_combo(&key, configured_key)
++                }
++                _ => false,
++            }
++        });
++        if index < trigger_index {
++            before.push(event);
++        } else if index > trigger_index && !matches_binding {
++            after.push(event);
++        }
++    }
++    (before, after)
++}
++
+ // ---------------------------------------------------------------------------
+ // Notifications
+ // ---------------------------------------------------------------------------
+ 
+-#[cfg(unix)]
+ fn client_remote_image_paste_key(
+     config: &crate::config::Config,
+ ) -> Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)> {
+@@ -1853,7 +1987,7 @@ fn reload_local_client_config(
+     sound_config: &mut crate::config::SoundConfig,
+     redraw_on_focus_gained: &mut bool,
+     draw_host_cursor: &mut bool,
+-    #[cfg(unix)] remote_image_paste_key: &mut Option<(
++    remote_image_paste_key: &mut Option<(
+         crossterm::event::KeyCode,
+         crossterm::event::KeyModifiers,
+     )>,
+@@ -1863,15 +1997,11 @@ fn reload_local_client_config(
+             for diagnostic in loaded.config.ui.sound.diagnostics() {
+                 warn!(diagnostic = %diagnostic, "local sound config diagnostic");
+             }
+-            #[cfg(unix)]
+             let loaded_remote_image_paste_key = client_remote_image_paste_key(&loaded.config);
+             *sound_config = loaded.config.ui.sound;
+             *redraw_on_focus_gained = loaded.config.ui.redraw_on_focus_gained;
+             *draw_host_cursor = should_draw_host_cursor(loaded.config.ui.host_cursor);
+-            #[cfg(unix)]
+-            {
+-                *remote_image_paste_key = loaded_remote_image_paste_key;
+-            }
++            *remote_image_paste_key = loaded_remote_image_paste_key;
+             debug!("reloaded local client config");
+         }
+         Err(diagnostics) => {
+@@ -2590,6 +2720,73 @@ mod tests {
+         ));
+     }
+ 
++    fn client_key_event(
++        code: crate::protocol::ClientKeyCode,
++        modifiers: crossterm::event::KeyModifiers,
++        kind: crate::protocol::ClientKeyKind,
++    ) -> crate::protocol::ClientInputEvent {
++        crate::protocol::ClientInputEvent::Key {
++            code,
++            modifiers: modifiers.bits(),
++            kind,
++            repeat_count: 1,
++            generated_text: None,
++            source: crate::protocol::ClientKeySource::Synthesized,
++        }
++    }
++
++    #[test]
++    fn windows_clipboard_image_trigger_consumes_only_its_binding() {
++        let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
++        let focus = crate::protocol::ClientInputEvent::FocusGained;
++        let press = client_key_event(
++            crate::protocol::ClientKeyCode::Char('v'),
++            crossterm::event::KeyModifiers::CONTROL,
++            crate::protocol::ClientKeyKind::Press,
++        );
++        let release = client_key_event(
++            crate::protocol::ClientKeyCode::Char('v'),
++            crossterm::event::KeyModifiers::CONTROL,
++            crate::protocol::ClientKeyKind::Release,
++        );
++        let trailing = crate::protocol::ClientInputEvent::FocusLost;
++        let events = vec![focus.clone(), press, release, trailing.clone()];
++
++        assert_eq!(
++            remote_image_paste_trigger_index(&events, true, Some(ctrl_v)),
++            Some(1)
++        );
++        assert_eq!(
++            remote_image_paste_trigger_index(&events, false, Some(ctrl_v)),
++            None
++        );
++        let (before, after) = events_around_remote_image_paste_trigger(events, 1, Some(ctrl_v));
++        assert_eq!(before, vec![focus]);
++        assert_eq!(after, vec![trailing]);
++    }
++
++    #[test]
++    fn windows_clipboard_image_trigger_ignores_key_release() {
++        let ctrl_v = crate::config::parse_key_combo("ctrl+v").unwrap();
++        let release = client_key_event(
++            crate::protocol::ClientKeyCode::Char('v'),
++            crossterm::event::KeyModifiers::CONTROL,
++            crate::protocol::ClientKeyKind::Release,
++        );
++        assert_eq!(
++            remote_image_paste_trigger_index(&[release], true, Some(ctrl_v)),
++            None
++        );
++    }
++
++    #[test]
++    fn windows_clipboard_image_trigger_accepts_empty_host_paste() {
++        let events = [crate::protocol::ClientInputEvent::Paste {
++            text: String::new(),
++        }];
++        assert_eq!(remote_image_paste_trigger_index(&events, true, None), Some(0));
++    }
++
+     #[cfg(unix)]
+     struct TempImageFile {
+         path: std::path::PathBuf,
+@@ -3174,14 +3371,12 @@ mod tests {
+         let mut sound_config = crate::config::SoundConfig::default();
+         let mut redraw_on_focus_gained = true;
+         let mut draw_host_cursor = false;
+-        #[cfg(unix)]
+         let mut remote_image_paste_key = None;
+ 
+         reload_local_client_config(
+             &mut sound_config,
+             &mut redraw_on_focus_gained,
+             &mut draw_host_cursor,
+-            #[cfg(unix)]
+             &mut remote_image_paste_key,
+         );
+ 
+diff --git a/src/config/model.rs b/src/config/model.rs
+index 5e638b81..9c49df36 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -10,6 +10,8 @@ use super::{
+ };
+ 
+ pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
++pub const DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB: u64 = 64;
++pub const MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB: u64 = 1024 * 1024;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+ #[serde(rename_all = "lowercase")]
+@@ -892,6 +894,15 @@ pub struct RemoteConfig {
+     /// once echo delay is observed to be high), or `"always"`.
+     /// Default: "auto".
+     pub predictive_echo: String,
++    /// Windows remote attach only: maximum aggregate size of clipboard images
++    /// retained in `/tmp/herdr-<remote-user>/`. Oldest images are deleted
++    /// first when a new image would exceed this per-user FIFO budget.
++    /// Default: 64 MiB.
++    #[serde(
++        default = "default_remote_clipboard_image_buffer_mb",
++        deserialize_with = "deserialize_remote_clipboard_image_buffer_mb"
++    )]
++    pub clipboard_image_buffer_mb: u64,
+     /// Allow the remote `hcode` shim script to open local VS Code Remote-SSH
+     /// windows for paths on the attached host (`hcode .` inside
+     /// `herdr --remote`). The client only ever launches VS Code with
+@@ -906,11 +917,38 @@ impl Default for RemoteConfig {
+             manage_ssh_config: true,
+             tcp_relay: false,
+             predictive_echo: "auto".to_string(),
++            clipboard_image_buffer_mb: DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB,
+             code_open: true,
+         }
+     }
+ }
+ 
++impl RemoteConfig {
++    pub(crate) fn clipboard_image_buffer_bytes(&self) -> u64 {
++        self.clipboard_image_buffer_mb * 1024 * 1024
++    }
++}
++
++fn deserialize_remote_clipboard_image_buffer_mb<'de, D>(
++    deserializer: D,
++) -> Result<u64, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    let value = u64::deserialize(deserializer)?;
++    if (1..=MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB).contains(&value) {
++        Ok(value)
++    } else {
++        Err(de::Error::custom(format!(
++            "remote.clipboard_image_buffer_mb must be between 1 and {MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB}"
++        )))
++    }
++}
++
++fn default_remote_clipboard_image_buffer_mb() -> u64 {
++    DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB
++}
++
+ #[derive(Debug, Default, Deserialize)]
+ #[serde(default)]
+ pub struct ExperimentalConfig {
+@@ -1610,19 +1648,39 @@ mouse_scroll_lines = 0
+     }
+ 
+     #[test]
+-    fn remote_config_defaults_and_code_open_parse() {
++    fn remote_config_defaults_and_overrides_parse() {
+         let config = Config::default();
+         assert!(config.remote.code_open);
++        assert_eq!(
++            config.remote.clipboard_image_buffer_mb,
++            DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB
++        );
++        assert_eq!(config.remote.clipboard_image_buffer_bytes(), 64 * 1024 * 1024);
+ 
+         let toml = r#"
+ [remote]
+ code_open = false
++clipboard_image_buffer_mb = 128
+ "#;
+         let config: Config = toml::from_str(toml).unwrap();
+         assert!(!config.remote.code_open);
++        assert_eq!(config.remote.clipboard_image_buffer_mb, 128);
+         assert!(config.remote.manage_ssh_config);
+     }
+ 
++    #[test]
++    fn remote_clipboard_image_buffer_rejects_zero_and_excessive_values() {
++        assert!(toml::from_str::<Config>(
++            "[remote]\nclipboard_image_buffer_mb = 0\n"
++        )
++        .is_err());
++        assert!(toml::from_str::<Config>(&format!(
++            "[remote]\nclipboard_image_buffer_mb = {}\n",
++            MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB + 1
++        ))
++        .is_err());
++    }
++
+     #[test]
+     fn toast_config_parses() {
+         let toml = r#"
+diff --git a/src/main.rs b/src/main.rs
+index 6978e46c..78215d90 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -402,6 +402,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
+ # Predictive local echo for remote terminal attach: "off", "auto", or "always".
+ # Auto displays predictions only after observing enough network latency.
+ # predictive_echo = "auto"
++# Windows remote attach: aggregate FIFO budget (MiB) for images copied into
++# /tmp/herdr-<remote-user>/. Oldest images are removed first.
++# clipboard_image_buffer_mb = 64
+ # Allow the remote `hcode` shim to open local VS Code Remote-SSH windows.
+ # code_open = true
+ 
+@@ -939,6 +942,7 @@ mod tests {
+         assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
+         assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
+         assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
++        assert!(DEFAULT_CONFIG.contains("# clipboard_image_buffer_mb = 64"));
+         assert!(DEFAULT_CONFIG.contains("# code_open = true"));
+     }
+ 
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index a6a106aa..3da1e440 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -207,6 +207,11 @@ mod windows;
+ #[cfg(target_os = "windows")]
+ pub use windows::*;
+ 
++// The DIB parser is platform-neutral so normal Linux CI can exercise the
++// bitmap formats consumed by the Windows clipboard implementation.
++#[cfg(any(windows, test))]
++mod windows_clipboard;
++
+ #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+ mod fallback;
+ #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+diff --git a/src/platform/windows.rs b/src/platform/windows.rs
+index 7450b05b..0120e27f 100644
+--- a/src/platform/windows.rs
++++ b/src/platform/windows.rs
+@@ -22,7 +22,10 @@ use windows_sys::{
+         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
+         System::{
+             Console::GetConsoleWindow,
+-            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
++            DataExchange::{
++                CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
++                OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
++            },
+             Diagnostics::{
+                 Debug::ReadProcessMemory,
+                 ToolHelp::{
+@@ -35,10 +38,10 @@ use windows_sys::{
+                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+             },
+             Memory::{
+-                GlobalAlloc, GlobalLock, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
++                GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
+                 MEMORY_BASIC_INFORMATION,
+             },
+-            Ole::CF_UNICODETEXT,
++            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
+             Threading::{
+                 GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+                 QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW, DETACHED_PROCESS,
+@@ -68,7 +71,7 @@ use windows_sys::{
+     },
+ };
+ 
+-use super::{ClipboardImage, ForegroundJob, Signal};
++use super::{windows_clipboard, ClipboardImage, ForegroundJob, Signal};
+ 
+ const STILL_ACTIVE: u32 = 259;
+ const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
+@@ -78,6 +81,7 @@ const PROCESS_ENVIRONMENT_READ_CHUNK_BYTES: usize = 16 * 1024;
+ const PROCESS_RUNTIME_MARKER_CACHE_CAPACITY: usize = 1_024;
+ const PROCESS_RUNTIME_MARKER_CACHE_RETENTION: Duration = Duration::from_secs(60);
+ const PROCESS_RUNTIME_MARKER_NEGATIVE_TTL: Duration = Duration::from_secs(1);
++const MAX_CLIPBOARD_FORMAT_BYTES: usize = 256 * 1024 * 1024;
+ 
+ static NEXT_PANE_RUNTIME_MARKER: AtomicU64 = AtomicU64::new(1);
+ static PROCESS_RUNTIME_MARKER_CACHE: LazyLock<Mutex<HashMap<u32, CachedProcessRuntimeMarker>>> =
+@@ -1221,6 +1225,74 @@ pub fn read_clipboard_text() -> Option<String> {
+     None
+ }
+ 
++/// Reads a Windows clipboard image and normalizes it to PNG for the existing
++/// remote `ClipboardImage` protocol message.
++///
++/// Prefer the registered PNG clipboard format because it preserves the
++/// producer's bytes exactly. Windows screenshots commonly expose only
++/// CF_DIBV5/CF_DIB, which are decoded by the platform-neutral parser.
++pub fn read_clipboard_image() -> Option<ClipboardImage> {
++    let owner = unsafe { GetConsoleWindow() };
++    let mut opened = false;
++    for _ in 0..5 {
++        if unsafe { OpenClipboard(owner) } != 0 {
++            opened = true;
++            break;
++        }
++        std::thread::sleep(Duration::from_millis(5));
++    }
++    if !opened {
++        return None;
++    }
++    let _clipboard = ClipboardGuard;
++
++    let png_format_name = wide_null("PNG");
++    let png_format = unsafe { RegisterClipboardFormatW(png_format_name.as_ptr()) };
++    if let Some(bytes) = clipboard_format_bytes(png_format)
++        .and_then(|bytes| windows_clipboard::registered_png(&bytes))
++    {
++        return Some(ClipboardImage {
++            bytes,
++            extension: "png",
++        });
++    }
++
++    for format in [CF_DIBV5 as u32, CF_DIB as u32] {
++        if let Some(bytes) = clipboard_format_bytes(format)
++            .and_then(|bytes| windows_clipboard::dib_to_png(&bytes))
++        {
++            return Some(ClipboardImage {
++                bytes,
++                extension: "png",
++            });
++        }
++    }
++    None
++}
++
++fn clipboard_format_bytes(format: u32) -> Option<Vec<u8>> {
++    if format == 0 || unsafe { IsClipboardFormatAvailable(format) } == 0 {
++        return None;
++    }
++    let memory = unsafe { GetClipboardData(format) };
++    if memory.is_null() {
++        return None;
++    }
++    let byte_len = unsafe { GlobalSize(memory) };
++    if byte_len == 0 || byte_len > MAX_CLIPBOARD_FORMAT_BYTES {
++        return None;
++    }
++    let locked = unsafe { GlobalLock(memory) };
++    if locked.is_null() {
++        return None;
++    }
++    let bytes = unsafe { std::slice::from_raw_parts(locked.cast::<u8>(), byte_len) }.to_vec();
++    unsafe {
++        GlobalUnlock(memory);
++    }
++    Some(bytes)
++}
++
+ pub fn open_url(url: &str) -> std::io::Result<()> {
+     let operation = wide_null("open");
+     let url = wide_null(url);
+diff --git a/src/platform/windows_clipboard.rs b/src/platform/windows_clipboard.rs
+new file mode 100644
+index 00000000..612ce383
+--- /dev/null
++++ b/src/platform/windows_clipboard.rs
+@@ -0,0 +1,325 @@
++//! Pure Windows clipboard bitmap decoding.
++//!
++//! Kept free of Win32 calls so the DIB parser can be exercised by the normal
++//! cross-platform test suite. The Windows platform layer owns the clipboard
++//! handle and passes either registered PNG bytes or a packed CF_DIB/CF_DIBV5
++//! payload here.
++
++const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
++const BITMAPINFOHEADER_SIZE: usize = 40;
++const BITMAPV5HEADER_SIZE: usize = 124;
++const BI_RGB: u32 = 0;
++const BI_BITFIELDS: u32 = 3;
++const BI_ALPHABITFIELDS: u32 = 6;
++const MAX_DIB_PIXELS: usize = 32 * 1024 * 1024;
++
++pub(super) fn registered_png(bytes: &[u8]) -> Option<Vec<u8>> {
++    bytes.starts_with(PNG_SIGNATURE).then(|| bytes.to_vec())
++}
++
++pub(super) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
++    let header_size = read_u32(dib, 0)? as usize;
++    if header_size < BITMAPINFOHEADER_SIZE || header_size > dib.len() {
++        return None;
++    }
++
++    let width = read_i32(dib, 4)?;
++    let signed_height = read_i32(dib, 8)?;
++    if width <= 0 || signed_height == 0 || signed_height == i32::MIN {
++        return None;
++    }
++    let width = width as usize;
++    let height = signed_height.unsigned_abs() as usize;
++    let top_down = signed_height < 0;
++    if width.checked_mul(height)? > MAX_DIB_PIXELS {
++        return None;
++    }
++
++    if read_u16(dib, 12)? != 1 {
++        return None;
++    }
++    let bits_per_pixel = read_u16(dib, 14)?;
++    let compression = read_u32(dib, 16)?;
++    if !matches!(bits_per_pixel, 24 | 32)
++        || (bits_per_pixel == 24 && compression != BI_RGB)
++        || (bits_per_pixel == 32
++            && !matches!(compression, BI_RGB | BI_BITFIELDS | BI_ALPHABITFIELDS))
++    {
++        return None;
++    }
++
++    let masks = if bits_per_pixel == 32 && compression != BI_RGB {
++        Some(read_color_masks(dib, header_size, compression)?)
++    } else {
++        None
++    };
++    let pixel_offset = pixel_offset(dib, header_size, bits_per_pixel, compression)?;
++    let row_bits = width.checked_mul(bits_per_pixel as usize)?;
++    let row_stride = row_bits.checked_add(31)?.checked_div(32)?.checked_mul(4)?;
++    let pixel_bytes = row_stride.checked_mul(height)?;
++    if pixel_offset.checked_add(pixel_bytes)? > dib.len() {
++        return None;
++    }
++
++    let rgba_len = width.checked_mul(height)?.checked_mul(4)?;
++    let mut rgba = Vec::with_capacity(rgba_len);
++    let mut any_alpha = false;
++    for output_y in 0..height {
++        let source_y = if top_down {
++            output_y
++        } else {
++            height - output_y - 1
++        };
++        let row_start = pixel_offset.checked_add(source_y.checked_mul(row_stride)?)?;
++        let row = dib.get(row_start..row_start.checked_add(row_stride)?)?;
++
++        for x in 0..width {
++            if bits_per_pixel == 24 {
++                let offset = x.checked_mul(3)?;
++                let blue = *row.get(offset)?;
++                let green = *row.get(offset + 1)?;
++                let red = *row.get(offset + 2)?;
++                rgba.extend_from_slice(&[red, green, blue, 255]);
++                continue;
++            }
++
++            let offset = x.checked_mul(4)?;
++            let pixel = u32::from_le_bytes(row.get(offset..offset + 4)?.try_into().ok()?);
++            let (red, green, blue, alpha) = if let Some(masks) = masks {
++                (
++                    masked_component(pixel, masks.red),
++                    masked_component(pixel, masks.green),
++                    masked_component(pixel, masks.blue),
++                    masks
++                        .alpha
++                        .map(|mask| masked_component(pixel, mask))
++                        .unwrap_or(255),
++                )
++            } else {
++                let bytes = pixel.to_le_bytes();
++                (bytes[2], bytes[1], bytes[0], bytes[3])
++            };
++            any_alpha |= alpha != 0;
++            rgba.extend_from_slice(&[red, green, blue, alpha]);
++        }
++    }
++
++    // BI_RGB's fourth byte is reserved rather than a guaranteed alpha
++    // channel. Clipboard producers commonly zero it for otherwise opaque
++    // screenshots, so treat an entirely-zero plane as opaque.
++    if bits_per_pixel == 32 && masks.is_none() && !any_alpha {
++        for alpha in rgba.iter_mut().skip(3).step_by(4) {
++            *alpha = 255;
++        }
++    }
++
++    encode_rgba_png(width as u32, height as u32, &rgba)
++}
++
++#[derive(Clone, Copy)]
++struct ColorMasks {
++    red: u32,
++    green: u32,
++    blue: u32,
++    alpha: Option<u32>,
++}
++
++fn read_color_masks(dib: &[u8], header_size: usize, compression: u32) -> Option<ColorMasks> {
++    let mask_offset = if header_size == BITMAPINFOHEADER_SIZE {
++        header_size
++    } else {
++        40
++    };
++    let red = read_u32(dib, mask_offset)?;
++    let green = read_u32(dib, mask_offset + 4)?;
++    let blue = read_u32(dib, mask_offset + 8)?;
++    if red == 0 || green == 0 || blue == 0 {
++        return None;
++    }
++    let alpha = if compression == BI_ALPHABITFIELDS || header_size >= 56 {
++        read_u32(dib, mask_offset + 12).filter(|mask| *mask != 0)
++    } else {
++        None
++    };
++    Some(ColorMasks {
++        red,
++        green,
++        blue,
++        alpha,
++    })
++}
++
++fn pixel_offset(
++    dib: &[u8],
++    header_size: usize,
++    bits_per_pixel: u16,
++    compression: u32,
++) -> Option<usize> {
++    let mut offset = header_size;
++    if header_size == BITMAPINFOHEADER_SIZE && matches!(compression, BI_BITFIELDS | BI_ALPHABITFIELDS)
++    {
++        offset = offset.checked_add(if compression == BI_ALPHABITFIELDS { 16 } else { 12 })?;
++    }
++
++    // CF_DIBV5 may place an embedded color profile between its header and
++    // pixel array. Honor it only when it occupies that exact packed-DIB slot;
++    // profiles stored after the bitmap must not move the pixel offset.
++    if header_size >= BITMAPV5HEADER_SIZE {
++        let profile_offset = read_u32(dib, 112)? as usize;
++        let profile_size = read_u32(dib, 116)? as usize;
++        if profile_size != 0 && profile_offset == offset {
++            offset = offset.checked_add(profile_size)?;
++        }
++    }
++
++    // The supported 24/32-bit formats have no palette. Keep the calculation
++    // explicit so extending this decoder to indexed DIBs cannot accidentally
++    // interpret their color table as pixels.
++    if bits_per_pixel <= 8 {
++        let colors_used = read_u32(dib, 32)? as usize;
++        let palette_entries = if colors_used == 0 {
++            1usize.checked_shl(bits_per_pixel.into())?
++        } else {
++            colors_used
++        };
++        offset = offset.checked_add(palette_entries.checked_mul(4)?)?;
++    }
++    Some(offset)
++}
++
++fn masked_component(pixel: u32, mask: u32) -> u8 {
++    let shift = mask.trailing_zeros();
++    let maximum = mask >> shift;
++    if maximum == 0 {
++        return 0;
++    }
++    let value = (pixel & mask) >> shift;
++    ((u64::from(value) * 255 + u64::from(maximum) / 2) / u64::from(maximum)) as u8
++}
++
++fn encode_rgba_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
++    let mut output = Vec::new();
++    {
++        let mut encoder = png::Encoder::new(&mut output, width, height);
++        encoder.set_color(png::ColorType::Rgba);
++        encoder.set_depth(png::BitDepth::Eight);
++        let mut writer = encoder.write_header().ok()?;
++        writer.write_image_data(rgba).ok()?;
++    }
++    registered_png(&output)
++}
++
++fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
++    Some(u16::from_le_bytes(
++        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
++    ))
++}
++
++fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
++    Some(u32::from_le_bytes(
++        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
++    ))
++}
++
++fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
++    Some(i32::from_le_bytes(
++        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
++    ))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
++        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
++    }
++
++    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
++        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
++    }
++
++    fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
++        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
++    }
++
++    fn decode_png(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
++        let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
++        let mut reader = decoder.read_info().expect("PNG header");
++        let mut output = vec![0; reader.output_buffer_size()];
++        let info = reader.next_frame(&mut output).expect("PNG frame");
++        output.truncate(info.buffer_size());
++        (info.width, info.height, output)
++    }
++
++    #[test]
++    fn decodes_bottom_up_24_bit_dib_with_row_padding() {
++        let mut dib = vec![0; BITMAPINFOHEADER_SIZE + 16];
++        write_u32(&mut dib, 0, BITMAPINFOHEADER_SIZE as u32);
++        write_i32(&mut dib, 4, 2);
++        write_i32(&mut dib, 8, 2);
++        write_u16(&mut dib, 12, 1);
++        write_u16(&mut dib, 14, 24);
++        // Bottom row: blue, white, then two bytes of stride padding.
++        dib[40..48].copy_from_slice(&[255, 0, 0, 255, 255, 255, 0, 0]);
++        // Top row: red, green, then padding.
++        dib[48..56].copy_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
++
++        let png = dib_to_png(&dib).expect("decode DIB");
++        let (width, height, rgba) = decode_png(&png);
++        assert_eq!((width, height), (2, 2));
++        assert_eq!(
++            rgba,
++            vec![
++                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
++            ]
++        );
++    }
++
++    #[test]
++    fn decodes_top_down_v5_bitfields_with_alpha() {
++        let mut dib = vec![0; BITMAPV5HEADER_SIZE + 4];
++        write_u32(&mut dib, 0, BITMAPV5HEADER_SIZE as u32);
++        write_i32(&mut dib, 4, 1);
++        write_i32(&mut dib, 8, -1);
++        write_u16(&mut dib, 12, 1);
++        write_u16(&mut dib, 14, 32);
++        write_u32(&mut dib, 16, BI_BITFIELDS);
++        write_u32(&mut dib, 40, 0x00ff_0000);
++        write_u32(&mut dib, 44, 0x0000_ff00);
++        write_u32(&mut dib, 48, 0x0000_00ff);
++        write_u32(&mut dib, 52, 0xff00_0000);
++        dib[BITMAPV5HEADER_SIZE..].copy_from_slice(&[30, 20, 10, 40]);
++
++        let png = dib_to_png(&dib).expect("decode DIBV5");
++        let (_, _, rgba) = decode_png(&png);
++        assert_eq!(rgba, vec![10, 20, 30, 40]);
++    }
++
++    #[test]
++    fn treats_zeroed_bi_rgb_alpha_plane_as_opaque() {
++        let mut dib = vec![0; BITMAPINFOHEADER_SIZE + 4];
++        write_u32(&mut dib, 0, BITMAPINFOHEADER_SIZE as u32);
++        write_i32(&mut dib, 4, 1);
++        write_i32(&mut dib, 8, 1);
++        write_u16(&mut dib, 12, 1);
++        write_u16(&mut dib, 14, 32);
++        dib[BITMAPINFOHEADER_SIZE..].copy_from_slice(&[3, 2, 1, 0]);
++
++        let png = dib_to_png(&dib).expect("decode BI_RGB");
++        let (_, _, rgba) = decode_png(&png);
++        assert_eq!(rgba, vec![1, 2, 3, 255]);
++    }
++
++    #[test]
++    fn rejects_unsupported_compressed_dib() {
++        let mut dib = vec![0; BITMAPINFOHEADER_SIZE + 4];
++        write_u32(&mut dib, 0, BITMAPINFOHEADER_SIZE as u32);
++        write_i32(&mut dib, 4, 1);
++        write_i32(&mut dib, 8, 1);
++        write_u16(&mut dib, 12, 1);
++        write_u16(&mut dib, 14, 32);
++        write_u32(&mut dib, 16, 4);
++        assert!(dib_to_png(&dib).is_none());
++    }
++}
+diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
+index 59199845..b95af086 100644
+--- a/src/remote/launcher.rs
++++ b/src/remote/launcher.rs
+@@ -215,6 +215,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+     let remote_config = timed("phase: load config", "", || {
+         crate::config::Config::load().config.remote
+     });
++    let clipboard_image_buffer_bytes = remote_config.clipboard_image_buffer_bytes();
+     let remote_ssh = RemoteSsh::new(
+         remote.target.clone(),
+         remote_config.manage_ssh_config,
+@@ -247,6 +248,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         local_socket.clone(),
+         session_name,
+         remote_ssh.options(),
++        clipboard_image_buffer_bytes,
+     )?;
+ 
+     remote_timing("phase: setup before client", "", launch_started.elapsed());
+@@ -341,6 +343,11 @@ impl RemoteHerdr {
+         self.shell_path = shell_path;
+         self
+     }
++
++    #[cfg(windows)]
++    pub(crate) fn is_linux(&self) -> bool {
++        self.platform.os == "linux"
++    }
+ }
+ 
+ #[derive(Debug, Clone, Deserialize)]
+diff --git a/src/remote/linux_clipboard_image_store.sh b/src/remote/linux_clipboard_image_store.sh
+new file mode 100644
+index 00000000..b6fdd00f
+--- /dev/null
++++ b/src/remote/linux_clipboard_image_store.sh
+@@ -0,0 +1,131 @@
++#!/bin/sh
++# Embedded by the native Windows remote bridge and executed through a lazy
++# persistent `ssh -T` side channel. stdin is a sequence of:
++#
++#   HERDR_IMAGE_V1 <byte-count> <extension> <capacity-bytes>\n<raw bytes>
++#
++# stdout is line-oriented control traffic. No image bytes are echoed.
++
++set -eu
++LC_ALL=C
++export LC_ALL
++
++protocol=HERDR_IMAGE_V1
++
++reply_error() {
++    printf '%s ERR %s\n' "$protocol" "$1"
++}
++
++user=$(id -un) || {
++    reply_error user_lookup_failed
++    exit 1
++}
++uid=$(id -u) || {
++    reply_error uid_lookup_failed
++    exit 1
++}
++case "$user" in
++    ''|*[!A-Za-z0-9._-]*)
++        reply_error unsafe_user_name
++        exit 1
++        ;;
++esac
++
++dir="/tmp/herdr-$user"
++if [ -L "$dir" ]; then
++    reply_error staging_dir_is_symlink
++    exit 1
++fi
++if [ ! -e "$dir" ]; then
++    mkdir -m 700 -- "$dir" 2>/dev/null || true
++fi
++if [ ! -d "$dir" ] || [ -L "$dir" ]; then
++    reply_error invalid_staging_dir
++    exit 1
++fi
++if [ "$(stat -c %u -- "$dir")" != "$uid" ]; then
++    reply_error staging_dir_wrong_owner
++    exit 1
++fi
++chmod 700 -- "$dir"
++
++if ! command -v flock >/dev/null 2>&1; then
++    reply_error flock_unavailable
++    exit 1
++fi
++exec 9>"$dir/.fifo.lock"
++printf '%s READY\n' "$protocol"
++
++while IFS=' ' read -r magic size extension capacity extra; do
++    if [ "$magic" != "$protocol" ] || [ -n "${extra:-}" ]; then
++        reply_error invalid_header
++        exit 1
++    fi
++    case "$size" in
++        ''|*[!0-9]*)
++            reply_error invalid_size
++            exit 1
++            ;;
++    esac
++    case "$capacity" in
++        ''|*[!0-9]*)
++            reply_error invalid_capacity
++            exit 1
++            ;;
++    esac
++    case "$extension" in
++        png|jpg|gif|webp|bmp) ;;
++        *)
++            reply_error invalid_extension
++            exit 1
++            ;;
++    esac
++    if [ "$size" -le 0 ] || [ "$capacity" -le 0 ] || [ "$size" -gt "$capacity" ]; then
++        reply_error image_exceeds_capacity
++        exit 1
++    fi
++
++    file=$(mktemp --suffix=".$extension" "$dir/clipboard-XXXXXXXXXXXX") || {
++        reply_error file_create_failed
++        exit 1
++    }
++    trap 'rm -f -- "$file"' EXIT HUP INT TERM
++    if ! dd iflag=fullblock bs="$size" count=1 of="$file" status=none; then
++        reply_error short_image_payload
++        exit 1
++    fi
++    chmod 600 -- "$file"
++
++    # Multiple Windows clients for the same Unix account share one capacity
++    # budget. Serialize the scan/delete transaction and never evict the image
++    # currently being committed; because size <= capacity, removing older
++    # entries is always sufficient.
++    flock 9
++    total=$(find "$dir" -maxdepth 1 -type f -name 'clipboard-*' -printf '%s\n' |
++        awk '{ total += $1 } END { printf "%.0f\n", total + 0 }')
++    while [ "$total" -gt "$capacity" ]; do
++        oldest=$(find "$dir" -maxdepth 1 -type f -name 'clipboard-*' ! -path "$file" \
++            -printf '%T@ %p\n' | sort -n | head -n 1)
++        if [ -z "$oldest" ]; then
++            break
++        fi
++        oldest=${oldest#* }
++        old_size=$(stat -c %s -- "$oldest" 2>/dev/null || printf '0')
++        if rm -f -- "$oldest"; then
++            total=$((total - old_size))
++        else
++            break
++        fi
++    done
++    if [ "$total" -gt "$capacity" ]; then
++        rm -f -- "$file"
++        flock -u 9
++        trap - EXIT HUP INT TERM
++        reply_error fifo_cleanup_failed
++        continue
++    fi
++    flock -u 9
++
++    trap - EXIT HUP INT TERM
++    printf '%s OK %s\n' "$protocol" "$file"
++done
+diff --git a/src/remote/unix.rs b/src/remote/unix.rs
+index 6e157019..f50ef790 100644
+--- a/src/remote/unix.rs
++++ b/src/remote/unix.rs
+@@ -144,6 +144,7 @@ impl SshStdioBridge {
+         local_socket: PathBuf,
+         session_name: String,
+         ssh_options: Option<&ManagedSshOptions>,
++        _clipboard_image_buffer_bytes: u64,
+     ) -> io::Result<Self> {
+         let _ = std::fs::remove_file(&local_socket);
+         let listener = UnixListener::bind(&local_socket)?;
+@@ -423,6 +424,7 @@ mod tests {
+             socket.clone(),
+             "default".to_string(),
+             None,
++            64 * 1024 * 1024,
+         )
+         .expect("start bridge listener");
+ 
+diff --git a/src/remote/windows.rs b/src/remote/windows.rs
+index 29a73dfb..b4b67ef6 100644
+--- a/src/remote/windows.rs
++++ b/src/remote/windows.rs
+@@ -23,9 +23,9 @@
+ //!   The whole pipe is then dropped, which *is* observable by the client.
+ 
+ use std::fs;
+-use std::io::{self, Read as _};
++use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
+ use std::path::PathBuf;
+-use std::process::{Command, Stdio};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+ use std::sync::{
+     atomic::{AtomicBool, Ordering},
+     Arc,
+@@ -36,14 +36,19 @@ use std::time::Duration;
+ use interprocess::local_socket::traits::Listener as _;
+ 
+ use super::launcher::{
+-    copy_flush, remote_bridge_command, remote_timing, sanitize_path_component, RemoteHerdr,
++    copy_flush, remote_bridge_command, remote_timing, sanitize_path_component, shell_quote,
++    RemoteHerdr,
+ };
+ use crate::ipc::LocalStream;
++use crate::protocol::{ClientInputEvent, ClientMessage, MAX_GRAPHICS_FRAME_SIZE};
+ 
+ /// Backoff between `CancelIoEx` retries while waiting for the pump thread to
+ /// observe its stop flag (the cancel is a no-op when the thread is momentarily
+ /// between blocking reads).
+ const CANCEL_RETRY: Duration = Duration::from_millis(1);
++const FRAME_LENGTH_PREFIX_BYTES: usize = 4;
++const REMOTE_IMAGE_STORE_PROTOCOL: &str = "HERDR_IMAGE_V1";
++const REMOTE_IMAGE_STORE_SCRIPT: &str = include_str!("linux_clipboard_image_store.sh");
+ 
+ /// Windows has no ssh connection multiplexing, so the "managed" options are
+ /// just inline keepalive flags for every ssh command we spawn.
+@@ -162,6 +167,7 @@ impl SshStdioBridge {
+         local_socket: PathBuf,
+         session_name: String,
+         ssh_options: Option<&ManagedSshOptions>,
++        clipboard_image_buffer_bytes: u64,
+     ) -> io::Result<Self> {
+         let _ = fs::remove_file(&local_socket);
+         let listener = crate::ipc::bind_local_listener(&local_socket)?;
+@@ -184,6 +190,7 @@ impl SshStdioBridge {
+                             &remote_herdr,
+                             &session_name,
+                             thread_ssh_options.as_ref(),
++                            clipboard_image_buffer_bytes,
+                         ) {
+                             eprintln!("herdr: remote bridge failed: {err}");
+                         }
+@@ -235,7 +242,15 @@ fn bridge_connection(
+     remote_herdr: &RemoteHerdr,
+     session_name: &str,
+     ssh_options: Option<&ManagedSshOptions>,
++    clipboard_image_buffer_bytes: u64,
+ ) -> io::Result<()> {
++    let mut image_store = remote_herdr.is_linux().then(|| {
++        RemoteClipboardImageStore::new(
++            target.to_owned(),
++            ssh_options.cloned(),
++            clipboard_image_buffer_bytes,
++        )
++    });
+     let mut command = Command::new("ssh");
+     apply_managed_ssh_options(&mut command, ssh_options);
+     command
+@@ -274,7 +289,14 @@ fn bridge_connection(
+     let upload_stop = Arc::clone(&stop);
+ 
+     let upload = thread::spawn(move || {
+-        pump_client_to_ssh(&upload_stream, &mut child_stdin, &upload_stop);
++        pump_client_to_ssh(
++            &upload_stream,
++            &mut child_stdin,
++            &upload_stop,
++            image_store
++                .as_mut()
++                .map(|store| store as &mut dyn ClipboardImageStore),
++        );
+         // Dropping `child_stdin` closes the remote bridge's stdin so the
+         // remote side detaches this client.
+     });
+@@ -305,41 +327,361 @@ fn bridge_connection(
+     }
+ }
+ 
+-/// Pumps client bytes into ssh's stdin with plain blocking reads. When the
+-/// ssh transport dies, `bridge_connection` sets `stop` and cancels the
+-/// in-flight read with [`cancel_blocking_pipe_read`]; keystrokes
+-/// are otherwise forwarded the moment they arrive, with no poll latency.
++/// Pumps complete client frames into ssh's stdin. Ordinary frames retain
++/// their original bytes; only `ClipboardImage` is decoded and rewritten after
++/// the side-channel store returns its remote path. When the ssh transport
++/// dies, `bridge_connection` sets `stop` and cancels the in-flight named-pipe
++/// read with [`cancel_blocking_pipe_read`].
+ fn pump_client_to_ssh(
+     stream: &LocalStream,
+     child_stdin: &mut (impl io::Write + Send),
+     stop: &AtomicBool,
++    mut image_store: Option<&mut dyn ClipboardImageStore>,
+ ) {
+-    let mut buffer = [0_u8; 16 * 1024];
++    let mut frame = Vec::with_capacity(16 * 1024);
+     loop {
+         if stop.load(Ordering::Acquire) {
+             return;
+         }
+-        let mut reader = stream;
+-        match reader.read(&mut buffer) {
++        match read_client_frame(stream, &mut frame) {
+             // Client closed its end of the pipe.
+-            Ok(0) => return,
+-            Ok(bytes_read) => {
+-                if child_stdin
+-                    .write_all(&buffer[..bytes_read])
+-                    .and_then(|()| child_stdin.flush())
+-                    .is_err()
+-                {
+-                    return;
+-                }
+-            }
+-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            Ok(false) => return,
++            Ok(true) => {}
+             // ERROR_OPERATION_ABORTED: our read was cancelled at shutdown.
+             Err(err) if err.raw_os_error() == Some(995) => return,
+             Err(_) => return,
+         }
++
++        if let Some((extension, data)) = clipboard_image_from_frame(&frame) {
++            if let Some(store) = image_store.as_deref_mut() {
++                match store.store(&extension, &data) {
++                    Ok(path) => {
++                        let message = ClientMessage::InputEvents {
++                            events: vec![ClientInputEvent::Paste { text: path }],
++                        };
++                        if crate::protocol::write_message(child_stdin, &message).is_err() {
++                            return;
++                        }
++                        continue;
++                    }
++                    Err(StoreFailure::Rejected(reason)) => {
++                        eprintln!("herdr: remote clipboard image rejected: {reason}");
++                        continue;
++                    }
++                    Err(StoreFailure::Unavailable(err)) => {
++                        eprintln!(
++                            "herdr: remote clipboard image store unavailable ({err}); using server staging fallback"
++                        );
++                    }
++                }
++            }
++        }
++
++        if child_stdin
++            .write_all(&frame)
++            .and_then(|()| child_stdin.flush())
++            .is_err()
++        {
++            return;
++        }
++    }
++}
++
++fn read_client_frame(stream: &LocalStream, frame: &mut Vec<u8>) -> io::Result<bool> {
++    frame.clear();
++    frame.resize(FRAME_LENGTH_PREFIX_BYTES, 0);
++    let mut reader = stream;
++    if !read_exact_or_clean_eof(&mut reader, frame)? {
++        frame.clear();
++        return Ok(false);
++    }
++    let payload_len = u32::from_le_bytes(
++        frame[..FRAME_LENGTH_PREFIX_BYTES]
++            .try_into()
++            .expect("fixed frame prefix"),
++    ) as usize;
++    if payload_len > MAX_GRAPHICS_FRAME_SIZE {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            format!(
++                "client frame size {payload_len} exceeds maximum {MAX_GRAPHICS_FRAME_SIZE}"
++            ),
++        ));
++    }
++    frame.resize(FRAME_LENGTH_PREFIX_BYTES + payload_len, 0);
++    read_exact_required(&mut reader, &mut frame[FRAME_LENGTH_PREFIX_BYTES..])?;
++    Ok(true)
++}
++
++fn read_exact_or_clean_eof(reader: &mut impl io::Read, buffer: &mut [u8]) -> io::Result<bool> {
++    let mut offset = 0;
++    while offset < buffer.len() {
++        match reader.read(&mut buffer[offset..]) {
++            Ok(0) if offset == 0 => return Ok(false),
++            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
++            Ok(read) => offset += read,
++            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
++            Err(err) => return Err(err),
++        }
++    }
++    Ok(true)
++}
++
++fn read_exact_required(reader: &mut impl io::Read, buffer: &mut [u8]) -> io::Result<()> {
++    if read_exact_or_clean_eof(reader, buffer)? {
++        Ok(())
++    } else {
++        Err(io::ErrorKind::UnexpectedEof.into())
++    }
++}
++
++fn clipboard_image_from_frame(frame: &[u8]) -> Option<(String, Vec<u8>)> {
++    let payload = frame.get(FRAME_LENGTH_PREFIX_BYTES..)?;
++    // Bincode's standard enum tag for ClipboardImage is stable at index 2;
++    // skip deserialization for every ordinary keystroke/render-control frame.
++    if payload.first() != Some(&2) {
++        return None;
++    }
++    let (message, consumed): (ClientMessage, usize) =
++        bincode::serde::decode_from_slice(payload, bincode::config::standard()).ok()?;
++    if consumed != payload.len() {
++        return None;
++    }
++    match message {
++        ClientMessage::ClipboardImage { extension, data } => Some((extension, data)),
++        _ => None,
++    }
++}
++
++trait ClipboardImageStore {
++    fn store(&mut self, extension: &str, data: &[u8]) -> Result<String, StoreFailure>;
++}
++
++#[derive(Debug)]
++enum StoreFailure {
++    Rejected(String),
++    Unavailable(io::Error),
++}
++
++struct RemoteClipboardImageStore {
++    target: String,
++    ssh_options: Option<ManagedSshOptions>,
++    capacity_bytes: u64,
++    session: Option<RemoteImageStoreSession>,
++}
++
++impl RemoteClipboardImageStore {
++    fn new(
++        target: String,
++        ssh_options: Option<ManagedSshOptions>,
++        capacity_bytes: u64,
++    ) -> Self {
++        Self {
++            target,
++            ssh_options,
++            capacity_bytes,
++            session: None,
++        }
++    }
++
++    fn spawn_session(&self) -> io::Result<RemoteImageStoreSession> {
++        let mut command = Command::new("ssh");
++        apply_managed_ssh_options(&mut command, self.ssh_options.as_ref());
++        command
++            .arg("-T")
++            .arg(&self.target)
++            .arg(remote_image_store_command())
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit());
++        let mut child = command.spawn().map_err(|err| {
++            io::Error::new(
++                err.kind(),
++                format!("failed to start clipboard image ssh side channel: {err}"),
++            )
++        })?;
++        let stdin = child
++            .stdin
++            .take()
++            .ok_or_else(|| io::Error::other("clipboard image ssh stdin missing"))?;
++        let stdout = child
++            .stdout
++            .take()
++            .ok_or_else(|| io::Error::other("clipboard image ssh stdout missing"))?;
++        let mut session = RemoteImageStoreSession {
++            child,
++            stdin: Some(stdin),
++            stdout: BufReader::new(stdout),
++        };
++        match session.read_response()? {
++            StoreResponse::Ready => Ok(session),
++            StoreResponse::Error(reason) => Err(io::Error::other(format!(
++                "remote clipboard image store setup failed: {reason}"
++            ))),
++            StoreResponse::Stored(path) => Err(io::Error::other(format!(
++                "remote clipboard image store returned a path before upload: {path}"
++            ))),
++        }
++    }
++
++    fn session(&mut self) -> io::Result<&mut RemoteImageStoreSession> {
++        if self.session.is_none() {
++            self.session = Some(self.spawn_session()?);
++        }
++        Ok(self.session.as_mut().expect("session was initialized"))
++    }
++
++    fn store_once(&mut self, extension: &str, data: &[u8]) -> Result<String, StoreFailure> {
++        let extension = normalized_image_extension(extension)
++            .ok_or_else(|| StoreFailure::Rejected("unsupported image extension".to_owned()))?;
++        let size = u64::try_from(data.len())
++            .map_err(|_| StoreFailure::Rejected("image size does not fit u64".to_owned()))?;
++        if size == 0 || size > self.capacity_bytes {
++            return Err(StoreFailure::Rejected(format!(
++                "image size {size} exceeds FIFO capacity {}",
++                self.capacity_bytes
++            )));
++        }
++        let capacity_bytes = self.capacity_bytes;
++        let session = self.session().map_err(StoreFailure::Unavailable)?;
++        let stdin = session
++            .stdin
++            .as_mut()
++            .ok_or_else(|| StoreFailure::Unavailable(io::Error::other("image store is closed")))?;
++        write!(
++            stdin,
++            "{REMOTE_IMAGE_STORE_PROTOCOL} {size} {extension} {capacity_bytes}\n"
++        )
++        .and_then(|()| stdin.write_all(data))
++        .and_then(|()| stdin.flush())
++        .map_err(StoreFailure::Unavailable)?;
++
++        match session.read_response().map_err(StoreFailure::Unavailable)? {
++            StoreResponse::Stored(path) if valid_remote_image_path(&path, extension) => Ok(path),
++            StoreResponse::Stored(_) => Err(StoreFailure::Rejected(
++                "remote store returned an unsafe image path".to_owned(),
++            )),
++            StoreResponse::Error(reason) => Err(StoreFailure::Rejected(reason)),
++            StoreResponse::Ready => Err(StoreFailure::Unavailable(io::Error::other(
++                "remote store returned duplicate READY response",
++            ))),
++        }
+     }
+ }
+ 
++impl ClipboardImageStore for RemoteClipboardImageStore {
++    fn store(&mut self, extension: &str, data: &[u8]) -> Result<String, StoreFailure> {
++        let result = self.store_once(extension, data);
++        if matches!(&result, Err(StoreFailure::Unavailable(_))) {
++            self.session.take();
++        }
++        result
++    }
++}
++
++struct RemoteImageStoreSession {
++    child: Child,
++    stdin: Option<ChildStdin>,
++    stdout: BufReader<ChildStdout>,
++}
++
++impl RemoteImageStoreSession {
++    fn read_response(&mut self) -> io::Result<StoreResponse> {
++        for _ in 0..16 {
++            let mut line = String::new();
++            if self.stdout.read_line(&mut line)? == 0 {
++                return Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    "clipboard image ssh side channel closed",
++                ));
++            }
++            if line.len() > 4096 {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "clipboard image store response is too long",
++                ));
++            }
++            let line = line.trim_end_matches(['\r', '\n']);
++            let Some(rest) = line.strip_prefix(REMOTE_IMAGE_STORE_PROTOCOL) else {
++                continue;
++            };
++            if rest == " READY" {
++                return Ok(StoreResponse::Ready);
++            }
++            if let Some(path) = rest.strip_prefix(" OK ") {
++                return Ok(StoreResponse::Stored(path.to_owned()));
++            }
++            if let Some(reason) = rest.strip_prefix(" ERR ") {
++                return Ok(StoreResponse::Error(reason.to_owned()));
++            }
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "invalid clipboard image store response",
++            ));
++        }
++        Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "clipboard image store emitted too much non-protocol output",
++        ))
++    }
++}
++
++impl Drop for RemoteImageStoreSession {
++    fn drop(&mut self) {
++        self.stdin.take();
++        if self.child.try_wait().ok().flatten().is_none() {
++            let _ = self.child.kill();
++        }
++        let _ = self.child.wait();
++    }
++}
++
++enum StoreResponse {
++    Ready,
++    Stored(String),
++    Error(String),
++}
++
++fn normalized_image_extension(extension: &str) -> Option<&'static str> {
++    if extension.eq_ignore_ascii_case("png") {
++        Some("png")
++    } else if extension.eq_ignore_ascii_case("jpg")
++        || extension.eq_ignore_ascii_case("jpeg")
++    {
++        Some("jpg")
++    } else if extension.eq_ignore_ascii_case("gif") {
++        Some("gif")
++    } else if extension.eq_ignore_ascii_case("webp") {
++        Some("webp")
++    } else if extension.eq_ignore_ascii_case("bmp") {
++        Some("bmp")
++    } else {
++        None
++    }
++}
++
++fn valid_remote_image_path(path: &str, extension: &str) -> bool {
++    let mut components = path.split('/');
++    components.next() == Some("")
++        && components.next() == Some("tmp")
++        && components.next().is_some_and(|name| {
++            name.strip_prefix("herdr-").is_some_and(|user| {
++                !user.is_empty()
++                    && user
++                        .bytes()
++                        .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
++            })
++        })
++        && components.next().is_some_and(|name| {
++            name.starts_with("clipboard-") && name.ends_with(&format!(".{extension}"))
++        })
++        && components.next().is_none()
++}
++
++fn remote_image_store_command() -> String {
++    format!("exec /bin/sh -c {}", shell_quote(REMOTE_IMAGE_STORE_SCRIPT))
++}
++
+ /// Repeatedly cancels in-flight I/O on the pipe until the pump thread exits.
+ /// The caller must have set the pump's stop flag first, so a cancel that
+ /// lands between two reads is followed by a clean flag-observed exit instead
+@@ -469,22 +811,171 @@ mod tests {
+         let stop = Arc::new(AtomicBool::new(false));
+         let pump_stop = Arc::clone(&stop);
+         let pump = thread::spawn(move || {
+-            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop);
++            pump_client_to_ssh(&server, &mut pump_sink, &pump_stop, None);
+         });
+ 
+-        client.write_all(b"keystrokes").expect("client write");
++        let message = ClientMessage::Input {
++            data: b"keystrokes".to_vec(),
++        };
++        let mut expected = Vec::new();
++        crate::protocol::write_message(&mut expected, &message).expect("encode input");
++        client.write_all(&expected).expect("client write");
+         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+-        while sink.0.lock().expect("sink lock").len() < 10 {
++        while sink.0.lock().expect("sink lock").len() < expected.len() {
+             assert!(std::time::Instant::now() < deadline, "pump never forwarded");
+             thread::sleep(Duration::from_millis(1));
+         }
+-        assert_eq!(sink.0.lock().expect("sink lock").as_slice(), b"keystrokes");
++        assert_eq!(sink.0.lock().expect("sink lock").as_slice(), expected);
+ 
+         // Client close must end the pump without any cancel.
+         drop(client);
+         pump.join().expect("pump thread");
+     }
+ 
++    struct FakeImageStore {
++        calls: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>,
++        result: Option<Result<String, StoreFailure>>,
++    }
++
++    impl ClipboardImageStore for FakeImageStore {
++        fn store(&mut self, extension: &str, data: &[u8]) -> Result<String, StoreFailure> {
++            self.calls
++                .lock()
++                .expect("store calls")
++                .push((extension.to_owned(), data.to_vec()));
++            self.result.take().expect("one image store call")
++        }
++    }
++
++    #[test]
++    fn pump_rewrites_clipboard_image_as_remote_paste_path() {
++        use std::io::Write as _;
++
++        let (mut client, server) = pipe_pair("image-rewrite");
++        let sink = SharedSink::default();
++        let mut pump_sink = sink.clone();
++        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
++        let captured_calls = Arc::clone(&calls);
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            let mut store = FakeImageStore {
++                calls: captured_calls,
++                result: Some(Ok("/tmp/herdr-ren/clipboard-abc.png".to_owned())),
++            };
++            pump_client_to_ssh(
++                &server,
++                &mut pump_sink,
++                &pump_stop,
++                Some(&mut store),
++            );
++        });
++
++        crate::protocol::write_message(
++            &mut client,
++            &ClientMessage::ClipboardImage {
++                extension: "png".to_owned(),
++                data: vec![1, 2, 3],
++            },
++        )
++        .expect("write image frame");
++        crate::protocol::write_message(
++            &mut client,
++            &ClientMessage::Input {
++                data: b"after".to_vec(),
++            },
++        )
++        .expect("write following frame");
++        drop(client);
++        pump.join().expect("pump thread");
++
++        assert_eq!(
++            calls.lock().expect("store calls").as_slice(),
++            &[("png".to_owned(), vec![1, 2, 3])]
++        );
++        let output = sink.0.lock().expect("sink lock").clone();
++        let mut cursor = output.as_slice();
++        let first: ClientMessage =
++            crate::protocol::read_message(&mut cursor, crate::protocol::MAX_FRAME_SIZE)
++                .expect("rewritten frame");
++        assert_eq!(
++            first,
++            ClientMessage::InputEvents {
++                events: vec![ClientInputEvent::Paste {
++                    text: "/tmp/herdr-ren/clipboard-abc.png".to_owned(),
++                }],
++            }
++        );
++        let second: ClientMessage =
++            crate::protocol::read_message(&mut cursor, crate::protocol::MAX_FRAME_SIZE)
++                .expect("following frame");
++        assert_eq!(
++            second,
++            ClientMessage::Input {
++                data: b"after".to_vec()
++            }
++        );
++        assert!(cursor.is_empty());
++    }
++
++    #[test]
++    fn pump_preserves_server_fallback_when_image_store_is_unavailable() {
++        use std::io::Write as _;
++
++        let (mut client, server) = pipe_pair("image-fallback");
++        let sink = SharedSink::default();
++        let mut pump_sink = sink.clone();
++        let stop = Arc::new(AtomicBool::new(false));
++        let pump_stop = Arc::clone(&stop);
++        let pump = thread::spawn(move || {
++            let mut store = FakeImageStore {
++                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
++                result: Some(Err(StoreFailure::Unavailable(io::Error::other(
++                    "ssh unavailable",
++                )))),
++            };
++            pump_client_to_ssh(
++                &server,
++                &mut pump_sink,
++                &pump_stop,
++                Some(&mut store),
++            );
++        });
++        let image = ClientMessage::ClipboardImage {
++            extension: "png".to_owned(),
++            data: vec![4, 5, 6],
++        };
++        crate::protocol::write_message(&mut client, &image).expect("write image frame");
++        drop(client);
++        pump.join().expect("pump thread");
++
++        let output = sink.0.lock().expect("sink lock").clone();
++        let decoded: ClientMessage =
++            crate::protocol::read_message(&mut output.as_slice(), crate::protocol::MAX_FRAME_SIZE)
++                .expect("fallback frame");
++        assert_eq!(decoded, image);
++    }
++
++    #[test]
++    fn remote_image_paths_are_strictly_scoped() {
++        assert!(valid_remote_image_path(
++            "/tmp/herdr-ren/clipboard-abc.png",
++            "png"
++        ));
++        assert!(!valid_remote_image_path(
++            "/tmp/herdr-ren/../escape.png",
++            "png"
++        ));
++        assert!(!valid_remote_image_path(
++            "/tmp/herdr-ren/clipboard-abc.jpg",
++            "png"
++        ));
++        assert!(!valid_remote_image_path(
++            "/home/ren/clipboard-abc.png",
++            "png"
++        ));
++    }
++
+     #[test]
+     fn pump_blocked_in_read_is_released_by_cancel() {
+         let (client, server) = pipe_pair("cancel");
+@@ -493,7 +984,7 @@ mod tests {
+         let stop = Arc::new(AtomicBool::new(false));
+         let pump_stop = Arc::clone(&stop);
+         let pump = thread::spawn(move || {
+-            pump_client_to_ssh(&pump_stream, &mut io::sink(), &pump_stop);
++            pump_client_to_ssh(&pump_stream, &mut io::sink(), &pump_stop, None);
+         });
+ 
+         // Let the pump enter its blocking read, then stop it the way
+@@ -522,6 +1013,7 @@ mod tests {
+             socket.clone(),
+             "default".to_string(),
+             None,
++            64 * 1024 * 1024,
+         )
+         .expect("start bridge listener");
+ 
+-- 
+2.51.1
+

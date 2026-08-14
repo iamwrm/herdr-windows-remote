@@ -259,7 +259,7 @@ Completed on Windows with Zig 0.15.2:
 - shim payload decoded and inspected successfully; `sh -n` passes, and a
   failing fake `herdr terminal title set` produces no stdout and only hcode's
   single stable delivery error;
-- clean-room: all four ownership patches apply with `git am` to a fresh
+- clean-room: all five ownership patches apply with `git am` to a fresh
   `v0.8.0` worktree and exactly match the implementation checkout; the known
   fork-era CI workflow is intentionally excluded from both;
 - `git diff --check` — clean.
