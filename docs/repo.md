@@ -42,18 +42,17 @@ based on, while `patches/herdr/BASE_COMMIT` pins that tag's peeled commit so a
 moved upstream tag cannot silently change a release build. The release workflow
 verifies both; keep them in sync with the patches.
 
-The current herdr series has one patch per owning initiative:
+The current herdr series has four patches grouped by implementation lifecycle:
 
 | Order | Owner | Scope |
 |---|---|---|
-| `0001` | [IV-0001](IV-0001-windows-remote.md) | native Windows remote transport and fork safeguards |
-| `0002` | [IV-0002](IV-0002-latency-improvements.md) | high-RTT attach, transport, and predictive-input latency |
+| `0001` | [IV-0001](IV-0001-windows-remote.md) | remaining input/theme fixes and fork safeguards (transport is upstream) |
+| `0002` | [IV-0002](IV-0002-latency-improvements.md), [IV-0006](IV-0006-software-cursor-predictive-echo.md) | isolated client prediction, software cursor, timing, optional TCP relay, Windows pipe progress fix |
 | `0003` | [IV-0004](IV-0004-vscode-remote-open.md) | remote-shell `hcode` integration |
-| `0004` | [IV-0006](IV-0006-software-cursor-predictive-echo.md) | safe predictive echo for hidden reverse-video software cursors |
-| `0005` | [IV-0007](IV-0007-windows-clipboard-images.md) | Windows clipboard images into a bounded per-user Linux FIFO |
+| `0004` | [IV-0007](IV-0007-windows-clipboard-images.md) | capacity and retention policy in upstream server image staging |
 
 [IV-0003](IV-0003-pi-predictive-echo.md) owns a legacy pi extension for older
-builds; patch `0004` supersedes it for current builds. The former IV-0005
+builds; patch `0002` supersedes it for current builds. The former IV-0005
 notification patch retired in `v0.8.0`, when upstream implemented native
 Windows system notifications.
 
@@ -91,7 +90,7 @@ refreshed patches.
 `.github/workflows/release-windows.yml` clones upstream at `BASE`, verifies the
 peeled tag against `BASE_COMMIT`, applies the patch series with `git am`, and
 builds `x86_64-pc-windows-msvc` with upstream's
-pinned steps, and publishes a prerelease with `herdr-windows-x86_64.exe`, the
+pinned steps, and publishes a prerelease with `herdr-windows-x86_64.zip` (binary plus app-local ConPTY), the
 Linux `hcode` shim, and `BUILD_INFO.html` (repo/upstream/patched commits and
 artifact SHA-256 checksums).
 

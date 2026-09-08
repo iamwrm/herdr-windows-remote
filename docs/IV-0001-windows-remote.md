@@ -2,17 +2,40 @@
 
 ## Record
 
-- **Status:** implemented as the current five-patch `v0.8.0` representation;
-  the latest publication is `v0.8.0-win.05`
+- **Status:** local v0.9.0 upgrade; not published. Native transport is now upstream-owned; this patch retains input/theme fixes and fork update safeguards.
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0001-*-IV-0001.patch` and
   `.github/workflows/release-windows.yml`
-- **Implementation base:** upstream release tag `v0.8.0` (`346411fa`), pinned
+- **Implementation base:** upstream release tag `v0.9.0` (`b99002ac`), pinned
   in `patches/herdr/BASE` and `patches/herdr/BASE_COMMIT`
 - **Consumers:** [IV-0002](IV-0002-latency-improvements.md) builds latency
   improvements on this transport; [IV-0004](IV-0004-vscode-remote-open.md)
   adds remote-to-local VS Code opening
+
+
+## v0.9.0 integration
+
+Upstream owns native transport, compatibility, restart approval, and multiline-paste handling. The remaining patch retains lenient Win32 record parsing, Windows theme reports through client-owned theme routing, inverse-color fallback, and the custom-build update safeguard.
+
+See [verification and migration](UPGRADE-v0.9.0.md). Descriptions below of earlier releases are historical.
+
+## v0.8.2 integration
+
+Upstream now owns native Windows remote attach in `src/remote/attach.rs`.
+The legacy launcher and platform transport copies are removed. The fork uses
+upstream's private listener, endpoint ownership checks, polling/cancellation,
+SSH configuration precedence, release checksum verification, and protocol 20.
+The old blocking named-pipe pump is retired in favor of upstream's lifecycle;
+custom input prediction and combined setup probing remain.
+
+Windows clipboard decoding is also upstream-owned. IV-0007 keeps its bounded
+Linux FIFO and frame rewrite through the upstream upload pump. Windows releases
+must include the ConPTY runtime; package with upstream's verified packaging script.
+
+Retirement now depends on the remaining custom features, not native remote
+support alone. Historical port details below describe v0.8.0 and earlier.
+See [upgrade verification](UPGRADE-v0.8.2.md) for historical validation.
 
 ## Purpose
 
@@ -197,8 +220,8 @@ labelled) for diagnosing slow attaches.
 `BASE_COMMIT`, then builds `x86_64-pc-windows-msvc` with upstream's pinned
 steps (Rust toolchain per `rust-toolchain.toml`, Zig 0.15.2,
 `cargo build --release --locked`) and publishes a prerelease with
-`herdr-windows-x86_64.exe`, the Linux `hcode` shim, and `BUILD_INFO.html`
-(shipped as HTML so the asset renders in the browser without downloading).
+`herdr-windows-x86_64.zip`, the Linux `hcode` shim, and `BUILD_INFO.html`.
+Extract the complete ZIP; `herdr.exe` requires its app-local ConPTY bundle.
 
 - **Trigger by tag:** `git tag vX.Y.Z-win.NN && git push origin <tag>`.
   The `vX.Y.Z` part must match `patches/herdr/BASE` (enforced by the

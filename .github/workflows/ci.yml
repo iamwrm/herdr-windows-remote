@@ -152,35 +152,43 @@ jobs:
           set -euo pipefail
           cargo fmt --all -- --check
           cargo clippy --locked --bin herdr -- -D warnings
-          cargo test --locked --bin herdr windows_clipboard
+          cargo test --locked --bin herdr clipboard_image
           cargo test --locked --bin herdr remote_clipboard_image_buffer
-          sh -n src/remote/linux_clipboard_image_store.sh
-
-          store_dir="/tmp/herdr-$(id -un)"
-          test ! -e "$store_dir"
-          cleanup() {
-            find "$store_dir" -maxdepth 1 -type f -exec unlink {} \;
-            rmdir "$store_dir"
-          }
-          trap cleanup EXIT
-          response=$(printf 'HERDR_IMAGE_V1 5 png 8\nabcdeHERDR_IMAGE_V1 5 png 8\nfghij' |
-            sh src/remote/linux_clipboard_image_store.sh)
-          test "$(printf '%s\n' "$response" | grep -c '^HERDR_IMAGE_V1 OK /tmp/herdr-')" -eq 2
-          test "$(find "$store_dir" -maxdepth 1 -type f -name 'clipboard-*' | wc -l)" -eq 1
-          remaining=$(find "$store_dir" -maxdepth 1 -type f -name 'clipboard-*' -print -quit)
-          test "$(wc -c < "$remaining")" -eq 5
-          test "$(od -An -tx1 "$remaining" | tr -d ' \n')" = 666768696a
+          cargo test --locked --bin herdr client::
+          cargo test --locked --bin herdr remote::
+          cargo test --locked --bin herdr protocol::wire::
+          python3 -m unittest scripts.test_package_windows_conpty
 
       - name: Windows verification
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: checkouts/herdr
         run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed" }
           cargo clippy --locked --bin herdr -- -D warnings
           if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
-          cargo test --locked --bin herdr windows_clipboard
+          cargo test --locked --bin herdr clipboard_image
           if ($LASTEXITCODE -ne 0) { throw "Windows clipboard tests failed" }
-          cargo test --locked --bin herdr remote::windows::tests
-          if ($LASTEXITCODE -ne 0) { throw "Windows remote bridge tests failed" }
+          cargo test --locked --bin herdr remote::
+          if ($LASTEXITCODE -ne 0) { throw "Windows remote tests failed" }
+          cargo test --locked --bin herdr client::
+          if ($LASTEXITCODE -ne 0) { throw "Windows client tests failed" }
+          cargo test --locked --bin herdr protocol::wire::
+          if ($LASTEXITCODE -ne 0) { throw "endpoint codec tests failed" }
           cargo build --release --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw "release build failed" }
+
+      - name: Verify Windows release package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stageDir = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          & .\checkouts\herdr\scripts\package_windows_conpty.ps1 `
+            -HerdrExe checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe `
+            -PackagePath (Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg") `
+            -StageDir $stageDir `
+            -OutputPath (Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64.zip")
+          & .\checkouts\herdr\scripts\windows_smoke_conpty_path.ps1 `
+            -ExePath (Join-Path $stageDir "herdr.exe")

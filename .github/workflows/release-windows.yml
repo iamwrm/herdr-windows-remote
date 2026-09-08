@@ -4,7 +4,7 @@ name: Release (Windows)
 # upstream (herdrdev/herdr) at the release tag pinned in
 # patches/herdr/BASE, verifying its commit via BASE_COMMIT, applying the patch
 # series with `git am`, and publishing
-# the Windows executable and Linux hcode shim as GitHub release assets.
+# the Windows ConPTY bundle and Linux hcode shim as GitHub release assets.
 
 on:
   workflow_dispatch:
@@ -113,9 +113,14 @@ jobs:
       - name: Package artifacts
         shell: pwsh
         run: |
-          Copy-Item checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe herdr-windows-x86_64.exe
+          $ErrorActionPreference = "Stop"
+          & .\checkouts\herdr\scripts\package_windows_conpty.ps1 `
+            -HerdrExe checkouts\herdr\target\x86_64-pc-windows-msvc\release\herdr.exe `
+            -PackagePath (Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg") `
+            -StageDir (Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64") `
+            -OutputPath herdr-windows-x86_64.zip
           Copy-Item extras\remote-bin\hcode hcode
-          $binaryHash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.exe).Hash.ToLowerInvariant()
+          $binaryHash = (Get-FileHash -Algorithm SHA256 herdr-windows-x86_64.zip).Hash.ToLowerInvariant()
           $hcodeHash = (Get-FileHash -Algorithm SHA256 hcode).Hash.ToLowerInvariant()
           # BUILD_INFO ships as HTML so the release asset renders in the
           # browser instead of forcing a download; gh release upload derives
@@ -129,7 +134,7 @@ jobs:
             "target=x86_64-pc-windows-msvc"
             "libghostty_vt_optimize=$env:LIBGHOSTTY_VT_OPTIMIZE"
             "libghostty_vt_simd=$env:LIBGHOSTTY_VT_SIMD"
-            "sha256=$binaryHash  herdr-windows-x86_64.exe"
+            "sha256=$binaryHash  herdr-windows-x86_64.zip"
             "sha256=$hcodeHash  hcode"
           )
           @"
@@ -175,13 +180,15 @@ jobs:
           @"
           Native Windows build: upstream herdr $env:UPSTREAM_BASE + patches/herdr series, with ``herdr --remote`` support. Includes the ``hcode`` Linux shim for opening local VS Code Remote-SSH.
 
+          Download ``herdr-windows-x86_64.zip``, extract the complete archive, and run ``herdr.exe``. Keep the bundled ``conpty`` directory beside the executable.
+
           **Repository commit:** [$($env:GITHUB_SHA.Substring(0, 7))](https://github.com/$env:GITHUB_REPOSITORY/commit/$env:GITHUB_SHA)
 
           ### Recent repository commits (up to 5)
 
           $commitLines
 
-          See [BUILD_INFO.html](https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/BUILD_INFO.html) for the upstream and patched commits and artifact SHA-256 checksums (renders in the browser, no download needed).
+          See [BUILD_INFO.html](https://github.com/$env:GITHUB_REPOSITORY/releases/download/$tag/BUILD_INFO.html) for the upstream and patched commits and artifact SHA-256 checksums.
           "@ | Out-File -Encoding utf8 RELEASE_NOTES.md
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
@@ -198,8 +205,15 @@ jobs:
               --title "herdr $tag (Windows --remote)" `
               --notes-file RELEASE_NOTES.md
           }
-          # Remove a stale BUILD_INFO.txt left by earlier runs of the rolling
-          # prerelease; --clobber only replaces same-named assets.
-          gh release delete-asset $tag BUILD_INFO.txt --repo $env:GITHUB_REPOSITORY --yes *> $null
-          if ($LASTEXITCODE -ne 0) { Write-Host "no stale BUILD_INFO.txt asset to remove" }
-          gh release upload $tag herdr-windows-x86_64.exe hcode BUILD_INFO.html --repo $env:GITHUB_REPOSITORY --clobber
+          gh release upload $tag herdr-windows-x86_64.zip hcode BUILD_INFO.html --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "release asset upload failed" }
+          # After the complete replacement is available, remove obsolete assets
+          # from earlier rolling builds; --clobber only replaces matching names.
+          $assets = @(gh release view $tag --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
+          if ($LASTEXITCODE -ne 0) { throw "failed to list release assets" }
+          foreach ($asset in @("BUILD_INFO.txt", "herdr-windows-x86_64.exe")) {
+            if ($assets -contains $asset) {
+              gh release delete-asset $tag $asset --repo $env:GITHUB_REPOSITORY --yes
+              if ($LASTEXITCODE -ne 0) { throw "failed to remove obsolete release asset $asset" }
+            }
+          }

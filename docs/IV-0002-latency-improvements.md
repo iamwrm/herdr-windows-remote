@@ -2,15 +2,15 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0002` of the current five-patch
-  `v0.8.0` representation; the latest publication is `v0.8.0-win.05` (the
+- **Status:** implemented in ownership patch `0002` of the current four-patch
+  `v0.9.0` representation (unpublished); the latest publication is `v0.8.0-win.05` (the
   initial latency stack shipped in `v0.7.5-win.01`); live deb1 verification
   and the W1 packet-capture verdict remain pending
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
 - **Deliverables:** ownership patch `patches/herdr/0002-*-IV-0002.patch`,
   plus the deb1 network-simulation harness below
-- **Implementation base:** `v0.8.0` (`346411fa`), stacked on
+- **Implementation base:** `v0.9.0` (`b99002ac`), stacked on
   [IV-0001](IV-0001-windows-remote.md)'s ownership patch `0001`
 - **Consumer compatibility:** [IV-0006](IV-0006-software-cursor-predictive-echo.md)
   owns automatic hidden software-cursor support for Prime Agent and pi;
@@ -18,6 +18,19 @@
   adapter for older builds
 - **Related initiative:** [IV-0004](IV-0004-vscode-remote-open.md) owns the
   following patch, `0003`; no IV-0004 changes are mixed into this patch
+
+
+## v0.9.0 integration
+
+Prediction and software-cursor handling share patch 0002. A small client presentation adapter consumes routed pane input, scopes state by endpoint and pane, and reconciles encoded client frames. Local-only rendering skips prediction. The cached combined probe is retired: upstream owns live capability discovery and restart decisions. Optional TCP relay and diagnostic timing remain.
+
+See [verification and migration](UPGRADE-v0.9.0.md). Descriptions below of earlier releases are historical.
+
+## v0.8.2 upgrade
+
+The combined probe and timing now integrate with upstream `src/remote/attach.rs`. Upstream owns the cancellable Windows pump (1 ms polling); the older blocking/CancelIoEx transport is retired. Predictive echo, coalesced protocol writes and the opt-in TCP relay remain.
+
+See [upgrade verification](UPGRADE-v0.8.2.md) for build and runtime evidence.
 
 ## Purpose
 

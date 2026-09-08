@@ -92,7 +92,10 @@ After every numbered release:
 - Confirm the release target and `BUILD_INFO.html` `repo_commit` equal
   `git rev-parse <tag>`, and `BUILD_INFO.html` `upstream_commit` equals
   `patches/herdr/BASE_COMMIT`.
-- Confirm `herdr-windows-x86_64.exe`, `hcode`, and `BUILD_INFO.html` are present.
+- Confirm `herdr-windows-x86_64.zip`, `hcode`, and `BUILD_INFO.html` are present.
+  Extract the ZIP and verify `herdr.exe` and the complete app-local `conpty`
+  runtime are included. The rolling prerelease must not retain the obsolete
+  `herdr-windows-x86_64.exe` asset.
 - Confirm the workflow conclusion is `success`, check-run annotations are
   empty, and logs contain no warning/deprecation messages.
 - Report the release URL, workflow-run URL, tag, and repository commit.

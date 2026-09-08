@@ -1,0 +1,568 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herdr patch stack <patches@example.invalid>
+Date: Tue, 8 Sep 2026 01:00:00 +0800
+Subject: [PATCH 1/4] fix(fork): retain input theme and update safeguards (IV-0001)
+
+---
+diff --git a/src/client/events.rs b/src/client/events.rs
+index 43f7b8ad..cc0fe0ff 100644
+--- a/src/client/events.rs
++++ b/src/client/events.rs
+@@ -10,6 +10,8 @@ pub(super) enum ClientLoopEvent {
+     DirectGraphicsResponse(direct_graphics::Response),
+     #[cfg(windows)]
+     StdinEvents(Vec<crate::protocol::ClientInputEvent>),
++    #[cfg(windows)]
++    StdinThemeReport(Vec<u8>),
+     Resize(u16, u16, u32, u32, bool),
+     TerminalUnavailable(io::Error),
+     ServerMessage {
+diff --git a/src/client/input.rs b/src/client/input.rs
+index 456f59b5..02383300 100644
+--- a/src/client/input.rs
++++ b/src/client/input.rs
+@@ -26,6 +26,18 @@ use super::ClientLoopEvent;
+ #[cfg(any(windows, test))]
+ mod windows_vti;
+ 
++/// Writes the host terminal default-color query (OSC 10/11) to stdout.
++///
++/// Used by the Windows console reader to re-query after the host reports a
++/// color scheme change, mirroring the Unix client's behavior.
++#[cfg(windows)]
++fn write_host_terminal_theme_query_to_stdout() -> std::io::Result<()> {
++    use std::io::Write as _;
++    let mut stdout = std::io::stdout();
++    stdout.write_all(crate::terminal_theme::HOST_COLOR_QUERY_SEQUENCE.as_bytes())?;
++    stdout.flush()
++}
++
+ // ---------------------------------------------------------------------------
+ // Stdin reader thread
+ // ---------------------------------------------------------------------------
+diff --git a/src/client/input/windows_vti.rs b/src/client/input/windows_vti.rs
+index fc81cd81..d12373fe 100644
+--- a/src/client/input/windows_vti.rs
++++ b/src/client/input/windows_vti.rs
+@@ -34,6 +34,20 @@ pub(super) fn raw_console_reader_loop(
+             }
+             WindowsInputItems::Closed => return,
+         }
++        if !pump.theme_reports.bytes.is_empty() {
++            let bytes = std::mem::take(&mut pump.theme_reports.bytes);
++            match event_tx.try_send(ClientLoopEvent::StdinThemeReport(bytes)) {
++                Ok(()) => {
++                    if std::mem::take(&mut pump.theme_reports.requery) {
++                        let _ = super::write_host_terminal_theme_query_to_stdout();
++                    }
++                }
++                Err(mpsc::error::TrySendError::Full(ClientLoopEvent::StdinThemeReport(bytes))) => {
++                    pump.theme_reports.bytes = bytes
++                }
++                Err(_) => return,
++            }
++        }
+         if !handoff.try_flush(&event_tx) {
+             return;
+         }
+@@ -282,14 +296,22 @@ struct WindowsInputMapper {
+ struct WindowsInputPump {
+     framer: crate::raw_input::RawInputFramer,
+     paste_from_win32_key_records: bool,
++    theme_reports: ThemeReportOutbox,
+     pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
+ }
+ 
++#[derive(Default)]
++struct ThemeReportOutbox {
++    bytes: Vec<u8>,
++    requery: bool,
++}
++
+ impl Default for WindowsInputPump {
+     fn default() -> Self {
+         Self {
+             framer: crate::raw_input::RawInputFramer::for_host_input(),
+             paste_from_win32_key_records: false,
++            theme_reports: ThemeReportOutbox::default(),
+             pending_physical_escape: None,
+         }
+     }
+@@ -439,9 +461,47 @@ impl WindowsInputPump {
+                 self.paste_from_win32_key_records = false;
+             }
+         }
++        for event in &events {
++            self.collect_theme_report(event);
++        }
+         Self::raw_events_to_client_events(events)
+     }
+ 
++    /// Reconstructs host theme report sequences (OSC 10/11 responses, color
++    /// scheme reports) so the client can forward them to the server as raw
++    /// input bytes — the same shape Unix clients deliver. The server's
++    /// raw-input framer parses them into this client's host theme, which
++    /// pane rendering needs to resolve inverse-video cells against the real
++    /// host colors instead of libghostty's fallback palette.
++    fn collect_theme_report(&mut self, event: &crate::raw_input::RawInputEvent) {
++        match event {
++            crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
++                self.theme_reports.bytes.extend_from_slice(
++                    crate::terminal_theme::osc_set_default_color_sequence(*kind, *color).as_bytes(),
++                );
++            }
++            crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
++                self.theme_reports
++                    .bytes
++                    .extend_from_slice(match appearance {
++                        crate::terminal_theme::HostAppearance::Dark => {
++                            crate::raw_input::GHOSTTY_COLOR_SCHEME_DARK_REPORT
++                        }
++                        crate::terminal_theme::HostAppearance::Light => {
++                            crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT
++                        }
++                    });
++                self.theme_reports.requery = true;
++            }
++            _ => {}
++        }
++    }
++
++    #[cfg(test)]
++    fn take_theme_reports(&mut self) -> ThemeReportOutbox {
++        std::mem::take(&mut self.theme_reports)
++    }
++
+     fn raw_events_to_client_events(
+         events: Vec<crate::raw_input::RawInputEvent>,
+     ) -> Vec<crate::protocol::ClientInputEvent> {
+@@ -1107,17 +1167,22 @@ impl WindowsWin32InputModeFramer {
+ }
+ 
+ fn parse_win32_input_mode_key_record(body: &str) -> Option<WindowsKeyRecord> {
+-    let mut fields = body.split(';');
+-    let virtual_key_code = fields.next()?.parse::<u16>().ok()?;
+-    let virtual_scan_code = fields.next()?.parse::<u16>().ok()?;
+-    let unicode = fields.next()?.parse::<u16>().ok()?;
+-    let key_down = fields.next()?.parse::<u16>().ok()? != 0;
+-    let control_key_state = fields.next()?.parse::<u32>().ok()?;
+-    let repeat_count = fields.next()?.parse::<u16>().ok()?;
+-    if fields.next().is_some() {
+-        return None;
++    fn field<T: std::str::FromStr>(value: Option<&str>, default: T) -> Option<T> {
++        match value {
++            None | Some("") => Some(default),
++            Some(value) => value.parse::<T>().ok(),
++        }
+     }
+ 
++    let mut fields = body.split(';');
++    let virtual_key_code = field(fields.next(), 0u16)?;
++    let virtual_scan_code = field(fields.next(), 0u16)?;
++    let unicode = field(fields.next(), 0u16)?;
++    let key_down = field(fields.next(), 0u16)? != 0;
++    let control_key_state = field(fields.next(), 0u32)?;
++    let repeat_count = field(fields.next(), 1u16)?;
++    // Extra parameters are ignored, exactly like the reference decoder.
++
+     Some(WindowsKeyRecord {
+         key_down,
+         repeat_count,
+@@ -1242,6 +1307,48 @@ fn windows_input_trace_enabled() -> bool {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn vti_osc_default_color_response_becomes_theme_report_not_input() {
++        let mut translator = WindowsInputTranslator::default();
++        let mut events = Vec::new();
++        for record in "\x1b]10;rgb:aabb/bbcc/ccdd\x1b\\\x1b]11;rgb:11/22/33\x1b\\"
++            .chars()
++            .map(key_char)
++        {
++            events.extend(translator.translate(record));
++        }
++        events.extend(translator.idle());
++
++        assert_eq!(events, Vec::new(), "theme responses must not become input");
++        let outbox = translator.pump.take_theme_reports();
++        let reports = String::from_utf8(outbox.bytes).unwrap();
++        assert_eq!(
++            reports,
++            "\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\"
++        );
++        assert!(!outbox.requery);
++
++        // Reports drain once.
++        assert!(translator.pump.take_theme_reports().bytes.is_empty());
++    }
++
++    #[test]
++    fn vti_color_scheme_report_becomes_theme_report_and_requeries() {
++        let mut translator = WindowsInputTranslator::default();
++        let mut events = Vec::new();
++        for record in "\x1b[?997;2n".chars().map(key_char) {
++            events.extend(translator.translate(record));
++        }
++        events.extend(translator.idle());
++
++        assert_eq!(events, Vec::new());
++        let outbox = translator.pump.take_theme_reports();
++        assert_eq!(
++            outbox.bytes,
++            crate::raw_input::GHOSTTY_COLOR_SCHEME_LIGHT_REPORT.to_vec()
++        );
++        assert!(outbox.requery);
++    }
+ 
+     fn key_char(ch: char) -> WindowsInputRecord {
+         WindowsInputRecord::Key(WindowsKeyRecord {
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index b815a057..6e377c53 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -986,6 +986,29 @@ async fn run_client_loop(
+                 }
+             }
+             #[cfg(windows)]
++            ClientLoopEvent::StdinThemeReport(data) => {
++                if let Some(shell) = state.shell.as_mut() {
++                    let outcome = shell
++                        .handle_raw_events(crate::raw_input::parse_raw_input_bytes_sync(&data));
++                    let frame = outcome
++                        .repaint
++                        .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
++                        .flatten();
++                    if finish_client_shell_input(
++                        &mut state,
++                        outcome,
++                        frame,
++                        &mut write_stream,
++                        &mut pending_activation,
++                        &mut endpoint_commands,
++                        &mut prefix_input_source,
++                        &event_tx,
++                    )? {
++                        return Ok(());
++                    }
++                }
++            }
++            #[cfg(windows)]
+             ClientLoopEvent::StdinEvents(events) => {
+                 let image_bridge_active = endpoint_accepts_local_images(
+                     is_remote_client,
+diff --git a/src/client/shell/input.rs b/src/client/shell/input.rs
+index 9b5fff21..3cc8cbe5 100644
+--- a/src/client/shell/input.rs
++++ b/src/client/shell/input.rs
+@@ -153,7 +153,7 @@ impl ClientShellState {
+         outcome
+     }
+ 
+-    pub(super) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
++    pub(crate) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
+         let mut outcome = ClientShellInput::default();
+         if !events.is_empty() && self.endpoint_error.take().is_some() {
+             outcome.repaint = true;
+diff --git a/src/client/terminal_geometry.rs b/src/client/terminal_geometry.rs
+index aaf216df..c0fcd3cd 100644
+--- a/src/client/terminal_geometry.rs
++++ b/src/client/terminal_geometry.rs
+@@ -193,7 +193,7 @@ pub(super) fn query_host_terminal_theme() {
+ }
+ 
+ pub(super) fn should_query_host_terminal_theme() -> bool {
+-    !cfg!(windows)
++    true
+ }
+ 
+ pub(super) fn write_host_terminal_theme_query(mut writer: impl io::Write) -> io::Result<()> {
+diff --git a/src/client/tests/mod.rs b/src/client/tests/mod.rs
+index cca73232..188e0c4f 100644
+--- a/src/client/tests/mod.rs
++++ b/src/client/tests/mod.rs
+@@ -399,7 +399,7 @@ fn color_scheme_change_event_requests_host_theme_query() {
+ 
+ #[test]
+ fn host_terminal_theme_query_is_disabled_on_windows() {
+-    assert_eq!(should_query_host_terminal_theme(), !cfg!(windows));
++    assert!(should_query_host_terminal_theme());
+ }
+ 
+ #[test]
+@@ -444,10 +444,7 @@ fn reported_cell_size_is_taken_from_host_cell_size_events() {
+ 
+ #[test]
+ fn color_scheme_reports_are_enabled_only_for_full_clients() {
+-    assert_eq!(
+-        should_enable_host_color_scheme_reports(true),
+-        !cfg!(windows)
+-    );
++    assert!(should_enable_host_color_scheme_reports(true));
+     assert!(!should_enable_host_color_scheme_reports(false));
+ }
+ 
+diff --git a/src/pane/terminal.rs b/src/pane/terminal.rs
+index 1dc5a88d..b1e4a346 100644
+--- a/src/pane/terminal.rs
++++ b/src/pane/terminal.rs
+@@ -2241,8 +2241,12 @@ impl GhosttyPaneTerminal {
+             .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+         let default_fg = colors
+             .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+-        let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+-        let resolved_bg = colors.map(|c| ghostty_color(c.background));
++        let (resolved_fg, resolved_bg) = ghostty_resolved_inverse_colors(
++            colors,
++            host_theme,
++            initial_default_foreground,
++            initial_default_background,
++        );
+         let palette_overrides = colors
+             .zip(terminal.default_palette().ok())
+             .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
+@@ -2508,8 +2512,12 @@ fn ghostty_collect_dirty_patch(
+         .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
+     let default_fg = colors
+         .and_then(|c| ghostty_default_fg(c.foreground, host_theme, initial_default_foreground));
+-    let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
+-    let resolved_bg = colors.map(|c| ghostty_color(c.background));
++    let (resolved_fg, resolved_bg) = ghostty_resolved_inverse_colors(
++        colors,
++        host_theme,
++        initial_default_foreground,
++        initial_default_background,
++    );
+     let palette_overrides = colors
+         .zip(terminal.default_palette().ok())
+         .and_then(|(colors, default)| PaletteOverrides::new(&colors.palette, &default));
+@@ -3136,19 +3144,35 @@ fn ghostty_cell_style(
+     if basic.style.invisible {
+         fg = bg.or(default_bg);
+     }
++    let mut host_reversed = false;
+     if basic.style.inverse {
+         // When the background is transparent (None), resolve it to the
+         // actual terminal background color before swapping.  Otherwise
+         // the swapped fg becomes None (Color::Reset) which the host
+         // terminal renders as its default foreground — the same hue as
+         // the new bg, making inverse text invisible.
+-        if bg.is_none() {
+-            bg = resolved_bg;
+-        }
+-        if fg.is_none() {
+-            fg = resolved_fg;
++        //
++        // Resolved colors are only available when they are trustworthy
++        // (host theme known, or the pane app customized its palette). When
++        // a needed side is untrustworthy — e.g. Windows clients never query
++        // the host theme, so the pane palette is just libghostty's built-in
++        // fallback — emit REVERSED instead and let the host terminal swap
++        // its real default colors. Resolving against the fallback painted
++        // white cursor blocks for TUIs that draw their cursor with reverse
++        // video (SGR 7) over default colors.
++        let bg_resolvable = bg.is_some() || resolved_bg.is_some();
++        let fg_resolvable = fg.is_some() || resolved_fg.is_some();
++        if bg_resolvable && fg_resolvable {
++            if bg.is_none() {
++                bg = resolved_bg;
++            }
++            if fg.is_none() {
++                fg = resolved_fg;
++            }
++            std::mem::swap(&mut fg, &mut bg);
++        } else {
++            host_reversed = true;
+         }
+-        std::mem::swap(&mut fg, &mut bg);
+     }
+ 
+     let mut style = ghostty_default_style(fg, bg);
+@@ -3178,10 +3202,40 @@ fn ghostty_cell_style(
+     if basic.style.strikethrough {
+         modifiers |= Modifier::CROSSED_OUT;
+     }
++    if host_reversed {
++        modifiers |= Modifier::REVERSED;
++    }
+     modifiers = crate::protocol::modifier_with_underline_style(modifiers, basic.style.underline);
+     style.add_modifier(modifiers)
+ }
+ 
++/// Concrete pane default colors for resolving inverse cells, or `None` per
++/// side when that color cannot be trusted.
++///
++/// A side is trustworthy when the host terminal theme for it is known (the
++/// pane palette was seeded/updated from real host colors) or when the pane
++/// app customized it away from the initial default (the app chose a concrete
++/// color on purpose). Otherwise the pane palette is just libghostty's
++/// built-in fallback and must not be baked into rendered cells.
++fn ghostty_resolved_inverse_colors(
++    colors: Option<crate::ghostty::RenderColors>,
++    host_theme: crate::terminal_theme::TerminalTheme,
++    initial_default_foreground: Option<crate::ghostty::RgbColor>,
++    initial_default_background: Option<crate::ghostty::RgbColor>,
++) -> (Option<Color>, Option<Color>) {
++    let resolved_fg = colors.and_then(|c| {
++        (host_theme.foreground.is_some()
++            || initial_default_foreground.is_some_and(|initial| initial != c.foreground))
++        .then(|| ghostty_color(c.foreground))
++    });
++    let resolved_bg = colors.and_then(|c| {
++        (host_theme.background.is_some()
++            || initial_default_background.is_some_and(|initial| initial != c.background))
++        .then(|| ghostty_color(c.background))
++    });
++    (resolved_fg, resolved_bg)
++}
++
+ #[derive(Debug)]
+ enum OrderedPtyResponseEvent {
+     DefaultColor(DefaultColorTrackedEvent),
+@@ -6868,6 +6922,68 @@ mod tests {
+         assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
+     }
+ 
++    #[test]
++    fn render_inverse_text_without_host_theme_defers_reversal_to_host_terminal() {
++        let (tx, _rx) = mpsc::channel(4);
++        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
++        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
++        // No host theme applied: the pane palette is libghostty's built-in
++        // fallback. TUIs like pi draw their cursor as `SGR 7` over default
++        // colors; resolving the reversal against the fallback painted a
++        // white block regardless of the real host colors (seen from Windows
++        // clients, which never query the host theme). The cell must instead
++        // keep default colors and carry REVERSED for the host terminal.
++        {
++            let mut core = pane.core.lock().unwrap();
++            core.terminal.write(b"\x1b[7mhi\x1b[27m");
++        }
++
++        let backend = ratatui::backend::TestBackend::new(20, 5);
++        let mut terminal = ratatui::Terminal::new(backend).unwrap();
++        terminal
++            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
++            .unwrap();
++
++        let buffer = terminal.backend().buffer();
++        let cell = &buffer[(0, 0)];
++        assert_eq!(cell.symbol(), "h");
++        assert_eq!(cell.style().fg, Some(Color::Reset));
++        assert_eq!(cell.style().bg, Some(Color::Reset));
++        assert!(cell.style().add_modifier.contains(Modifier::REVERSED));
++
++        // Cells outside the inverse run stay non-reversed.
++        let plain = &buffer[(3, 0)];
++        assert!(!plain.style().add_modifier.contains(Modifier::REVERSED));
++    }
++
++    #[test]
++    fn render_inverse_text_with_pane_customized_palette_still_resolves_concretely() {
++        let (tx, _rx) = mpsc::channel(4);
++        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
++        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
++        // No host theme, but the pane app set its own default colors via
++        // OSC 10/11 — those are deliberate concrete colors, so inverse must
++        // keep resolving to a concrete swap.
++        {
++            let mut core = pane.core.lock().unwrap();
++            core.terminal
++                .write(b"\x1b]10;rgb:aa/bb/cc\x1b\\\x1b]11;rgb:11/22/33\x1b\\\x1b[7mhi\x1b[27m");
++        }
++
++        let backend = ratatui::backend::TestBackend::new(20, 5);
++        let mut terminal = ratatui::Terminal::new(backend).unwrap();
++        terminal
++            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
++            .unwrap();
++
++        let buffer = terminal.backend().buffer();
++        let cell = &buffer[(0, 0)];
++        assert_eq!(cell.symbol(), "h");
++        assert_eq!(cell.style().fg, Some(Color::Rgb(0x11, 0x22, 0x33)));
++        assert_eq!(cell.style().bg, Some(Color::Rgb(0xaa, 0xbb, 0xcc)));
++        assert!(!cell.style().add_modifier.contains(Modifier::REVERSED));
++    }
++
+     #[test]
+     fn trim_trailing_blank_rows_drops_empty_viewport_tail() {
+         let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
+diff --git a/src/raw_input.rs b/src/raw_input.rs
+index 3f2e102e..7414a72c 100644
+--- a/src/raw_input.rs
++++ b/src/raw_input.rs
+@@ -4,7 +4,6 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+ ///
+ /// This directly extracts events without going through a channel, making it
+ /// suitable for synchronous use.
+-#[cfg(any(unix, test))]
+ pub fn parse_raw_input_bytes_sync(data: &[u8]) -> Vec<RawInputEvent> {
+     let mut framer = RawInputFramer::default();
+     let mut events = framer.push(data);
+diff --git a/src/update.rs b/src/update.rs
+index f836fb80..aa37e981 100644
+--- a/src/update.rs
++++ b/src/update.rs
+@@ -23,6 +23,14 @@ use interprocess::local_socket::traits::Stream as _;
+ use serde::{Deserialize, Deserializer};
+ 
+ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
++
++/// This build is the `herdr-windows-remote` patched build. Self-update and the
++/// background version check are disabled: they compare against the *official*
++/// herdr.dev manifests and would replace this binary with an upstream build
++/// that lacks native Windows `--remote` support. Fork releases live at
++/// [`FORK_RELEASES_URL`].
++const FORK_BUILD: bool = true;
++const FORK_RELEASES_URL: &str = "https://github.com/iamwrm/herdr-windows-remote/releases";
+ const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+ const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
+ const HERDR_UPDATE_COMMAND: &str = "herdr update";
+@@ -2111,6 +2119,12 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
+ 
+ /// Manual self-update command (`herdr update`).
+ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
++    if FORK_BUILD {
++        return Err(format!(
++            "self-update is disabled for this windows-remote fork build: it would install an official upstream binary without the custom clipboard, hcode, and predictive-input integrations.\nDownload fork builds from {FORK_RELEASES_URL} instead."
++        ));
++    }
++
+     let channel = UpdateChannel::configured();
+ 
+     if is_homebrew_managed_install() {
+@@ -2243,6 +2257,14 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
+ /// Background update check: only surface availability and release notes.
+ /// Runs in a background thread at startup.
+ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
++    if FORK_BUILD {
++        // No version check against the official manifests: any "update
++        // available" notice would steer the user into replacing this fork
++        // build with an upstream binary. Watch FORK_RELEASES_URL instead.
++        tracing::info!("skipping update check: windows-remote fork build");
++        return;
++    }
++
+     crate::logging::update_check_started();
+     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
+         let version = version.trim();
+@@ -2397,6 +2419,18 @@ fn platform_target() -> (&'static str, &'static str) {
+ // Tests
+ // ---------------------------------------------------------------------------
+ 
++#[cfg(test)]
++mod fork_tests {
++    use super::*;
++
++    #[test]
++    fn fork_self_update_error_points_to_current_releases() {
++        let error = self_update(SelfUpdateOptions::default()).expect_err("fork update disabled");
++        assert!(error.contains("https://github.com/iamwrm/herdr-windows-remote/releases"));
++        assert!(!error.contains("https://github.com/iamwrm/herdr/releases"));
++    }
++}
++
+ #[cfg(all(test, unix))]
+ mod tests {
+     use super::*;
