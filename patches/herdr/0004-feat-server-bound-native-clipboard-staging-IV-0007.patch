@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herdr patch stack <patches@example.invalid>
+Date: Tue, 8 Sep 2026 01:00:00 +0800
+Subject: [PATCH 4/4] feat(server): bound native clipboard staging (IV-0007)
+
+---
+diff --git a/src/config/model.rs b/src/config/model.rs
+index f17c3d66..46de3131 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -10,6 +10,8 @@ use super::{
+ };
+ 
+ pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
++pub const DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB: u64 = 64;
++pub const MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB: u64 = 1024 * 1024;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+ #[serde(rename_all = "lowercase")]
+@@ -1037,6 +1039,15 @@ pub struct RemoteConfig {
+     /// once echo delay is observed to be high), or `"always"`.
+     /// Default: "auto".
+     pub predictive_echo: String,
++    /// Server-side maximum aggregate size of staged clipboard images.
++    /// Configure on the remote server. Images survive client disconnects;
++    /// oldest images are deleted first to enforce this per-user FIFO budget.
++    /// Default: 64 MiB.
++    #[serde(
++        default = "default_remote_clipboard_image_buffer_mb",
++        deserialize_with = "deserialize_remote_clipboard_image_buffer_mb"
++    )]
++    pub clipboard_image_buffer_mb: u64,
+     /// Allow the remote `hcode` shim script to open local VS Code Remote-SSH
+     /// windows for paths on the attached host (`hcode .` inside
+     /// `herdr --remote`). The client only ever launches VS Code with
+@@ -1051,11 +1062,36 @@ impl Default for RemoteConfig {
+             manage_ssh_config: true,
+             tcp_relay: false,
+             predictive_echo: "auto".to_string(),
++            clipboard_image_buffer_mb: DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB,
+             code_open: true,
+         }
+     }
+ }
+ 
++impl RemoteConfig {
++    pub(crate) fn clipboard_image_buffer_bytes(&self) -> u64 {
++        self.clipboard_image_buffer_mb * 1024 * 1024
++    }
++}
++
++fn deserialize_remote_clipboard_image_buffer_mb<'de, D>(deserializer: D) -> Result<u64, D::Error>
++where
++    D: Deserializer<'de>,
++{
++    let value = u64::deserialize(deserializer)?;
++    if (1..=MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB).contains(&value) {
++        Ok(value)
++    } else {
++        Err(de::Error::custom(format!(
++            "remote.clipboard_image_buffer_mb must be between 1 and {MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB}"
++        )))
++    }
++}
++
++fn default_remote_clipboard_image_buffer_mb() -> u64 {
++    DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB
++}
++
+ #[derive(Debug, Default, Deserialize)]
+ #[serde(default)]
+ pub struct ExperimentalConfig {
+@@ -1849,19 +1885,39 @@ mouse_scroll_lines = 0
+     }
+ 
+     #[test]
+-    fn remote_config_defaults_and_code_open_parse() {
++    fn remote_config_defaults_and_overrides_parse() {
+         let config = Config::default();
+         assert!(config.remote.code_open);
++        assert_eq!(
++            config.remote.clipboard_image_buffer_mb,
++            DEFAULT_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB
++        );
++        assert_eq!(
++            config.remote.clipboard_image_buffer_bytes(),
++            64 * 1024 * 1024
++        );
+ 
+         let toml = r#"
+ [remote]
+ code_open = false
++clipboard_image_buffer_mb = 128
+ "#;
+         let config: Config = toml::from_str(toml).unwrap();
+         assert!(!config.remote.code_open);
++        assert_eq!(config.remote.clipboard_image_buffer_mb, 128);
+         assert!(config.remote.manage_ssh_config);
+     }
+ 
++    #[test]
++    fn remote_clipboard_image_buffer_rejects_zero_and_excessive_values() {
++        assert!(toml::from_str::<Config>("[remote]\nclipboard_image_buffer_mb = 0\n").is_err());
++        assert!(toml::from_str::<Config>(&format!(
++            "[remote]\nclipboard_image_buffer_mb = {}\n",
++            MAX_REMOTE_CLIPBOARD_IMAGE_BUFFER_MB + 1
++        ))
++        .is_err());
++    }
++
+     #[test]
+     fn toast_config_parses() {
+         let toml = r#"
+diff --git a/src/server/clipboard_image.rs b/src/server/clipboard_image.rs
+index 70072f2d..527731ff 100644
+--- a/src/server/clipboard_image.rs
++++ b/src/server/clipboard_image.rs
+@@ -1,9 +1,7 @@
+ use std::fs;
+ use std::io::{self, Write as _};
+ use std::path::{Path, PathBuf};
+-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+-
+-const STAGED_CLIPBOARD_IMAGE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
++use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ pub(crate) struct StagedClipboardImage {
+     pub(crate) path: PathBuf,
+@@ -17,7 +15,22 @@ pub(crate) fn stage(
+ ) -> io::Result<StagedClipboardImage> {
+     let extension = sanitize_extension(extension);
+     let dir = ensure_staging_dir()?;
+-    cleanup_stale(&dir);
++    // Serialize capacity accounting across named servers sharing this user directory.
++    let lock = fs::OpenOptions::new()
++        .read(true)
++        .write(true)
++        .create(true)
++        .truncate(false)
++        .open(dir.join(".fifo.lock"))?;
++    lock.lock()?;
++    let budget = crate::config::Config::load()
++        .config
++        .remote
++        .clipboard_image_buffer_bytes();
++    if data.len() as u64 > budget {
++        return Err(io::Error::other("clipboard image exceeds FIFO capacity"));
++    }
++    reserve_capacity(&dir, data.len() as u64, budget)?;
+ 
+     let unique = SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+@@ -36,7 +49,11 @@ pub(crate) fn stage(
+             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+             Err(err) => return Err(err),
+         };
+-        file.write_all(data)?;
++        if let Err(error) = file.write_all(data) {
++            drop(file);
++            let _ = fs::remove_file(&path);
++            return Err(error);
++        }
+         return Ok(StagedClipboardImage {
+             paste_text: path.to_string_lossy().into_owned(),
+             path,
+@@ -82,13 +99,22 @@ fn staging_dir() -> PathBuf {
+ fn ensure_staging_dir() -> io::Result<PathBuf> {
+     let dir = staging_dir();
+     fs::create_dir_all(&dir)?;
+-    let metadata = fs::metadata(&dir)?;
++    let metadata = fs::symlink_metadata(&dir)?;
+     if !metadata.is_dir() {
+         return Err(io::Error::other(format!(
+             "clipboard image staging path is not a directory: {}",
+             dir.display()
+         )));
+     }
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::MetadataExt;
++        if metadata.uid() != unsafe { libc::geteuid() } {
++            return Err(io::Error::other(
++                "clipboard staging directory is owned by another user",
++            ));
++        }
++    }
+     restrict_dir_permissions(&dir)?;
+     Ok(dir)
+ }
+@@ -115,28 +141,72 @@ fn restrict_dir_permissions(_dir: &Path) -> io::Result<()> {
+     Ok(())
+ }
+ 
+-fn cleanup_stale(dir: &Path) {
+-    let Ok(entries) = fs::read_dir(dir) else {
+-        return;
+-    };
+-    for entry in entries.flatten() {
+-        let path = entry.path();
+-        let Ok(metadata) = entry.metadata() else {
++fn reserve_capacity(dir: &Path, incoming: u64, budget: u64) -> io::Result<()> {
++    if incoming > budget {
++        return Err(io::Error::other("clipboard image exceeds FIFO capacity"));
++    }
++    let mut files = Vec::new();
++    let mut total = 0u64;
++    for entry in fs::read_dir(dir)? {
++        let entry = entry?;
++        if !entry.file_name().to_string_lossy().starts_with("client-") {
+             continue;
++        }
++        let meta = match fs::symlink_metadata(entry.path()) {
++            Ok(meta) => meta,
++            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
++            Err(e) => return Err(e),
+         };
+-        let Ok(modified) = metadata.modified() else {
++        if !meta.is_file() {
+             continue;
+-        };
+-        if modified.elapsed().unwrap_or_default() > STAGED_CLIPBOARD_IMAGE_MAX_AGE {
+-            let _ = fs::remove_file(path);
+         }
++        total = total.saturating_add(meta.len());
++        files.push((meta.modified()?, entry.path(), meta.len()));
+     }
++    files.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
++    for (_, path, size) in files {
++        if total <= budget - incoming {
++            break;
++        }
++        match fs::remove_file(path) {
++            Ok(()) => {}
++            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
++            Err(e) => return Err(e),
++        };
++        total = total.saturating_sub(size);
++    }
++    Ok(())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn fifo_evicts_oldest_and_rejects_oversized_without_eviction() {
++        let dir = std::env::temp_dir().join(format!(
++            "herdr-fifo-test-{}-{}",
++            std::process::id(),
++            SystemTime::now()
++                .duration_since(UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        fs::create_dir(&dir).unwrap();
++        let first = dir.join("client-1.png");
++        let second = dir.join("client-2.png");
++        fs::write(&first, b"abcde").unwrap();
++        fs::write(&second, b"fghij").unwrap();
++        fs::write(dir.join("unrelated"), b"preserve").unwrap();
++        assert!(reserve_capacity(&dir, 9, 8).is_err());
++        assert!(first.exists() && second.exists());
++        reserve_capacity(&dir, 3, 8).unwrap();
++        assert!(!first.exists());
++        assert_eq!(fs::read(second).unwrap(), b"fghij");
++        assert!(dir.join("unrelated").exists());
++        fs::remove_dir_all(dir).unwrap();
++    }
++
+     #[test]
+     fn sanitize_extension_accepts_known_image_extensions() {
+         assert_eq!(sanitize_extension("PNG"), "png");
+diff --git a/src/server/headless.rs b/src/server/headless.rs
+index 2d652378..5b29292b 100644
+--- a/src/server/headless.rs
++++ b/src/server/headless.rs
+@@ -2146,8 +2146,10 @@ impl HeadlessServer {
+                             staged.paste_text,
+                         );
+                         if routed {
+-                            if let Some(client) = self.clients.get_mut(&client_id) {
+-                                client.staged_clipboard_files.push(staged.path);
++                            if self.clients.contains_key(&client_id) {
++                                // Successfully routed images belong to the per-user FIFO,
++                                // so an attached agent can read them after this client leaves.
++                                drop(staged.path);
+                             } else {
+                                 crate::server::clipboard_image::remove_files(vec![staged.path]);
+                                 return false;

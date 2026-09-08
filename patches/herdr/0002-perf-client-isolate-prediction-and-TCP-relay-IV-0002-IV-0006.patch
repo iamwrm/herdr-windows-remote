@@ -1,0 +1,3405 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herdr patch stack <patches@example.invalid>
+Date: Tue, 8 Sep 2026 01:00:00 +0800
+Subject: [PATCH 2/4] perf(client): isolate prediction and TCP relay (IV-0002, IV-0006)
+
+---
+diff --git a/Cargo.lock b/Cargo.lock
+index 08fe5cc6..254c4ad7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -697,6 +697,7 @@ dependencies = [
+  "toml",
+  "tracing",
+  "tracing-subscriber",
++ "unicode-segmentation",
+  "unicode-width",
+  "widestring",
+  "windows-sys",
+diff --git a/Cargo.toml b/Cargo.toml
+index d28ba46b..a645a4f4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -45,6 +45,7 @@ toml = "0.8"
+ tracing = "0.1.44"
+ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ unicode-width = "0.2"
++unicode-segmentation = "1.12"
+ schemars = { version = "1.2.1", features = ["derive"] }
+ 
+ [patch.crates-io]
+@@ -65,6 +66,7 @@ windows-sys = { version = "0.61.2", features = [
+     "Win32_System_Diagnostics_ToolHelp",
+     "Win32_System_Console",
+     "Win32_System_JobObjects",
++    "Win32_System_IO",
+     "Win32_System_Kernel",
+     "Win32_System_Memory",
+     "Win32_System_Ole",
+diff --git a/src/client/catalog_reload.rs b/src/client/catalog_reload.rs
+index 21f33bea..d807b0d7 100644
+--- a/src/client/catalog_reload.rs
++++ b/src/client/catalog_reload.rs
+@@ -112,6 +112,7 @@ mod tests {
+ 
+     fn state() -> ClientState {
+         ClientState {
++            prediction: prediction::Prediction::new("off", false),
+             blit_encoder: render_ansi::BlitEncoder::new(),
+             mouse_capture_active: false,
+             endpoint_mouse_capture_requested: false,
+diff --git a/src/client/echo_timing.rs b/src/client/echo_timing.rs
+new file mode 100644
+index 00000000..d3773b6c
+--- /dev/null
++++ b/src/client/echo_timing.rs
+@@ -0,0 +1,187 @@
++//! Env-gated keystroke→frame echo latency probe (`HERDR_ECHO_TIMING=1`).
++//!
++//! Measures the wall-clock time between sending a key input to the server and
++//! receiving the next locally composed frame (including chrome-only repaints).
++//! This is a diagnostic upper/lower mixed sample, not a network RTT benchmark.
++//! On a remote attach it approximates
++//! the full echo path (client → ssh → server → PTY → render → ssh → client),
++//! which is dominated by the link RTT.
++//!
++//! Methodology: at most one probe is outstanding at a time; the first frame
++//! received after a probed input closes the probe. Frames generated for
++//! unrelated reasons (spinner animation, background output) close probes
++//! early and show up as below-RTT outliers — measure while typing into an
++//! idle shell prompt for the clean signal.
++//!
++//! `HERDR_ECHO_TIMING=1` prints one summary when the client loop ends;
++//! `HERDR_ECHO_TIMING=verbose` additionally reports rolling stats every
++//! [`REPORT_EVERY`] samples. Zero overhead when the env var is unset.
++
++use std::time::Instant;
++
++const ENV_VAR: &str = "HERDR_ECHO_TIMING";
++const REPORT_EVERY: usize = 25;
++const MAX_SAMPLES: usize = 10_000;
++
++pub(crate) struct EchoTiming {
++    enabled: bool,
++    /// Report rolling stats while sampling instead of only a final summary.
++    verbose: bool,
++    outstanding: Option<Instant>,
++    samples_ms: Vec<u64>,
++    reported_at: usize,
++}
++
++impl EchoTiming {
++    pub(crate) fn from_env() -> Self {
++        let value = std::env::var(ENV_VAR).unwrap_or_default();
++        let value = value.trim();
++        let enabled = !value.is_empty() && value != "0";
++        let verbose = matches!(value, "verbose" | "rolling" | "2");
++        Self {
++            enabled,
++            verbose,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        }
++    }
++
++    /// Records that a key input was just sent to the server. No-op while a
++    /// previous probe is still waiting for its frame.
++    pub(crate) fn on_key_input_sent(&mut self) {
++        if !self.enabled || self.outstanding.is_some() {
++            return;
++        }
++        self.outstanding = Some(Instant::now());
++    }
++
++    /// Records that a rendered frame arrived from the server, closing the
++    /// outstanding probe if any.
++    pub(crate) fn on_render_received(&mut self) {
++        let Some(started) = self.outstanding.take() else {
++            return;
++        };
++        if self.samples_ms.len() >= MAX_SAMPLES {
++            return;
++        }
++        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
++        self.samples_ms.push(elapsed_ms);
++        if self.verbose && self.samples_ms.len() - self.reported_at >= REPORT_EVERY {
++            self.report("rolling");
++        }
++    }
++
++    /// Prints a stats summary to stderr. Called automatically while sampling
++    /// and once more (as "final") when the client loop ends.
++    pub(crate) fn report(&mut self, label: &str) {
++        if !self.enabled || self.samples_ms.is_empty() || self.reported_at == self.samples_ms.len()
++        {
++            return;
++        }
++        self.reported_at = self.samples_ms.len();
++        let stats = Stats::compute(&self.samples_ms);
++        // \r\n: the host terminal is in raw mode while the client runs.
++        eprint!(
++            "herdr echo-timing ({label}): n={} p50={}ms p95={}ms min={}ms max={}ms\r\n",
++            stats.count, stats.p50, stats.p95, stats.min, stats.max
++        );
++    }
++}
++
++impl Drop for EchoTiming {
++    fn drop(&mut self) {
++        self.report("final");
++    }
++}
++
++struct Stats {
++    count: usize,
++    p50: u64,
++    p95: u64,
++    min: u64,
++    max: u64,
++}
++
++impl Stats {
++    fn compute(samples: &[u64]) -> Self {
++        let mut sorted = samples.to_vec();
++        sorted.sort_unstable();
++        let percentile = |p: usize| -> u64 {
++            let index = (sorted.len().saturating_sub(1)) * p / 100;
++            sorted[index]
++        };
++        Self {
++            count: sorted.len(),
++            p50: percentile(50),
++            p95: percentile(95),
++            min: sorted[0],
++            max: sorted[sorted.len() - 1],
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn enabled_probe() -> EchoTiming {
++        EchoTiming {
++            enabled: true,
++            verbose: false,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        }
++    }
++
++    #[test]
++    fn disabled_probe_records_nothing() {
++        let mut probe = EchoTiming {
++            enabled: false,
++            verbose: false,
++            outstanding: None,
++            samples_ms: Vec::new(),
++            reported_at: 0,
++        };
++        probe.on_key_input_sent();
++        assert!(probe.outstanding.is_none());
++        probe.on_render_received();
++        assert!(probe.samples_ms.is_empty());
++    }
++
++    #[test]
++    fn one_probe_outstanding_at_a_time() {
++        let mut probe = enabled_probe();
++        probe.on_key_input_sent();
++        let first = probe.outstanding;
++        assert!(first.is_some());
++        probe.on_key_input_sent();
++        assert_eq!(probe.outstanding, first, "second input must not restart");
++        probe.on_render_received();
++        assert!(probe.outstanding.is_none());
++        assert_eq!(probe.samples_ms.len(), 1);
++    }
++
++    #[test]
++    fn frame_without_probe_is_ignored() {
++        let mut probe = enabled_probe();
++        probe.on_render_received();
++        assert!(probe.samples_ms.is_empty());
++    }
++
++    #[test]
++    fn stats_percentiles() {
++        let samples: Vec<u64> = (1..=100).collect();
++        let stats = Stats::compute(&samples);
++        assert_eq!(stats.count, 100);
++        assert_eq!(stats.p50, 50);
++        assert_eq!(stats.p95, 95);
++        assert_eq!(stats.min, 1);
++        assert_eq!(stats.max, 100);
++
++        let one = Stats::compute(&[42]);
++        assert_eq!(one.p50, 42);
++        assert_eq!(one.p95, 42);
++    }
++}
+diff --git a/src/client/endpoint/writer.rs b/src/client/endpoint/writer.rs
+index 973ff234..fb631a9b 100644
+--- a/src/client/endpoint/writer.rs
++++ b/src/client/endpoint/writer.rs
+@@ -157,24 +157,34 @@ fn queue_full() -> io::Error {
+     )
+ }
+ 
+-fn write_frame(
++fn write_frame(writer: &mut impl io::Write, frame: &[u8], stopped: &AtomicBool) -> io::Result<()> {
++    write_frame_with_clock(writer, frame, stopped, Instant::now)
++}
++
++fn write_frame_with_clock(
+     writer: &mut impl io::Write,
+     mut frame: &[u8],
+     stopped: &AtomicBool,
++    mut now: impl FnMut() -> Instant,
+ ) -> io::Result<()> {
+-    let deadline = Instant::now() + WRITE_TIMEOUT;
++    let mut deadline = now() + WRITE_TIMEOUT;
+     while !frame.is_empty() && !stopped.load(Ordering::Acquire) {
+-        match writer.write(frame) {
++        let chunk_len = frame.len().min(crate::platform::LOCAL_STREAM_WRITE_CHUNK);
++        match writer.write(&frame[..chunk_len]) {
+             Ok(0) => {}
+             Ok(written) => {
+                 frame = &frame[written..];
++                // Bound inactivity, not total transfer time. Large images can need
++                // more than five seconds of small Windows pipe writes while the
++                // polling peer continues to consume every chunk.
++                deadline = now() + WRITE_TIMEOUT;
+                 continue;
+             }
+             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+             Err(error) => return Err(error),
+         }
+-        if Instant::now() >= deadline {
++        if now() >= deadline {
+             return Err(io::Error::new(
+                 io::ErrorKind::TimedOut,
+                 "endpoint write timed out",
+@@ -327,6 +337,42 @@ mod tests {
+         let _ = std::fs::remove_file(path);
+     }
+ 
++    #[test]
++    fn large_frame_reaches_a_polling_peer() {
++        let (stream, mut peer, path) = streams();
++        peer.set_nonblocking(true).unwrap();
++        let mut transport = NativeEndpointTransport::with_lifetime(stream, ()).unwrap();
++        let input = ClientMessage::Input {
++            data: vec![b'x'; 32 * 1024],
++        };
++        let mut expected = Vec::new();
++        crate::protocol::write_message(&mut expected, &input).unwrap();
++        transport.send(&input).unwrap();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        let mut received = Vec::new();
++        let mut buffer = [0; 8192];
++        while received.len() < expected.len() && Instant::now() < deadline {
++            match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
++                crate::ipc::LocalStreamReadCount::Data(n) => {
++                    received.extend_from_slice(&buffer[..n])
++                }
++                crate::ipc::LocalStreamReadCount::Pending => {
++                    std::thread::sleep(Duration::from_millis(1))
++                }
++                crate::ipc::LocalStreamReadCount::Closed => break,
++            }
++        }
++        drop(transport);
++        drop(peer);
++        let _ = std::fs::remove_file(path);
++        assert_eq!(
++            received.len(),
++            expected.len(),
++            "polling peer must receive the complete large frame"
++        );
++        assert_eq!(received, expected);
++    }
++
+     #[test]
+     fn partial_writes_preserve_frame_bytes() {
+         struct PartialWriter(Vec<u8>);
+@@ -346,6 +392,67 @@ mod tests {
+         assert_eq!(writer.0, b"first framesecond frame");
+     }
+ 
++    struct ScriptedWriter<'a> {
++        now: &'a std::cell::Cell<Instant>,
++        steps: std::collections::VecDeque<Result<usize, io::ErrorKind>>,
++        bytes: Vec<u8>,
++    }
++
++    impl io::Write for ScriptedWriter<'_> {
++        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++            self.now.set(self.now.get() + Duration::from_secs(2));
++            let count = self.steps.pop_front().expect("scripted write attempt")?;
++            self.bytes.extend_from_slice(&bytes[..count]);
++            Ok(count)
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    #[test]
++    fn progressing_frame_can_outlast_the_write_timeout() {
++        let started = Instant::now();
++        let now = std::cell::Cell::new(started);
++        let mut writer = ScriptedWriter {
++            now: &now,
++            steps: [Ok(1), Err(io::ErrorKind::WouldBlock)]
++                .into_iter()
++                .cycle()
++                .take(11)
++                .collect(),
++            bytes: Vec::new(),
++        };
++        write_frame_with_clock(&mut writer, b"abcdef", &AtomicBool::new(false), || {
++            now.get()
++        })
++        .expect("ongoing progress must renew the inactivity deadline");
++        assert!(now.get().duration_since(started) > WRITE_TIMEOUT);
++        assert_eq!(writer.bytes, b"abcdef");
++    }
++
++    #[test]
++    fn frame_times_out_when_progress_stops() {
++        for blocked in [Ok(0), Err(io::ErrorKind::WouldBlock)] {
++            let now = std::cell::Cell::new(Instant::now());
++            let mut writer = ScriptedWriter {
++                now: &now,
++                steps: [Ok(1), blocked, blocked, blocked].into(),
++                bytes: Vec::new(),
++            };
++            let error =
++                write_frame_with_clock(&mut writer, b"ab", &AtomicBool::new(false), || now.get())
++                    .unwrap_err();
++            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
++            assert_eq!(writer.bytes, b"a");
++            assert!(
++                writer.steps.is_empty(),
++                "timeout starts at the last progress"
++            );
++        }
++    }
++
+     #[test]
+     fn a_stalled_write_is_cancellable_without_peer_progress() {
+         struct StalledWriter(mpsc::Sender<()>);
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 6e377c53..c5c9c1be 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -12,6 +12,10 @@
+ //! - Forwards OSC 52 clipboard writes from server to its own stdout
+ //! - Displays sound/toast notifications forwarded from server
+ 
++mod echo_timing;
++mod predict;
++mod prediction;
++mod screen_model;
+ mod attach;
+ mod catalog_reload;
+ mod clipboard_forwarding;
+@@ -374,6 +378,10 @@ async fn run_client_loop(
+     let local_unavailable = initial.is_none();
+ 
+     let mut state = ClientState {
++        prediction: prediction::Prediction::new(
++            &crate::config::Config::load().config.remote.predictive_echo,
++            is_remote_client,
++        ),
+         blit_encoder: render_ansi::BlitEncoder::new(),
+         mouse_capture_active: config.mouse_capture_active,
+         endpoint_mouse_capture_requested: false,
+@@ -711,6 +719,12 @@ async fn run_client_loop(
+                 ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
+             }
+         };
++        if state
++            .prediction
++            .set_remote(is_remote_client || !write_stream.active_id().is_local())
++        {
++            state.request_repaint();
++        }
+         let now = std::time::Instant::now();
+         if let Some(shell) = state.shell.as_mut() {
+             shell.tick_popup_pending(now);
+@@ -1948,12 +1962,16 @@ async fn run_client_loop(
+                 if !write_stream.accepts(&endpoint_id, generation) {
+                     continue;
+                 }
++                if write_stream.active_id() == &endpoint_id {
++                    state.prediction.reset();
++                }
+                 write_stream.fail(
+                     &endpoint_id,
+                     io::Error::new(io::ErrorKind::UnexpectedEof, "connection was lost"),
+                 );
+             }
+             ClientLoopEvent::Timer => {
++                state.prediction.timer();
+                 client_timer.fired();
+                 #[cfg(unix)]
+                 if let Ok(mut matcher) = state.direct_graphics_response.lock() {
+diff --git a/src/client/predict.rs b/src/client/predict.rs
+new file mode 100644
+index 00000000..b4f8bb22
+--- /dev/null
++++ b/src/client/predict.rs
+@@ -0,0 +1,1341 @@
++//! Predictive local echo for remote attach (i0002 W3, mosh-style).
++//!
++//! On a high-RTT link every keystroke takes a full round trip before it
++//! echoes. When the typing context is safe (plain cells with a visible
++//! hardware cursor, or matching color-only cells with a reverse-video
++//! software cursor, plus room before the right margin) the client draws the typed
++//! character immediately — underlined, like mosh — and reconciles against
++//! the frames the server sends later:
++//!
++//! - the server echoes the same character into the predicted cell, or moves
++//!   its cursor past an unchanged cell such as a blank space → the prediction
++//!   is confirmed (cursor-only confirmations are explicitly repainted to drop
++//!   the local underline);
++//! - the server writes something else there → all outstanding predictions
++//!   are repainted from the [`ScreenModel`] (the server's truth) — this is
++//!   why the model exists: the server diffs against *its* idea of the
++//!   screen and would never repaint a wrongly-predicted cell it did not
++//!   touch;
++//! - a prediction stays unconfirmed too long → same repaint, so stalls
++//!   cannot leave stale artifacts.
++//!
++//! Modes (`remote.predictive_echo`, env `HERDR_PREDICTIVE_ECHO`):
++//! `off` — fully disabled, byte-for-byte today's behavior; `always` — draw
++//! from the first keystroke; `auto` (default) — predictions are tracked
++//! invisibly until two of them are confirmed with an echo delay above
++//! [`AUTO_MIN_LATENCY`], so fast links never see underlines and broken
++//! contexts never draw at all.
++//!
++//! Only printable width-1 characters (optionally shifted) and backspace
++//! over our own predictions are predicted. Any other key press flushes
++//! outstanding predictions back to server truth.
++
++use std::collections::VecDeque;
++use std::io::Write;
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++
++use super::screen_model::ScreenModel;
++#[cfg(test)]
++use crate::protocol::TerminalFrame;
++
++/// The plain pen (matches `render_ansi::build_sgr` for an unstyled cell).
++const PLAIN_SGR: &str = "\x1b[0;39;49m";
++/// Prediction pen: underline over default colors.
++const UNDERLINE_SGR: &str = "\x1b[0;4;39;49m";
++/// Maximum keystrokes predicted ahead of the last confirmation.
++const MAX_PENDING: usize = 8;
++/// Unconfirmed predictions older than this are flushed back to server truth.
++const PREDICTION_TIMEOUT: Duration = Duration::from_secs(5);
++/// `auto` starts drawing after this many confirmed predictions…
++const AUTO_MIN_CONFIRMED: u64 = 2;
++/// …whose echo delay exceeded this (fast links never show predictions).
++const AUTO_MIN_LATENCY: Duration = Duration::from_millis(60);
++
++const ENV_VAR: &str = "HERDR_PREDICTIVE_ECHO";
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum PredictiveEchoMode {
++    Off,
++    Auto,
++    Always,
++}
++
++impl PredictiveEchoMode {
++    pub(crate) fn from_config(config_value: &str) -> Self {
++        let value = std::env::var(ENV_VAR)
++            .ok()
++            .filter(|value| !value.trim().is_empty())
++            .unwrap_or_else(|| config_value.to_string());
++        match value.trim().to_ascii_lowercase().as_str() {
++            "off" | "false" | "0" => Self::Off,
++            "always" => Self::Always,
++            _ => Self::Auto,
++        }
++    }
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++enum PredictionCursor {
++    Hardware,
++    Software { base_sgr: Arc<str> },
++}
++
++#[derive(Debug)]
++struct Prediction {
++    x: u16,
++    y: u16,
++    ch: char,
++    cursor: PredictionCursor,
++    /// Whether the local underlined overlay is still visible. A matching
++    /// server cell write clears it even if FIFO retirement is blocked by an
++    /// earlier cursor-only prediction.
++    drawn: bool,
++    /// Cumulative server acknowledgement; unlike `touched`, this survives
++    /// across frames until older predictions retire.
++    observed: bool,
++    sent_at: Instant,
++}
++
++pub(crate) struct Predictor {
++    model: ScreenModel,
++    pending: VecDeque<Prediction>,
++    /// An input could not be predicted, so the model is stale until another
++    /// server frame arrives. Never start a second prediction chain from that
++    /// stale cursor.
++    blocked_until_frame: bool,
++    display_unlocked: bool,
++    slow_confirmed: u64,
++    touched_scratch: Vec<(u16, u16)>,
++}
++
++impl Predictor {
++    /// Returns `None` for [`PredictiveEchoMode::Off`], so the client loop
++    /// carries no prediction state at all when disabled.
++    pub(crate) fn new(mode: PredictiveEchoMode) -> Option<Self> {
++        if mode == PredictiveEchoMode::Off {
++            return None;
++        }
++        Some(Self {
++            model: ScreenModel::new(),
++            pending: VecDeque::new(),
++            blocked_until_frame: false,
++            display_unlocked: mode == PredictiveEchoMode::Always,
++            slow_confirmed: 0,
++            touched_scratch: Vec::new(),
++        })
++    }
++
++    /// Semantic pane input after local UI routing.
++    pub(crate) fn on_input_events(
++        &mut self,
++        events: &[crate::protocol::ClientPaneInputEvent],
++    ) -> Vec<u8> {
++        use crate::protocol::{
++            ClientKeyCode, ClientKeyKind, ClientPaneInputEvent as ClientInputEvent,
++        };
++
++        const SHIFT: u8 = 0b1;
++        let mut out = Vec::new();
++        for event in events {
++            match event {
++                ClientInputEvent::Key {
++                    code,
++                    modifiers,
++                    kind: ClientKeyKind::Press | ClientKeyKind::Repeat,
++                    ..
++                } => match code {
++                    ClientKeyCode::Char(ch) if modifiers & !SHIFT == 0 => {
++                        self.on_char(*ch, &mut out);
++                    }
++                    ClientKeyCode::Backspace if *modifiers == 0 => {
++                        self.on_backspace(&mut out);
++                    }
++                    _ => self.on_other_input(&mut out),
++                },
++                ClientInputEvent::TextCommit(_)
++                | ClientInputEvent::Paste(..)
++                | ClientInputEvent::Mouse { .. } => {
++                    self.on_other_input(&mut out);
++                }
++                // Key releases do not act on the remote application and must
++                // not interrupt a prediction chain. Focus notifications are
++                // likewise harmless to the modeled cursor.
++                _ => {}
++            }
++        }
++        out
++    }
++
++    /// A printable character was typed. Predicts and (when unlocked) draws
++    /// it underlined at the predicted insertion point.
++    fn on_char(&mut self, ch: char, out: &mut impl Write) {
++        use unicode_width::UnicodeWidthChar as _;
++
++        if self.blocked_until_frame {
++            return;
++        }
++        if self.pending.len() >= MAX_PENDING {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        if ch.is_control() || ch.width() != Some(1) {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        let Some(cursor) = self.prediction_cursor() else {
++            self.stop_predicting_until_frame(out);
++            return;
++        };
++        let (x, y) = self.insertion_point();
++        if y != self.model.cursor().1 || x + 1 >= self.model.width() {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++        let safe_target = match &cursor {
++            PredictionCursor::Hardware => self.cell_is_plain(x, y) && self.cell_is_plain(x + 1, y),
++            PredictionCursor::Software { base_sgr } => {
++                let first = self.pending.is_empty();
++                self.cell_has_base_style(x, y, base_sgr, first)
++                    && self.cell_has_base_style(x + 1, y, base_sgr, false)
++            }
++        };
++        if !safe_target {
++            self.stop_predicting_until_frame(out);
++            return;
++        }
++
++        let drawn = self.display_unlocked;
++        if drawn {
++            match &cursor {
++                PredictionCursor::Hardware => {
++                    let _ = write!(
++                        out,
++                        "\x1b[{};{}H{UNDERLINE_SGR}{ch}{PLAIN_SGR}",
++                        y + 1,
++                        x + 1
++                    );
++                }
++                PredictionCursor::Software { base_sgr } => {
++                    self.draw_software_prediction(out, x, y, ch, base_sgr);
++                }
++            }
++        }
++        self.pending.push_back(Prediction {
++            x,
++            y,
++            ch,
++            cursor,
++            drawn,
++            observed: false,
++            sent_at: Instant::now(),
++        });
++    }
++
++    /// Backspace is only predicted over our own outstanding predictions.
++    fn on_backspace(&mut self, out: &mut impl Write) {
++        let Some(prediction) = self.pending.pop_back() else {
++            self.blocked_until_frame = true;
++            return;
++        };
++        if prediction.drawn {
++            self.repaint_model_cell(out, prediction.x, prediction.y);
++            match prediction.cursor {
++                PredictionCursor::Hardware => {
++                    let _ = write!(
++                        out,
++                        "\x1b[{row};{col}H",
++                        row = prediction.y + 1,
++                        col = prediction.x + 1,
++                    );
++                }
++                PredictionCursor::Software { .. } => self.redraw_software_pending(out),
++            }
++        }
++    }
++
++    /// Any other key press invalidates the cursor used by this prediction
++    /// chain. Restore server truth and wait for a fresh frame before trying
++    /// to predict again.
++    fn on_other_input(&mut self, out: &mut impl Write) {
++        self.stop_predicting_until_frame(out);
++    }
++
++    pub(crate) fn on_resize(&mut self) -> Vec<u8> {
++        let mut out = Vec::new();
++        self.stop_predicting_until_frame(&mut out);
++        out
++    }
++
++    /// Applies a received frame to the model and returns bytes that must be
++    /// written after (or inserted at the end of) that frame.
++    #[cfg(test)]
++    pub(crate) fn on_frame(&mut self, frame: &TerminalFrame) -> Vec<u8> {
++        self.on_encoded_frame(&frame.bytes, frame.width, frame.height, frame.full)
++    }
++    pub(crate) fn on_encoded_frame(
++        &mut self,
++        bytes: &[u8],
++        width: u16,
++        height: u16,
++        full: bool,
++    ) -> Vec<u8> {
++        let mut out = Vec::new();
++        self.model.ensure_size(width, height);
++        if full {
++            self.model.begin_full_frame();
++        }
++        let mut touched = std::mem::take(&mut self.touched_scratch);
++        touched.clear();
++        self.model.apply(bytes, &mut touched);
++
++        if !self.model.prediction_safe() {
++            if full {
++                self.pending.clear();
++            } else {
++                self.stop_predicting_until_frame(&mut out);
++            }
++            self.blocked_until_frame = true;
++            self.touched_scratch = touched;
++            return out;
++        }
++        self.blocked_until_frame = false;
++
++        if full {
++            // The redraw repainted every cell; the screen is server truth.
++            self.pending.clear();
++            self.touched_scratch = touched;
++            return out;
++        }
++
++        // Record observations before any conservative abort so repaint
++        // cleanup cannot overwrite cells the raw frame already styled. Cursor
++        // progress acknowledges unchanged cells such as a blank space.
++        let (server_x, server_y) = self.model.cursor();
++        let cursor_valid = self.server_cursor_matches_chain();
++        let model = &self.model;
++        let mut observed_mismatch = false;
++        for prediction in &mut self.pending {
++            let cell_touched = touched.contains(&(prediction.x, prediction.y));
++            let cursor_passed = cursor_valid && server_y == prediction.y && server_x > prediction.x;
++            let software_caret_waiting =
++                matches!(prediction.cursor, PredictionCursor::Software { .. })
++                    && cursor_valid
++                    && server_x == prediction.x
++                    && server_y == prediction.y;
++            if cell_touched {
++                prediction.drawn = false;
++            }
++            if software_caret_waiting {
++                // Prime Agent repaints its reverse-video caret over the first
++                // unacknowledged prediction. It is cursor state, not a
++                // conflicting character write; redraw the local suffix below.
++                continue;
++            }
++            if !cell_touched && !cursor_passed {
++                continue;
++            }
++            let matches = model
++                .cell(prediction.x, prediction.y)
++                .is_some_and(|cell| cell.symbol.chars().eq(std::iter::once(prediction.ch)));
++            if matches {
++                prediction.observed = true;
++            } else {
++                observed_mismatch = true;
++            }
++        }
++
++        // A row jump or cursor representation change is not a safe
++        // continuation of this prediction chain. Software-cursor chains
++        // deliberately accept a hidden hardware cursor only while the model
++        // contains the matching reverse-video caret at that position.
++        if !self.pending.is_empty()
++            && (!cursor_valid || server_y != self.pending.front().expect("pending exists").y)
++        {
++            self.stop_predicting_until_frame(&mut out);
++            self.touched_scratch = touched;
++            return out;
++        }
++
++        let now = Instant::now();
++        let mut repainted_confirmation = false;
++        // Observations are cumulative. Cursor progress confirms visually
++        // unchanged characters such as a space typed over an already-blank
++        // cell, while later touched predictions no longer lose their evidence
++        // behind that space.
++        while self.pending.front().is_some_and(|front| front.observed) {
++            let front = self.pending.pop_front().expect("front exists");
++            if front.drawn {
++                // A cursor-only acknowledgement did not repaint the local
++                // underline. Explicitly restore the now-confirmed cell.
++                self.repaint_model_cell(&mut out, front.x, front.y);
++                repainted_confirmation = true;
++            }
++            if now.saturating_duration_since(front.sent_at) >= AUTO_MIN_LATENCY {
++                self.slow_confirmed += 1;
++                if self.slow_confirmed >= AUTO_MIN_CONFIRMED {
++                    self.display_unlocked = true;
++                }
++            }
++        }
++
++        let mispredicted = observed_mismatch || self.prediction_timed_out(now);
++
++        if mispredicted {
++            self.stop_predicting_until_frame(&mut out);
++        } else if self.display_unlocked
++            && matches!(
++                self.pending.front().map(|prediction| &prediction.cursor),
++                Some(PredictionCursor::Software { .. })
++            )
++        {
++            // A server frame can overwrite the application's software caret and
++            // the first pending overlay, so redraw the whole suffix.
++            self.redraw_software_pending(&mut out);
++        } else if self.pending.iter().any(|prediction| prediction.drawn) {
++            // Hardware-cursor predictions retain their cheaper cursor-only
++            // reanchor when matching server writes removed earlier overlays.
++            self.reanchor_pending(&mut out);
++        } else if repainted_confirmation {
++            let (x, y) = self.model.cursor();
++            let sgr = self
++                .model
++                .cell(x, y)
++                .map_or(PLAIN_SGR, |cell| cell.sgr.as_ref());
++            let _ = write!(out, "{sgr}\x1b[{};{}H", y + 1, x + 1);
++        }
++        self.touched_scratch = touched;
++        out
++    }
++
++    /// Timeouts must fire even when the server becomes idle; otherwise a
++    /// stale prediction remains until the next key happens to produce a frame.
++    pub(crate) fn on_timer(&mut self) -> Vec<u8> {
++        let mut out = Vec::new();
++        if self.prediction_timed_out(Instant::now()) {
++            self.stop_predicting_until_frame(&mut out);
++        }
++        out
++    }
++
++    fn prediction_timed_out(&self, now: Instant) -> bool {
++        self.pending
++            .front()
++            .is_some_and(|front| now.saturating_duration_since(front.sent_at) >= PREDICTION_TIMEOUT)
++    }
++
++    fn stop_predicting_until_frame(&mut self, out: &mut impl Write) {
++        self.flush_repaint(out);
++        self.blocked_until_frame = true;
++    }
++
++    fn insertion_point(&self) -> (u16, u16) {
++        match self.pending.back() {
++            Some(prediction) => ((prediction.x + 1).min(self.model.width()), prediction.y),
++            None => self.model.cursor(),
++        }
++    }
++
++    fn cell_is_plain(&self, x: u16, y: u16) -> bool {
++        self.model.cell(x, y).is_some_and(|cell| cell.plain)
++    }
++
++    fn cell_has_base_style(&self, x: u16, y: u16, base_sgr: &str, reversed: bool) -> bool {
++        self.model
++            .cell(x, y)
++            .and_then(|cell| cell.prediction_style.as_ref())
++            .is_some_and(|style| style.base_sgr.as_ref() == base_sgr && style.reversed == reversed)
++    }
++
++    fn prediction_cursor(&self) -> Option<PredictionCursor> {
++        if let Some(prediction) = self.pending.front() {
++            return Some(prediction.cursor.clone());
++        }
++        if self.model.cursor_visible() {
++            return Some(PredictionCursor::Hardware);
++        }
++        let (x, y) = self.model.cursor();
++        if x + 1 >= self.model.width() {
++            return None;
++        }
++        let caret = self.model.cell(x, y)?.prediction_style.as_ref()?;
++        let next = self.model.cell(x + 1, y)?.prediction_style.as_ref()?;
++        (caret.reversed && !next.reversed && caret.base_sgr == next.base_sgr).then(|| {
++            PredictionCursor::Software {
++                base_sgr: caret.base_sgr.clone(),
++            }
++        })
++    }
++
++    fn server_cursor_matches_chain(&self) -> bool {
++        let Some(prediction) = self.pending.front() else {
++            return true;
++        };
++        match &prediction.cursor {
++            PredictionCursor::Hardware => self.model.cursor_visible(),
++            PredictionCursor::Software { base_sgr } => {
++                if self.model.cursor_visible() {
++                    return false;
++                }
++                let (x, y) = self.model.cursor();
++                self.cell_has_base_style(x, y, base_sgr, true)
++            }
++        }
++    }
++
++    fn model_symbol(&self, x: u16, y: u16) -> String {
++        match self.model.cell(x, y) {
++            Some(cell) if !cell.symbol.is_empty() => cell.symbol.clone(),
++            _ => " ".to_string(),
++        }
++    }
++
++    fn repaint_model_cell(&self, out: &mut impl Write, x: u16, y: u16) {
++        let symbol = self.model_symbol(x, y);
++        let sgr = self
++            .model
++            .cell(x, y)
++            .map_or(PLAIN_SGR, |cell| cell.sgr.as_ref());
++        let _ = write!(out, "\x1b[{};{}H{sgr}{symbol}", y + 1, x + 1);
++    }
++
++    fn sgr_with_modifier(base_sgr: &str, modifier: &str) -> String {
++        base_sgr.replacen("\x1b[0;", &format!("\x1b[0;{modifier};"), 1)
++    }
++
++    fn draw_software_prediction(
++        &self,
++        out: &mut impl Write,
++        x: u16,
++        y: u16,
++        ch: char,
++        base_sgr: &str,
++    ) {
++        let underline_sgr = Self::sgr_with_modifier(base_sgr, "4");
++        let reverse_sgr = Self::sgr_with_modifier(base_sgr, "7");
++        let caret_symbol = self.model_symbol(x + 1, y);
++        let _ = write!(
++            out,
++            "\x1b[{};{}H{underline_sgr}{ch}{reverse_sgr}{caret_symbol}{base_sgr}\x1b[{};{}H",
++            y + 1,
++            x + 1,
++            y + 1,
++            x + 2,
++        );
++    }
++
++    fn redraw_software_pending(&mut self, out: &mut impl Write) {
++        let Some(PredictionCursor::Software { base_sgr }) = self
++            .pending
++            .front()
++            .map(|prediction| prediction.cursor.clone())
++        else {
++            return;
++        };
++        let underline_sgr = Self::sgr_with_modifier(&base_sgr, "4");
++        for prediction in &mut self.pending {
++            let _ = write!(
++                out,
++                "\x1b[{};{}H{underline_sgr}{}",
++                prediction.y + 1,
++                prediction.x + 1,
++                prediction.ch,
++            );
++            prediction.drawn = true;
++        }
++        let (x, y) = self.insertion_point();
++        let reverse_sgr = Self::sgr_with_modifier(&base_sgr, "7");
++        let symbol = self.model_symbol(x, y);
++        let _ = write!(
++            out,
++            "\x1b[{};{}H{reverse_sgr}{symbol}{base_sgr}\x1b[{};{}H",
++            y + 1,
++            x + 1,
++            y + 1,
++            x + 1,
++        );
++    }
++
++    /// Repaints every drawn prediction with the model's (server-truth)
++    /// content and parks the host cursor back at the server's position.
++    fn flush_repaint(&mut self, out: &mut impl Write) {
++        let software_caret = self.pending.front().and_then(|prediction| {
++            (self.display_unlocked
++                && matches!(prediction.cursor, PredictionCursor::Software { .. }))
++            .then(|| self.insertion_point())
++        });
++        let mut wrote = false;
++        while let Some(prediction) = self.pending.pop_front() {
++            if !prediction.drawn {
++                continue;
++            }
++            self.repaint_model_cell(out, prediction.x, prediction.y);
++            wrote = true;
++        }
++        if let Some((x, y)) = software_caret {
++            self.repaint_model_cell(out, x, y);
++            wrote = true;
++        }
++        if wrote {
++            let (x, y) = self.model.cursor();
++            let _ = write!(out, "\x1b[{};{}H", y + 1, x + 1);
++        }
++    }
++
++    fn reanchor_pending(&self, out: &mut impl Write) {
++        let (x, y) = self.insertion_point();
++        let _ = write!(
++            out,
++            "{PLAIN_SGR}\x1b[{};{}H",
++            y + 1,
++            x.min(self.model.width().saturating_sub(1)) + 1
++        );
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::render_ansi::BlitEncoder;
++    use crate::protocol::{CellData, CursorState, FrameData};
++
++    fn plain_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0,
++            bg: 0,
++            modifier: 0,
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn styled_cell(symbol: &str) -> CellData {
++        CellData {
++            modifier: 1,
++            ..plain_cell(symbol)
++        }
++    }
++
++    /// A tiny 8x2 "shell": `$ ` prompt with the cursor after it.
++    fn prompt_frame(extra: &[(u16, u16, CellData)], cursor: (u16, u16)) -> FrameData {
++        let mut cells = vec![plain_cell(" "); 16];
++        cells[0] = plain_cell("$");
++        for (x, y, cell) in extra {
++            cells[*y as usize * 8 + *x as usize] = cell.clone();
++        }
++        FrameData {
++            cells,
++            width: 8,
++            height: 2,
++            cursor: Some(CursorState {
++                x: cursor.0,
++                y: cursor.1,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    fn wide_prompt(text: &str, cursor_x: u16) -> FrameData {
++        let width = 12;
++        let mut cells = vec![plain_cell(" "); width as usize];
++        cells[0] = plain_cell("$");
++        for (offset, ch) in text.chars().enumerate() {
++            cells[2 + offset] = plain_cell(&ch.to_string());
++        }
++        FrameData {
++            cells,
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: cursor_x,
++                y: 0,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    const PRIME_BG: u32 = 0x01_00_00_04; // indexed blue
++    const REVERSED: u16 = 1 << 6;
++
++    /// Prime Agent's editor uses a hidden hardware cursor and paints a
++    /// reverse-video cell over a colored input surface.
++    fn prime_editor_frame(text: &str, cursor_x: u16) -> FrameData {
++        let width = 12;
++        let mut cells = vec![
++            CellData {
++                bg: PRIME_BG,
++                ..plain_cell(" ")
++            };
++            width as usize
++        ];
++        for (offset, ch) in text.chars().enumerate() {
++            cells[2 + offset] = CellData {
++                symbol: ch.to_string(),
++                bg: PRIME_BG,
++                ..plain_cell(" ")
++            };
++        }
++        cells[cursor_x as usize].modifier = REVERSED;
++        FrameData {
++            cells,
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: cursor_x,
++                y: 0,
++                visible: false,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    /// Drives frames through a real `BlitEncoder` into the predictor.
++    struct Harness {
++        encoder: BlitEncoder,
++        predictor: Predictor,
++        seq: u64,
++    }
++
++    impl Harness {
++        fn new(mode: PredictiveEchoMode) -> Self {
++            Self {
++                encoder: BlitEncoder::new(),
++                predictor: Predictor::new(mode).expect("mode not off"),
++                seq: 0,
++            }
++        }
++
++        fn feed(&mut self, frame: &FrameData) -> Vec<u8> {
++            let encoded = self.encoder.encode(frame, false);
++            self.seq += 1;
++            let terminal_frame = TerminalFrame {
++                seq: self.seq,
++                width: frame.width,
++                height: frame.height,
++                full: encoded.full,
++                bytes: encoded.bytes.clone(),
++            };
++            self.encoder.commit(frame.clone(), encoded);
++            self.predictor.on_frame(&terminal_frame)
++        }
++    }
++
++    #[test]
++    fn off_mode_creates_no_predictor() {
++        assert!(Predictor::new(PredictiveEchoMode::Off).is_none());
++    }
++
++    #[test]
++    fn mode_parsing_defaults_to_auto() {
++        assert_eq!(
++            PredictiveEchoMode::from_config("off"),
++            PredictiveEchoMode::Off
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("always"),
++            PredictiveEchoMode::Always
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("auto"),
++            PredictiveEchoMode::Auto
++        );
++        assert_eq!(
++            PredictiveEchoMode::from_config("garbage"),
++            PredictiveEchoMode::Auto
++        );
++    }
++
++    #[test]
++    fn always_mode_draws_underlined_prediction_at_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('l', &mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(out.contains("\x1b[1;3H"), "CUP to cursor: {out:?}");
++        assert!(out.contains(UNDERLINE_SGR), "underline pen: {out:?}");
++        assert!(out.contains('l'), "predicted char: {out:?}");
++        assert!(out.ends_with(PLAIN_SGR), "pen restored: {out:?}");
++        assert_eq!(harness.predictor.pending.len(), 1);
++    }
++
++    #[test]
++    fn prime_software_cursor_draws_with_colored_editor_style() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('a', &mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert_eq!(harness.predictor.pending.len(), 1);
++        assert!(
++            out.contains("\x1b[0;4;39;48;5;4ma"),
++            "colored underlined prediction: {out:?}"
++        );
++        assert!(
++            out.contains("\x1b[0;7;39;48;5;4m "),
++            "reverse-video software caret: {out:?}"
++        );
++        assert!(out.ends_with("\x1b[1;4H"), "caret anchor: {out:?}");
++    }
++
++    #[test]
++    fn prime_software_cursor_reconciles_abc_one_ack_at_a_time() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        for ch in "abc".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        for (text, cursor_x, expected_pending) in [("a", 3, 2), ("ab", 4, 1), ("abc", 5, 0)] {
++            let out =
++                String::from_utf8(harness.feed(&prime_editor_frame(text, cursor_x))).expect("utf8");
++            assert_eq!(harness.predictor.pending.len(), expected_pending, "{text}");
++            if expected_pending > 0 {
++                assert!(
++                    out.contains("\x1b[0;4;39;48;5;4m"),
++                    "pending suffix redrawn after {text}: {out:?}"
++                );
++                assert!(
++                    out.ends_with("\x1b[1;6H"),
++                    "local caret remains after c: {out:?}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn prime_software_cursor_confirms_coalesced_abc_space_def() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        let out = String::from_utf8(harness.feed(&prime_editor_frame("abc def", 9))).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            out.contains("\x1b[0;39;48;5;4m "),
++            "unchanged space underline removed with editor colors: {out:?}"
++        );
++        assert!(
++            out.ends_with("\x1b[1;10H"),
++            "server caret restored: {out:?}"
++        );
++    }
++
++    #[test]
++    fn prime_software_cursor_mismatch_restores_colored_server_truth() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prime_editor_frame("", 2));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        let out = String::from_utf8(harness.feed(&prime_editor_frame("X", 3))).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(
++            out.contains("\x1b[1;5H\x1b[0;39;48;5;4m "),
++            "stale local caret restored with editor colors: {out:?}"
++        );
++    }
++
++    #[test]
++    fn hidden_multi_cell_selection_is_not_mistaken_for_software_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        let mut selection = prime_editor_frame("xy", 2);
++        selection.cells[3].modifier = REVERSED;
++        harness.feed(&selection);
++        harness.predictor.on_char('z', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "two-cell selection");
++
++        let mut mixed_modifier = prime_editor_frame("", 2);
++        mixed_modifier.cells[2].modifier = REVERSED | 1; // reverse + bold
++        harness.feed(&mixed_modifier);
++        harness.predictor.on_char('z', &mut Vec::new());
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "reverse plus another modifier"
++        );
++    }
++
++    #[test]
++    fn prediction_confirms_when_server_echoes_same_char() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('l', &mut Vec::new());
++
++        // Server echo: `l` appears at (2,0), cursor advances.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("l"))], (3, 0)));
++        assert!(harness.predictor.pending.is_empty(), "confirmed");
++        assert!(out.is_empty(), "no repaint needed: {out:?}");
++    }
++
++    #[test]
++    fn misprediction_repaints_server_truth_and_flushes() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        // Server writes something else into the first predicted cell.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("X"))], (3, 0)));
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty(), "flushed");
++        // The second prediction's cell (3,0) is repainted from the model.
++        assert!(out.contains("\x1b[1;4H"), "repaint second cell: {out:?}");
++        assert!(out.contains(PLAIN_SGR), "plain pen: {out:?}");
++    }
++
++    #[test]
++    fn touched_misprediction_keeps_authoritative_server_style() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.feed(&prompt_frame(&[(2, 0, styled_cell("X"))], (3, 0)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            out.is_empty(),
++            "raw frame already repainted the mismatched cell with server style"
++        );
++    }
++
++    #[test]
++    fn typeahead_predictions_are_redrawn_and_cursor_reanchored() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++        harness.predictor.on_char('b', &mut Vec::new());
++
++        // Server confirms only the first char; the second is still pending.
++        let out = harness.feed(&prompt_frame(&[(2, 0, plain_cell("a"))], (3, 0)));
++        let out = String::from_utf8(out).expect("utf8");
++        assert_eq!(harness.predictor.pending.len(), 1);
++        assert!(
++            !out.contains(UNDERLINE_SGR),
++            "untouched prediction needs no redraw: {out:?}"
++        );
++        assert!(
++            out.ends_with("\x1b[1;5H"),
++            "cursor re-anchored past prediction: {out:?}"
++        );
++    }
++
++    #[test]
++    fn cursor_only_update_confirms_space_over_blank_cell() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char(' ', &mut Vec::new());
++        assert_eq!(harness.predictor.pending.len(), 1);
++
++        // A space at end-of-line does not change any cell. Pi reports it only
++        // by moving the hardware cursor in a second write/frame.
++        let out = harness.feed(&prompt_frame(&[], (3, 0)));
++        assert!(harness.predictor.pending.is_empty(), "space confirmed");
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(out.contains(PLAIN_SGR), "underline removed: {out:?}");
++        assert!(
++            out.ends_with("\x1b[1;4H"),
++            "server cursor restored: {out:?}"
++        );
++    }
++
++    #[test]
++    fn coalesced_abc_space_def_confirms_without_stale_cursor() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&wide_prompt("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        // The final diff writes every non-space character, while the space at
++        // column 5 remains visually blank and is acknowledged only by cursor
++        // progress.
++        let out = harness.feed(&wide_prompt("abc def", 9));
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(
++            !out.contains(UNDERLINE_SGR),
++            "no prediction redraw: {out:?}"
++        );
++        assert!(out.contains(PLAIN_SGR), "space underline removed: {out:?}");
++        assert!(out.ends_with("\x1b[1;10H"), "cursor after f: {out:?}");
++    }
++
++    #[test]
++    fn cursor_only_catchup_repairs_pi_split_render() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&wide_prompt("", 2));
++        for ch in "abc def".chars() {
++            harness.predictor.on_char(ch, &mut Vec::new());
++        }
++
++        // Pi writes changed content first and positions its hardware cursor in
++        // a second terminal write. The first frame can therefore contain all
++        // text while its cursor is still parked after c.
++        let content_out = harness.feed(&wide_prompt("abc def", 5));
++        assert_eq!(harness.predictor.pending.len(), 4, "space blocks suffix");
++        assert!(
++            String::from_utf8(content_out)
++                .expect("utf8")
++                .ends_with("\x1b[1;10H"),
++            "predicted cursor remains after f"
++        );
++
++        // The cursor-only frame must drain the untouched space and every
++        // later prediction, removing local underlines without another input.
++        let cursor_out = harness.feed(&wide_prompt("abc def", 9));
++        let cursor_out = String::from_utf8(cursor_out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(!cursor_out.contains(UNDERLINE_SGR));
++        assert!(cursor_out.ends_with("\x1b[1;10H"));
++    }
++
++    #[test]
++    fn cursor_progress_unblocks_predictions_behind_unchanged_space() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char(' ', &mut Vec::new());
++        harness.predictor.on_char('d', &mut Vec::new());
++        harness.predictor.on_char('e', &mut Vec::new());
++
++        // The space is untouched, while d/e are normal cell diffs. Cursor
++        // progress confirms the space so it cannot block the later writes.
++        harness.feed(&prompt_frame(
++            &[(3, 0, plain_cell("d")), (4, 0, plain_cell("e"))],
++            (5, 0),
++        ));
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "whole chain confirmed"
++        );
++    }
++
++    #[test]
++    fn failed_gate_flushes_chain_and_blocks_until_fresh_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[(4, 0, styled_cell("~"))], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        // `b` would push into the styled cell, so it cannot be represented by
++        // this prediction chain.
++        harness.predictor.on_char('b', &mut out);
++        assert!(harness.predictor.pending.is_empty(), "chain flushed");
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "drawn a restored to server truth");
++
++        let mut blocked_out = Vec::new();
++        harness.predictor.on_char('c', &mut blocked_out);
++        assert!(blocked_out.is_empty(), "no stale second chain");
++        assert!(harness.predictor.pending.is_empty());
++    }
++
++    #[test]
++    fn hidden_cursor_frame_flushes_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++
++        let mut hidden = prompt_frame(&[], (2, 0));
++        hidden.cursor.as_mut().expect("cursor").visible = false;
++        let out = harness.feed(&hidden);
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "prediction repainted before cursor hides");
++    }
++
++    #[test]
++    fn cross_row_cursor_frame_flushes_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++
++        let out = harness.feed(&prompt_frame(&[], (2, 1)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty());
++    }
++
++    #[test]
++    fn idle_timer_flushes_expired_prediction_without_another_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        harness
++            .predictor
++            .pending
++            .front_mut()
++            .expect("pending")
++            .sent_at = Instant::now()
++            .checked_sub(PREDICTION_TIMEOUT)
++            .expect("past");
++
++        let out = harness.predictor.on_timer();
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty(), "expired prediction repainted");
++    }
++
++    fn confirm_auto_prediction(harness: &mut Harness, confirmed_text: &str, slow: bool) {
++        let ch = confirmed_text.chars().next_back().expect("non-empty text");
++        harness.predictor.on_char(ch, &mut Vec::new());
++        let pending = harness
++            .predictor
++            .pending
++            .front_mut()
++            .expect("pending prediction");
++        pending.sent_at = if slow {
++            Instant::now()
++                .checked_sub(AUTO_MIN_LATENCY + Duration::from_millis(1))
++                .expect("past")
++        } else {
++            Instant::now()
++                .checked_add(AUTO_MIN_LATENCY)
++                .expect("future")
++        };
++        let cells = confirmed_text
++            .chars()
++            .enumerate()
++            .map(|(offset, ch)| (2 + offset as u16, 0, plain_cell(&ch.to_string())))
++            .collect::<Vec<_>>();
++        harness.feed(&prompt_frame(
++            &cells,
++            (2 + confirmed_text.chars().count() as u16, 0),
++        ));
++    }
++
++    #[test]
++    fn auto_mode_dark_launches_then_unlocks_after_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        assert!(!harness.predictor.display_unlocked);
++        confirm_auto_prediction(&mut harness, "ab", true);
++        assert!(harness.predictor.display_unlocked);
++
++        let mut out = Vec::new();
++        harness.predictor.on_char('c', &mut out);
++        assert!(!out.is_empty(), "draws once unlocked");
++    }
++
++    #[test]
++    fn auto_mode_does_not_count_fast_fast_slow_as_two_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", false);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(!harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 1);
++    }
++
++    #[test]
++    fn auto_mode_counts_nonconsecutive_slow_confirmations() {
++        let mut harness = Harness::new(PredictiveEchoMode::Auto);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++
++        confirm_auto_prediction(&mut harness, "a", true);
++        confirm_auto_prediction(&mut harness, "ab", false);
++        confirm_auto_prediction(&mut harness, "abc", true);
++
++        assert!(harness.predictor.display_unlocked);
++        assert_eq!(harness.predictor.slow_confirmed, 2);
++    }
++
++    #[test]
++    fn styled_cells_and_hidden_cursor_are_not_predicted() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[(2, 0, styled_cell("~"))], (2, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "styled target");
++
++        let mut hidden = prompt_frame(&[], (2, 0));
++        hidden.cursor.as_mut().expect("cursor").visible = false;
++        harness.feed(&hidden);
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty(), "hidden cursor");
++    }
++
++    #[test]
++    fn right_margin_is_not_predicted() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (7, 0)));
++        harness.predictor.on_char('x', &mut Vec::new());
++        assert!(harness.predictor.pending.is_empty());
++    }
++
++    #[test]
++    fn backspace_undoes_last_prediction_only() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        harness.predictor.on_backspace(&mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.contains("\x1b[1;3H"), "restores the cell: {out:?}");
++
++        // Without pending predictions, backspace is left to the server.
++        let mut out = Vec::new();
++        harness.predictor.on_backspace(&mut out);
++        assert!(out.is_empty());
++    }
++
++    #[cfg(windows)]
++    fn key_event(
++        ch: char,
++        kind: crate::protocol::ClientKeyKind,
++    ) -> crate::protocol::ClientPaneInputEvent {
++        crate::protocol::ClientPaneInputEvent::Key {
++            code: crate::protocol::ClientKeyCode::Char(ch),
++            modifiers: 0,
++            kind,
++            repeat_count: 1,
++            generated_text: Some(ch.to_string()),
++            shifted_codepoint: None,
++            tracks_release: false,
++            physical_key_id: None,
++            windows_record: None,
++        }
++    }
++
++    #[cfg(windows)]
++    fn mouse_event(
++        kind: crate::protocol::ClientMouseKind,
++    ) -> crate::protocol::ClientPaneInputEvent {
++        crate::protocol::ClientPaneInputEvent::Mouse {
++            kind,
++            position: crate::protocol::ClientMousePosition::Cell { column: 4, row: 1 },
++            geometry: None,
++            lines: 1,
++            modifiers: 0,
++        }
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_click_flushes_and_blocks_later_key_in_same_batch() {
++        use crate::protocol::{ClientKeyKind, ClientMouseButton, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.predictor.on_input_events(&[
++            mouse_event(ClientMouseKind::Down(ClientMouseButton::Left)),
++            key_event('b', ClientKeyKind::Press),
++        ]);
++        assert!(!out.is_empty(), "drawn prediction must be repainted");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++
++        harness.feed(&prompt_frame(&[], (4, 0)));
++        harness
++            .predictor
++            .on_input_events(&[key_event('c', ClientKeyKind::Press)]);
++        assert_eq!(harness.predictor.pending.len(), 1, "fresh frame recovers");
++    }
++
++    #[cfg(windows)]
++    #[test]
++    fn mouse_scroll_blocks_prediction_but_key_release_does_not() {
++        use crate::protocol::{ClientKeyKind, ClientMouseKind};
++
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_input_events(&[
++            key_event('x', ClientKeyKind::Release),
++            key_event('a', ClientKeyKind::Press),
++        ]);
++        assert_eq!(harness.predictor.pending.len(), 1, "release is harmless");
++
++        let out = harness
++            .predictor
++            .on_input_events(&[mouse_event(ClientMouseKind::ScrollDown)]);
++        assert!(!out.is_empty(), "scroll repaints drawn prediction");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++    }
++
++    #[test]
++    fn other_keys_flush_drawn_predictions() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let mut out = Vec::new();
++        harness.predictor.on_other_input(&mut out);
++        let out = String::from_utf8(out).expect("utf8");
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.contains("\x1b[1;3H"), "repaint predicted cell: {out:?}");
++        assert!(out.ends_with("\x1b[1;3H"), "cursor at server pos: {out:?}");
++    }
++
++    #[test]
++    fn full_frame_clears_pending_without_correction() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        harness.encoder = BlitEncoder::new();
++        let out = harness.feed(&prompt_frame(&[], (2, 0)));
++        assert!(harness.predictor.pending.is_empty());
++        assert!(out.is_empty(), "full frame itself restores truth");
++    }
++
++    #[test]
++    fn resize_repaints_pending_while_waiting_for_full_frame() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        harness.feed(&prompt_frame(&[], (2, 0)));
++        harness.predictor.on_char('a', &mut Vec::new());
++
++        let out = harness.predictor.on_resize();
++        assert!(harness.predictor.pending.is_empty());
++        assert!(harness.predictor.blocked_until_frame);
++        assert!(!out.is_empty());
++    }
++
++    #[test]
++    fn pending_cap_stops_predicting() {
++        let mut harness = Harness::new(PredictiveEchoMode::Always);
++        let width = MAX_PENDING as u16 + 2;
++        let wide = FrameData {
++            cells: vec![plain_cell(" "); width as usize],
++            width,
++            height: 1,
++            cursor: Some(CursorState {
++                x: 0,
++                y: 0,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        };
++        harness.feed(&wide);
++        for _ in 0..MAX_PENDING + 3 {
++            harness.predictor.on_char('x', &mut Vec::new());
++        }
++        assert!(
++            harness.predictor.pending.is_empty(),
++            "cap flushes unsafe chain"
++        );
++        assert!(harness.predictor.blocked_until_frame);
++    }
++}
+diff --git a/src/client/prediction.rs b/src/client/prediction.rs
+new file mode 100644
+index 00000000..535a13b2
+--- /dev/null
++++ b/src/client/prediction.rs
+@@ -0,0 +1,264 @@
++//! Local prediction integration. Never changes the stable endpoint codec.
++use super::{
++    echo_timing::EchoTiming,
++    endpoint::ClientEndpointId,
++    predict::{PredictiveEchoMode, Predictor},
++};
++use crate::protocol::ClientMessage;
++use std::io::{self, Write as _};
++const SYNC_OUTPUT_END: &[u8] = b"\x1b[?2026l";
++pub(super) struct Prediction {
++    mode: PredictiveEchoMode,
++    remote: bool,
++    predictor: Option<Predictor>,
++    owner: Option<(ClientEndpointId, String)>,
++    timing: EchoTiming,
++}
++impl Prediction {
++    pub(super) fn new(mode: &str, remote: bool) -> Self {
++        let mode = PredictiveEchoMode::from_config(mode);
++        Self {
++            mode,
++            remote,
++            predictor: if remote { Predictor::new(mode) } else { None },
++            owner: None,
++            timing: EchoTiming::from_env(),
++        }
++    }
++    pub(super) fn set_remote(&mut self, remote: bool) -> bool {
++        if self.remote == remote {
++            return false;
++        }
++        self.reset();
++        self.remote = remote;
++        self.predictor = if remote {
++            Predictor::new(self.mode)
++        } else {
++            None
++        };
++        true
++    }
++    pub(super) fn reset(&mut self) {
++        if let Some(p) = &mut self.predictor {
++            write_prediction_output(&p.on_resize());
++        }
++        self.owner = None;
++    }
++    pub(super) fn input(
++        &mut self,
++        message: &ClientMessage,
++        endpoint: &ClientEndpointId,
++        remote_process: bool,
++    ) {
++        if !remote_process && endpoint.is_local() {
++            self.reset();
++            return;
++        }
++        let (pane, events) = match message {
++            ClientMessage::ClientShellPaneInput { pane_id, events } => (pane_id, events),
++            _ => {
++                self.reset();
++                return;
++            }
++        };
++        let owner = (endpoint.clone(), pane.clone());
++        if self
++            .owner
++            .as_ref()
++            .is_some_and(|previous| previous != &owner)
++        {
++            self.reset();
++        }
++        self.owner = Some(owner);
++        if let Some(p) = &mut self.predictor {
++            write_prediction_output(&p.on_input_events(events));
++        }
++        if events.iter().any(|e| {
++            matches!(
++                e,
++                crate::protocol::ClientPaneInputEvent::Key {
++                    kind: crate::protocol::ClientKeyKind::Press
++                        | crate::protocol::ClientKeyKind::Repeat,
++                    ..
++                } | crate::protocol::ClientPaneInputEvent::TextCommit(_)
++                    | crate::protocol::ClientPaneInputEvent::Paste(_)
++            )
++        }) {
++            self.timing.on_key_input_sent();
++        }
++    }
++    pub(super) fn timer(&mut self) {
++        if let Some(p) = &mut self.predictor {
++            write_prediction_output(&p.on_timer());
++        }
++    }
++    pub(super) fn write_frame(
++        &mut self,
++        writer: &mut impl io::Write,
++        bytes: &[u8],
++        size: (u16, u16),
++        full: bool,
++        graphics: &[u8],
++    ) -> io::Result<()> {
++        let correction = self
++            .predictor
++            .as_mut()
++            .map(|p| p.on_encoded_frame(bytes, size.0, size.1, full))
++            .unwrap_or_default();
++        self.timing.on_render_received();
++        if correction.is_empty() {
++            return super::frame_output::write_encoded_frame_with_graphics(writer, bytes, graphics);
++        }
++        let mut combined = Vec::with_capacity(bytes.len() + correction.len());
++        write_terminal_frame_with_predictions(&mut combined, bytes, &correction)?;
++        super::frame_output::write_encoded_frame_with_graphics(writer, &combined, graphics)
++    }
++}
++fn write_prediction_output(bytes: &[u8]) {
++    if bytes.is_empty() {
++        return;
++    }
++    let mut stdout = io::stdout().lock();
++    let _ = stdout.write_all(bytes);
++    let _ = stdout.flush();
++}
++
++/// Keep frame reconciliation atomic with the server frame. Inserting the
++/// predictor's repaint/cursor anchor before the synchronized-output terminator
++/// prevents the host terminal from briefly exposing the stale server cursor.
++/// Linux encoders append a duplicate IME cursor anchor after that terminator;
++/// discard that tail when a predictor anchor supersedes it.
++fn write_terminal_frame_with_predictions(
++    mut writer: impl io::Write,
++    frame: &[u8],
++    prediction_output: &[u8],
++) -> io::Result<()> {
++    if prediction_output.is_empty() {
++        writer.write_all(frame)?;
++    } else if let Some(sync_end) = frame
++        .windows(SYNC_OUTPUT_END.len())
++        .rposition(|window| window == SYNC_OUTPUT_END)
++    {
++        let tail = &frame[sync_end + SYNC_OUTPUT_END.len()..];
++        if tail.is_empty() || is_post_sync_ime_cursor_anchor(tail) {
++            writer.write_all(&frame[..sync_end])?;
++            writer.write_all(prediction_output)?;
++            writer.write_all(SYNC_OUTPUT_END)?;
++        } else {
++            // Never discard an unrecognized server suffix. The correction is
++            // less atomic in this defensive fallback, but remains final.
++            writer.write_all(frame)?;
++            writer.write_all(prediction_output)?;
++        }
++    } else {
++        writer.write_all(frame)?;
++        writer.write_all(prediction_output)?;
++    }
++    writer.flush()
++}
++
++/// The non-Windows encoder's optional IME suffix is exactly
++/// `CUP(row,col) + DECTCEM(show|hide)`. Recognize only that grammar before
++/// replacing it; arbitrary bytes after synchronized output must be preserved.
++fn is_post_sync_ime_cursor_anchor(bytes: &[u8]) -> bool {
++    let Some(rest) = bytes.strip_prefix(b"\x1b[") else {
++        return false;
++    };
++    let Some(cup_end) = rest.iter().position(|byte| *byte == b'H') else {
++        return false;
++    };
++    let coordinates = &rest[..cup_end];
++    let Some(separator) = coordinates.iter().position(|byte| *byte == b';') else {
++        return false;
++    };
++    let (row, column_with_separator) = coordinates.split_at(separator);
++    let column = &column_with_separator[1..];
++    let valid_number = |number: &[u8]| !number.is_empty() && number.iter().all(u8::is_ascii_digit);
++    valid_number(row)
++        && valid_number(column)
++        && matches!(&rest[cup_end + 1..], b"\x1b[?25h" | b"\x1b[?25l")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn prediction_output_stays_inside_frame_sync_block() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(
++            &mut output,
++            b"\x1b[?2026hframe\x1b[?2026l\x1b[3;5H\x1b[?25h",
++            b"prediction-cursor",
++        )
++        .unwrap();
++
++        assert_eq!(output, b"\x1b[?2026hframeprediction-cursor\x1b[?2026l");
++    }
++
++    #[test]
++    fn prediction_output_preserves_unrecognized_post_sync_suffix() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(
++            &mut output,
++            b"\x1b[?2026hframe\x1b[?2026lserver-suffix",
++            b"prediction-cursor",
++        )
++        .unwrap();
++
++        assert_eq!(
++            output,
++            b"\x1b[?2026hframe\x1b[?2026lserver-suffixprediction-cursor"
++        );
++    }
++
++    #[test]
++    fn post_sync_ime_cursor_anchor_recognizer_is_exact() {
++        assert!(is_post_sync_ime_cursor_anchor(b"\x1b[3;5H\x1b[?25h"));
++        assert!(is_post_sync_ime_cursor_anchor(b"\x1b[12;1H\x1b[?25l"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"\x1b[3;5H"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"\x1b[3;5H\x1b[?25hmore"));
++        assert!(!is_post_sync_ime_cursor_anchor(b"server-suffix"));
++    }
++
++    #[test]
++    fn prediction_output_falls_back_after_unsynchronized_frame() {
++        let mut output = Vec::new();
++        write_terminal_frame_with_predictions(&mut output, b"frame", b"prediction").unwrap();
++        assert_eq!(output, b"frameprediction");
++    }
++
++    #[test]
++    fn local_frames_do_not_build_a_prediction_model() {
++        let mut prediction = Prediction::new("always", false);
++        let mut output = Vec::new();
++        prediction
++            .write_frame(&mut output, b"frame", (80, 24), true, &[])
++            .unwrap();
++        assert_eq!(output, b"frame");
++        assert!(prediction.predictor.is_none());
++        assert!(prediction.set_remote(true));
++        assert!(prediction.predictor.is_some());
++        assert!(prediction.set_remote(false));
++        assert!(prediction.predictor.is_none());
++    }
++    #[test]
++    fn same_pane_id_on_different_endpoints_changes_owner() {
++        let mut prediction = Prediction::new("off", true);
++        let first = ClientEndpointId::Ssh(
++            super::super::endpoint::ProfileId::parse("00000000000000000000000000000001").unwrap(),
++        );
++        let second = ClientEndpointId::Ssh(
++            super::super::endpoint::ProfileId::parse("00000000000000000000000000000002").unwrap(),
++        );
++        let message = ClientMessage::ClientShellPaneInput {
++            pane_id: "w1:p1".into(),
++            events: Vec::new(),
++        };
++        prediction.input(&message, &first, false);
++        assert_eq!(prediction.owner.as_ref().unwrap().0, first);
++        prediction.input(&message, &second, false);
++        assert_eq!(prediction.owner.as_ref().unwrap().0, second);
++        prediction.reset();
++        assert!(prediction.owner.is_none());
++    }
++}
+diff --git a/src/client/screen_model.rs b/src/client/screen_model.rs
+new file mode 100644
+index 00000000..ebdc2820
+--- /dev/null
++++ b/src/client/screen_model.rs
+@@ -0,0 +1,860 @@
++//! Client-side mirror of the terminal-ansi frame stream (i0002 W3).
++//!
++//! Terminal-ansi clients normally blit server frame bytes to stdout without
++//! understanding them. Predictive local echo needs to know what is on screen
++//! (cursor position, cell contents and styling), so this model replays every
++//! received `TerminalFrame` into a cell grid.
++//!
++//! The frame stream is produced exclusively by `protocol::render_ansi::
++//! BlitEncoder`, whose output vocabulary is small and contains **no scrolling
++//! and no relative cursor motion**. Cell runs begin at an absolute `CUP`;
++//! a width-1 cell may let the following cell continue inline. Printable runs
++//! are split at Unicode extended grapheme boundaries before updating cells.
++//! The parser below handles that vocabulary — CUP, SGR, `2J` clear, `?25 h/l` cursor
++//! visibility, `?2026 h/l` sync markers, DECSCUSR, OSC (hyperlinks,
++//! clipboard) and APC (Kitty graphics) passthrough — and ignores everything
++//! else. Round-trip tests validate the model against `BlitEncoder` output of
++//! reference frames.
++
++use std::sync::Arc;
++
++/// The SGR sequence `build_sgr` emits for a completely unstyled cell.
++const PLAIN_SGR: &str = "\x1b[0;39;49m";
++
++/// A cell style safe for predictive echo. Colors are preserved, while the
++/// only accepted modifier is reverse video (used by software cursors).
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct PredictionStyle {
++    pub(crate) base_sgr: Arc<str>,
++    pub(crate) reversed: bool,
++}
++
++#[derive(Clone, Debug)]
++struct PenStyle {
++    sgr: Arc<str>,
++    prediction: Option<PredictionStyle>,
++}
++
++impl PenStyle {
++    fn plain() -> Self {
++        Self {
++            sgr: Arc::from(PLAIN_SGR),
++            prediction: Some(PredictionStyle {
++                base_sgr: Arc::from(PLAIN_SGR),
++                reversed: false,
++            }),
++        }
++    }
++
++    fn unknown() -> Self {
++        Self {
++            sgr: Arc::from(PLAIN_SGR),
++            prediction: None,
++        }
++    }
++}
++
++/// Parses the complete canonical SGR emitted by `render_ansi::build_sgr`.
++/// Retaining only colors and an optional reverse modifier keeps software
++/// cursor detection strict while supporting indexed and RGB themes.
++fn parse_pen_style(params: &str) -> PenStyle {
++    if matches!(params, "" | "0") {
++        return PenStyle::plain();
++    }
++
++    let sgr: Arc<str> = format!("\x1b[{params}m").into();
++    let parts = params.split(';').collect::<Vec<_>>();
++    if parts.first() != Some(&"0") {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let Some(fg_start) = parts
++        .iter()
++        .enumerate()
++        .skip(1)
++        .find_map(|(index, part)| is_fg_start(part).then_some(index))
++    else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++
++    let modifiers = &parts[1..fg_start];
++    let reversed = modifiers == ["7"];
++    if !modifiers.is_empty() && !reversed {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let Some(fg_end) = color_end(&parts, fg_start, true) else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++    let Some(bg_end) = color_end(&parts, fg_end, false) else {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    };
++    if bg_end != parts.len() {
++        return PenStyle {
++            sgr,
++            prediction: None,
++        };
++    }
++
++    let base_sgr: Arc<str> = format!(
++        "\x1b[0;{};{}m",
++        parts[fg_start..fg_end].join(";"),
++        parts[fg_end..bg_end].join(";")
++    )
++    .into();
++    PenStyle {
++        sgr,
++        prediction: Some(PredictionStyle { base_sgr, reversed }),
++    }
++}
++
++fn is_fg_start(part: &str) -> bool {
++    part.parse::<u16>()
++        .is_ok_and(|value| (30..=39).contains(&value) || (90..=97).contains(&value))
++}
++
++fn is_bg_start(part: &str) -> bool {
++    part.parse::<u16>()
++        .is_ok_and(|value| (40..=49).contains(&value) || (100..=107).contains(&value))
++}
++
++fn color_end(parts: &[&str], start: usize, foreground: bool) -> Option<usize> {
++    let part = *parts.get(start)?;
++    let extended = if foreground { "38" } else { "48" };
++    if part == extended {
++        return match parts.get(start + 1).copied() {
++            Some("5") if parts.get(start + 2)?.parse::<u8>().is_ok() => Some(start + 3),
++            Some("2")
++                if parts.get(start + 2)?.parse::<u8>().is_ok()
++                    && parts.get(start + 3)?.parse::<u8>().is_ok()
++                    && parts.get(start + 4)?.parse::<u8>().is_ok() =>
++            {
++                Some(start + 5)
++            }
++            _ => None,
++        };
++    }
++    let simple = if foreground {
++        is_fg_start(part)
++    } else {
++        is_bg_start(part)
++    };
++    simple.then_some(start + 1)
++}
++
++/// One mirrored cell.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct ModelCell {
++    /// Grapheme cluster displayed in the cell. Blank cells hold `" "`.
++    pub(crate) symbol: String,
++    /// Whether the cell was written with the plain pen (default colors, no
++    /// modifiers, no hyperlink).
++    pub(crate) plain: bool,
++    /// Exact canonical SGR emitted before this cell.
++    pub(crate) sgr: Arc<str>,
++    /// Safe colors and reverse-video state, if no other modifier or hyperlink
++    /// makes local prediction ambiguous.
++    pub(crate) prediction_style: Option<PredictionStyle>,
++}
++
++impl ModelCell {
++    fn blank() -> Self {
++        Self {
++            symbol: " ".to_string(),
++            plain: true,
++            sgr: Arc::from(PLAIN_SGR),
++            prediction_style: PenStyle::plain().prediction,
++        }
++    }
++
++    /// Wide-character continuation cells: covered by the cell to their left.
++    fn continuation() -> Self {
++        Self {
++            symbol: String::new(),
++            plain: false,
++            sgr: Arc::from(PLAIN_SGR),
++            prediction_style: None,
++        }
++    }
++}
++
++pub(crate) struct ScreenModel {
++    width: u16,
++    height: u16,
++    cells: Vec<ModelCell>,
++    /// 0-based (col, row) of the host cursor after the last applied frame.
++    cursor: (u16, u16),
++    cursor_visible: bool,
++    /// Current canonical SGR and its prediction-safe interpretation.
++    pen: PenStyle,
++    /// Whether an OSC 8 hyperlink is currently open.
++    hyperlink_open: bool,
++    /// False after standalone zero-width output, whose host-terminal cell
++    /// effect cannot be represented safely for prediction reconciliation.
++    prediction_safe: bool,
++}
++
++impl ScreenModel {
++    pub(crate) fn new() -> Self {
++        Self {
++            width: 0,
++            height: 0,
++            cells: Vec::new(),
++            cursor: (0, 0),
++            cursor_visible: false,
++            pen: PenStyle::unknown(),
++            hyperlink_open: false,
++            prediction_safe: true,
++        }
++    }
++
++    pub(crate) fn ensure_size(&mut self, width: u16, height: u16) {
++        if self.width == width && self.height == height {
++            return;
++        }
++        self.width = width;
++        self.height = height;
++        self.cells = vec![ModelCell::blank(); width as usize * height as usize];
++        self.cursor = (0, 0);
++        self.cursor_visible = false;
++        self.prediction_safe = true;
++    }
++
++    /// A full frame replaces prior screen truth, so it can recover from an
++    /// earlier unmodelable zero-width write unless this frame contains one too.
++    pub(crate) fn begin_full_frame(&mut self) {
++        self.prediction_safe = true;
++    }
++
++    pub(crate) fn prediction_safe(&self) -> bool {
++        self.prediction_safe
++    }
++
++    pub(crate) fn cursor(&self) -> (u16, u16) {
++        self.cursor
++    }
++
++    pub(crate) fn cursor_visible(&self) -> bool {
++        self.cursor_visible
++    }
++
++    pub(crate) fn width(&self) -> u16 {
++        self.width
++    }
++
++    pub(crate) fn cell(&self, x: u16, y: u16) -> Option<&ModelCell> {
++        if x >= self.width || y >= self.height {
++            return None;
++        }
++        self.cells
++            .get(y as usize * self.width as usize + x as usize)
++    }
++
++    /// Replays one frame's bytes into the grid. `touched` receives the
++    /// (col, row) of every cell the frame wrote, for prediction reconcile.
++    pub(crate) fn apply(&mut self, bytes: &[u8], touched: &mut Vec<(u16, u16)>) {
++        let mut index = 0;
++        while index < bytes.len() {
++            if bytes[index] == 0x1b {
++                index = self.apply_escape(bytes, index, touched);
++            } else if bytes[index] < 0x20 || bytes[index] == 0x7f {
++                // Stray C0/DEL outside an escape — the encoder never emits
++                // these, skip defensively.
++                index += 1;
++            } else {
++                index = self.apply_text_run(bytes, index, touched);
++            }
++        }
++    }
++
++    /// Consumes one escape sequence starting at `start` (which is ESC).
++    fn apply_escape(&mut self, bytes: &[u8], start: usize, touched: &mut Vec<(u16, u16)>) -> usize {
++        let Some(&kind) = bytes.get(start + 1) else {
++            return start + 1;
++        };
++        match kind {
++            b'[' => {
++                // CSI: parameter bytes 0x30..=0x3f, intermediates 0x20..=0x2f,
++                // final 0x40..=0x7e.
++                let mut end = start + 2;
++                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
++                    end += 1;
++                }
++                if end >= bytes.len() {
++                    return bytes.len();
++                }
++                let params = &bytes[start + 2..end];
++                self.apply_csi(params, bytes[end], touched);
++                end + 1
++            }
++            b']' => {
++                // OSC: terminated by BEL or ST (ESC \).
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x07 {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 1;
++                    }
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        self.apply_osc(&bytes[start + 2..end]);
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            b'_' => {
++                // APC (Kitty graphics passthrough): terminated by ST.
++                let mut end = start + 2;
++                while end < bytes.len() {
++                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
++                        return end + 2;
++                    }
++                    end += 1;
++                }
++                bytes.len()
++            }
++            // Stray ST or an escape we do not model.
++            _ => start + 2,
++        }
++    }
++
++    fn apply_csi(&mut self, params: &[u8], final_byte: u8, touched: &mut Vec<(u16, u16)>) {
++        let params = std::str::from_utf8(params).unwrap_or("");
++        match final_byte {
++            b'H' => {
++                let mut split = params.split(';');
++                let row: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                let col: u16 = split.next().and_then(|v| v.parse().ok()).unwrap_or(1);
++                self.cursor = (
++                    col.saturating_sub(1).min(self.width.saturating_sub(1)),
++                    row.saturating_sub(1).min(self.height.saturating_sub(1)),
++                );
++            }
++            b'm' => {
++                self.pen = parse_pen_style(params);
++            }
++            b'J' => {
++                if params == "2" {
++                    for (index, cell) in self.cells.iter_mut().enumerate() {
++                        if cell.symbol != " " || !cell.plain {
++                            *cell = ModelCell::blank();
++                            touched.push((
++                                (index % self.width.max(1) as usize) as u16,
++                                (index / self.width.max(1) as usize) as u16,
++                            ));
++                        }
++                    }
++                }
++            }
++            // ?2026 sync markers carry no screen state; only ?25 does.
++            b'h' | b'l' if params == "?25" => {
++                self.cursor_visible = final_byte == b'h';
++            }
++            // DECSCUSR (`CSI Ps SP q`) and anything else: no cell effect.
++            _ => {}
++        }
++    }
++
++    fn apply_osc(&mut self, payload: &[u8]) {
++        // OSC 8 hyperlink open/close; OSC 52 clipboard is passthrough.
++        if let Some(rest) = payload.strip_prefix(b"8;") {
++            let uri = rest.splitn(2, |b| *b == b';').nth(1).unwrap_or(b"");
++            self.hyperlink_open = !uri.is_empty();
++        }
++    }
++
++    /// Consumes one printable run. The encoder may batch adjacent cells
++    /// without another CUP because inline eligibility is decided by the
++    /// previous cell. Split the run at extended grapheme boundaries so an
++    /// ASCII base plus combining marks remains one modeled cell.
++    fn apply_text_run(
++        &mut self,
++        bytes: &[u8],
++        start: usize,
++        touched: &mut Vec<(u16, u16)>,
++    ) -> usize {
++        let mut end = start;
++        while end < bytes.len() && bytes[end] != 0x1b && bytes[end] >= 0x20 && bytes[end] != 0x7f {
++            end += 1;
++        }
++        use unicode_segmentation::UnicodeSegmentation as _;
++
++        let run = String::from_utf8_lossy(&bytes[start..end]);
++        for grapheme in run.graphemes(true) {
++            self.write_symbol(grapheme.to_string(), touched);
++        }
++        end
++    }
++
++    fn write_symbol(&mut self, symbol: String, touched: &mut Vec<(u16, u16)>) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let (x, y) = self.cursor;
++        if x >= self.width || y >= self.height {
++            return;
++        }
++        let width = symbol.width() as u16;
++        if width == 0 {
++            // BlitEncoder emits this grapheme without advancing the cursor.
++            // A host terminal may attach it to a preceding glyph, so neither
++            // a destination cell nor prediction reconciliation is knowable.
++            self.prediction_safe = false;
++            return;
++        }
++        let prediction_style = (!self.hyperlink_open)
++            .then(|| self.pen.prediction.clone())
++            .flatten();
++        let plain = prediction_style
++            .as_ref()
++            .is_some_and(|style| !style.reversed && style.base_sgr.as_ref() == PLAIN_SGR);
++        let index = y as usize * self.width as usize + x as usize;
++        self.cells[index] = ModelCell {
++            symbol,
++            plain,
++            sgr: self.pen.sgr.clone(),
++            prediction_style,
++        };
++        touched.push((x, y));
++        for offset in 1..width {
++            let column = x + offset;
++            if column >= self.width {
++                break;
++            }
++            self.cells[index + offset as usize] = ModelCell::continuation();
++            touched.push((column, y));
++        }
++        self.cursor.0 = (x + width).min(self.width.saturating_sub(1));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::render_ansi::BlitEncoder;
++    use crate::protocol::{CellData, CursorState, FrameData};
++
++    fn plain_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0,
++            bg: 0,
++            modifier: 0,
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn styled_cell(symbol: &str) -> CellData {
++        CellData {
++            symbol: symbol.to_string(),
++            fg: 0x00_00_00_02, // red
++            bg: 0,
++            modifier: 1, // bold
++            skip: false,
++            hyperlink: None,
++        }
++    }
++
++    fn frame(width: u16, height: u16, cells: Vec<CellData>, cursor: (u16, u16)) -> FrameData {
++        FrameData {
++            cells,
++            width,
++            height,
++            cursor: Some(CursorState {
++                x: cursor.0,
++                y: cursor.1,
++                visible: true,
++                shape: 0,
++            }),
++            hyperlinks: Vec::new(),
++            graphics: Vec::new(),
++        }
++    }
++
++    fn assert_model_matches(model: &ScreenModel, frame: &FrameData) {
++        use unicode_width::UnicodeWidthStr as _;
++
++        let mut expect_continuations = 0;
++        for y in 0..frame.height {
++            for x in 0..frame.width {
++                let cell = &frame.cells[y as usize * frame.width as usize + x as usize];
++                let model_cell = model.cell(x, y).expect("cell in range");
++                if expect_continuations > 0 {
++                    expect_continuations -= 1;
++                    assert_eq!(
++                        model_cell,
++                        &ModelCell::continuation(),
++                        "continuation at ({x},{y})"
++                    );
++                    continue;
++                }
++                if cell.skip {
++                    continue;
++                }
++                assert_eq!(model_cell.symbol, cell.symbol, "symbol at ({x},{y})");
++                let plain = cell.fg == 0 && cell.bg == 0 && cell.modifier == 0;
++                assert_eq!(model_cell.plain, plain, "plainness at ({x},{y})");
++                expect_continuations = cell.symbol.width().saturating_sub(1);
++            }
++        }
++        let cursor = frame.cursor.as_ref().expect("cursor");
++        assert_eq!(model.cursor(), (cursor.x, cursor.y), "cursor position");
++        assert_eq!(model.cursor_visible(), cursor.visible, "cursor visibility");
++    }
++
++    /// Encodes `frames` in sequence through a real `BlitEncoder` (full frame
++    /// first, then diffs) and replays the bytes into a model.
++    fn replay(frames: &[FrameData]) -> ScreenModel {
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++        for frame in frames {
++            let encoded = encoder.encode(frame, false);
++            model.ensure_size(frame.width, frame.height);
++            model.apply(&encoded.bytes, &mut touched);
++            encoder.commit(frame.clone(), encoded);
++        }
++        model
++    }
++
++    #[test]
++    fn full_frame_round_trips_through_real_encoder() {
++        let mut cells = vec![plain_cell(" "); 12];
++        cells[0] = plain_cell("$");
++        cells[2] = styled_cell("l");
++        cells[3] = plain_cell("s");
++        let frame = frame(4, 3, cells, (1, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_model_matches(&model, &frame);
++    }
++
++    #[test]
++    fn incremental_frame_round_trips_through_real_encoder() {
++        let mut first_cells = vec![plain_cell(" "); 12];
++        first_cells[0] = plain_cell("$");
++        let first = frame(4, 3, first_cells.clone(), (2, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("e");
++        second_cells[5] = styled_cell("X");
++        let second = frame(4, 3, second_cells, (3, 0));
++
++        let model = replay(&[first, second.clone()]);
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn contiguous_ascii_diff_updates_each_cell() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell("a"),
++                plain_cell("b"),
++                plain_cell("c"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++        let model = replay(&[first, second.clone()]);
++
++        assert_model_matches(&model, &second);
++    }
++
++    #[test]
++    fn decomposed_grapheme_full_frame_occupies_one_cell() {
++        let reference = frame(
++            3,
++            1,
++            vec![plain_cell("e\u{301}"), plain_cell("!"), plain_cell(" ")],
++            (2, 0),
++        );
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert_model_matches(&model, &reference);
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "e\u{301}");
++        assert_eq!(model.cell(1, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn ascii_prefix_and_decomposed_grapheme_diff_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell("a"),
++                plain_cell("e\u{301}"),
++                plain_cell("!"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("ae\u{301}"),
++            "test must exercise one ASCII-leading decomposed run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
++    }
++
++    fn zero_width_diff(symbol: &str) -> (ScreenModel, Vec<(u16, u16)>) {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let second = frame(
++            4,
++            1,
++            vec![
++                plain_cell(" "),
++                plain_cell(symbol),
++                plain_cell("x"),
++                plain_cell(" "),
++            ],
++            (3, 0),
++        );
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.begin_full_frame();
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++        (model, touched)
++    }
++
++    #[test]
++    fn combining_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{301}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
++    }
++
++    #[test]
++    fn zwj_only_symbol_invalidates_prediction_without_advancing() {
++        let (model, touched) = zero_width_diff("\u{200d}");
++        assert!(!model.prediction_safe());
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "x");
++        assert_eq!(touched, vec![(2, 0)]);
++    }
++
++    #[test]
++    fn ascii_prefix_and_wide_cell_in_one_run_update_separate_cells() {
++        let first = frame(4, 1, vec![plain_cell(" "); 4], (0, 0));
++        let mut second_cells = vec![plain_cell(" "); 4];
++        second_cells[0] = plain_cell("a");
++        second_cells[1] = plain_cell("你");
++        second_cells[2] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        model.ensure_size(4, 1);
++        let initial = encoder.encode(&first, false);
++        model.apply(&initial.bytes, &mut Vec::new());
++        encoder.commit(first, initial);
++        let diff = encoder.encode(&second, false);
++        assert!(
++            String::from_utf8_lossy(&diff.bytes).contains("a你"),
++            "test must exercise one mixed printable run"
++        );
++        let mut touched = Vec::new();
++        model.apply(&diff.bytes, &mut touched);
++
++        assert_model_matches(&model, &second);
++        assert_eq!(touched, vec![(0, 0), (1, 0), (2, 0)]);
++    }
++
++    #[test]
++    fn wide_symbol_occupies_two_columns() {
++        let mut cells = vec![plain_cell(" "); 8];
++        cells[0] = plain_cell("你");
++        cells[1] = CellData {
++            skip: true,
++            ..plain_cell(" ")
++        };
++        cells[2] = plain_cell("!");
++        let frame = frame(4, 2, cells, (3, 0));
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "你");
++        assert_eq!(model.cell(1, 0).unwrap(), &ModelCell::continuation());
++        assert_eq!(model.cell(2, 0).unwrap().symbol, "!");
++    }
++
++    #[test]
++    fn hyperlinked_cells_are_not_plain() {
++        let mut cells = vec![plain_cell(" "); 4];
++        cells[0] = CellData {
++            hyperlink: Some(0),
++            ..plain_cell("h")
++        };
++        cells[1] = plain_cell("x");
++        let mut frame = frame(4, 1, cells, (2, 0));
++        frame.hyperlinks = vec!["https://example.com".to_string()];
++
++        let model = replay(std::slice::from_ref(&frame));
++        assert!(!model.cell(0, 0).unwrap().plain, "hyperlinked cell");
++        assert!(model.cell(1, 0).unwrap().plain, "cell after link close");
++    }
++
++    #[test]
++    fn colored_reverse_cell_retains_safe_base_style() {
++        let mut cells = vec![plain_cell(" "); 3];
++        cells[0] = CellData {
++            fg: 0x02_FF_80_40,
++            bg: 0x01_00_00_04,
++            modifier: 1 << 6,
++            ..plain_cell(" ")
++        };
++        cells[1] = CellData {
++            fg: 0x02_FF_80_40,
++            bg: 0x01_00_00_04,
++            ..plain_cell(" ")
++        };
++        let mut reference = frame(3, 1, cells, (0, 0));
++        reference.cursor.as_mut().expect("cursor").visible = false;
++
++        let model = replay(std::slice::from_ref(&reference));
++        let caret = model
++            .cell(0, 0)
++            .unwrap()
++            .prediction_style
++            .as_ref()
++            .expect("reverse-only style is safe");
++        let neighbor = model
++            .cell(1, 0)
++            .unwrap()
++            .prediction_style
++            .as_ref()
++            .expect("color-only style is safe");
++        assert!(caret.reversed);
++        assert!(!neighbor.reversed);
++        assert_eq!(caret.base_sgr, neighbor.base_sgr);
++        assert_eq!(caret.base_sgr.as_ref(), "\x1b[0;38;2;255;128;64;48;5;4m");
++    }
++
++    #[test]
++    fn hidden_cursor_is_reported_hidden() {
++        let mut reference = frame(2, 1, vec![plain_cell("a"), plain_cell(" ")], (0, 0));
++        reference.cursor.as_mut().expect("cursor").visible = false;
++
++        let model = replay(std::slice::from_ref(&reference));
++        assert!(!model.cursor_visible());
++    }
++
++    #[test]
++    fn resize_clears_the_grid() {
++        let reference = frame(2, 1, vec![plain_cell("a"), plain_cell("b")], (0, 0));
++        let mut model = replay(std::slice::from_ref(&reference));
++        model.ensure_size(3, 2);
++        assert_eq!(model.cell(0, 0).unwrap(), &ModelCell::blank());
++        assert_eq!(model.width(), 3);
++    }
++
++    #[test]
++    fn touched_reports_written_cells() {
++        let mut first_cells = vec![plain_cell(" "); 4];
++        first_cells[0] = plain_cell("a");
++        let first = frame(4, 1, first_cells.clone(), (1, 0));
++
++        let mut second_cells = first_cells;
++        second_cells[2] = plain_cell("b");
++        let second = frame(4, 1, second_cells, (3, 0));
++
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++
++        let encoded = encoder.encode(&first, false);
++        model.ensure_size(first.width, first.height);
++        model.apply(&encoded.bytes, &mut touched);
++        encoder.commit(first, encoded);
++
++        touched.clear();
++        let encoded = encoder.encode(&second, false);
++        model.apply(&encoded.bytes, &mut touched);
++        assert_eq!(touched, vec![(2, 0)], "diff frame touches only the change");
++    }
++
++    #[test]
++    fn cursor_only_diff_updates_cursor_without_touching_cells() {
++        let cells = vec![plain_cell(" "); 4];
++        let first = frame(4, 1, cells.clone(), (1, 0));
++        let second = frame(4, 1, cells, (2, 0));
++        let mut encoder = BlitEncoder::new();
++        let mut model = ScreenModel::new();
++        let mut touched = Vec::new();
++
++        let encoded = encoder.encode(&first, false);
++        model.ensure_size(first.width, first.height);
++        model.apply(&encoded.bytes, &mut touched);
++        encoder.commit(first, encoded);
++
++        touched.clear();
++        let encoded = encoder.encode(&second, false);
++        model.apply(&encoded.bytes, &mut touched);
++        assert!(touched.is_empty());
++        assert_eq!(model.cursor(), (2, 0));
++        assert!(model.cursor_visible());
++    }
++
++    #[test]
++    fn kitty_graphics_and_osc52_are_passthrough() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(
++            b"\x1b_Ga=T;payload\x1b\\\x1b]52;c;YQ==\x07\x1b[1;1Hz",
++            &mut touched,
++        );
++        assert_eq!(model.cell(0, 0).unwrap().symbol, "z");
++    }
++
++    #[test]
++    fn truncated_escape_at_end_does_not_panic() {
++        let mut model = ScreenModel::new();
++        model.ensure_size(2, 1);
++        let mut touched = Vec::new();
++        model.apply(b"\x1b[1;1", &mut touched);
++        model.apply(b"\x1b]8;;unterminated", &mut touched);
++        model.apply(b"\x1b", &mut touched);
++    }
++}
+diff --git a/src/client/shell_runtime.rs b/src/client/shell_runtime.rs
+index 00bb1406..29bb43fa 100644
+--- a/src/client/shell_runtime.rs
++++ b/src/client/shell_runtime.rs
+@@ -721,6 +721,9 @@ pub(super) fn finish_client_shell_input(
+             // Pane input and non-focus host effects do not cross the frozen handoff boundary.
+             continue;
+         }
++        state
++            .prediction
++            .input(&request, endpoints.active_id(), is_remote_client_process());
+         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
+     }
+     if let Some(frame) = frame {
+diff --git a/src/client/state.rs b/src/client/state.rs
+index c26ca165..b23320fc 100644
+--- a/src/client/state.rs
++++ b/src/client/state.rs
+@@ -3,6 +3,7 @@ use super::*;
+ /// State tracking for the thin client.
+ pub(super) struct ClientState {
+     /// Stateful semantic-frame encoder used when the server sends FrameData.
++    pub(super) prediction: prediction::Prediction,
+     pub(super) blit_encoder: render_ansi::BlitEncoder,
+     pub(super) mouse_capture_active: bool,
+     pub(super) endpoint_mouse_capture_requested: bool,
+@@ -58,10 +59,12 @@ impl Drop for ClientState {
+ 
+ impl ClientState {
+     pub(super) fn request_repaint(&mut self) {
++        self.prediction.reset();
+         self.repaint_pending = true;
+     }
+ 
+     pub(super) fn freeze_presentation(&mut self) {
++        self.prediction.reset();
+         self.presentation_frozen = true;
+     }
+ 
+@@ -166,7 +169,13 @@ impl ClientState {
+         crate::render_prof::duration_since("client_surface_patch.encode", encode_started);
+         let write_started = crate::render_prof::timer();
+         let mut stdout = io::stdout();
+-        stdout.write_all(&encoded.bytes)?;
++        self.prediction.write_frame(
++            &mut stdout,
++            &encoded.bytes,
++            self.reported_size,
++            encoded.full,
++            &[],
++        )?;
+         stdout.flush()?;
+         crate::render_prof::duration_since("client_surface_patch.write", write_started);
+         let committed = self.blit_encoder.commit_patch(&rows, patch.cursor, encoded);
+@@ -223,7 +232,13 @@ impl ClientState {
+         } else {
+             &[]
+         };
+-        let _ = write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
++        let _ = self.prediction.write_frame(
++            &mut stdout,
++            &encoded.bytes,
++            self.reported_size,
++            encoded.full,
++            graphics,
++        );
+         let _ = stdout.flush();
+         self.blit_encoder.commit(frame_data, encoded);
+         self.repaint_pending = false;
+diff --git a/src/config/model.rs b/src/config/model.rs
+index 604fe9ad..1f9f6108 100644
+--- a/src/config/model.rs
++++ b/src/config/model.rs
+@@ -1020,15 +1020,31 @@ pub struct AdvancedConfig {
+ #[derive(Debug, Deserialize)]
+ #[serde(default)]
+ pub struct RemoteConfig {
+-    /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
+-    /// Set false to run plain ssh unchanged. Default: true.
++    /// Manage ssh options for `herdr --remote`: on Unix, add fallback
++    /// keepalives and private connection reuse; on Windows, add command-line
++    /// keepalives without config-file writes or connection reuse. Set false
++    /// to run plain ssh unchanged. Default: true.
+     pub manage_ssh_config: bool,
++    /// Windows only: route the `--remote` ssh transport through a local
++    /// `herdr remote-tcp-relay` ProxyCommand that owns the TCP socket with
++    /// TCP_NODELAY set, avoiding Nagle keystroke stalls on high-RTT links.
++    /// Overrides any ProxyCommand/ProxyJump from your ssh config for the
++    /// target, so it is opt-in. Requires manage_ssh_config. Default: false.
++    pub tcp_relay: bool,
++    /// Predictive local echo for remote attach: draw typed characters
++    /// immediately (underlined) instead of waiting a full round trip, then
++    /// reconcile against server frames. `"off"`, `"auto"` (only activates
++    /// once echo delay is observed to be high), or `"always"`.
++    /// Default: "auto".
++    pub predictive_echo: String,
+ }
+ 
+ impl Default for RemoteConfig {
+     fn default() -> Self {
+         Self {
+             manage_ssh_config: true,
++            tcp_relay: false,
++            predictive_echo: "auto".to_string(),
+         }
+     }
+ }
+diff --git a/src/main.rs b/src/main.rs
+index cf7cf5b4..636abf56 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -537,6 +537,10 @@ fn main() -> io::Result<()> {
+         Err(err) => return Err(err),
+     }
+ 
++    if args.get(1).map(|s| s.as_str()) == Some("remote-tcp-relay") {
++        return remote::run_remote_tcp_relay(&args[2..]);
++    }
++
+     // Subcommands and flags (no TUI, no logging needed)
+     if args.get(1).map(|s| s.as_str()) == Some("remote-client-bridge") {
+         return remote::run_remote_client_bridge();
+diff --git a/src/platform/mod.rs b/src/platform/mod.rs
+index d48ad4fa..f0c08ceb 100644
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -3,6 +3,9 @@
+ //! Centralizes OS-dependent behavior behind a clean boundary so core
+ //! modules don't scatter `#[cfg]` branches through product logic.
+ 
++#[cfg(not(windows))]
++pub(crate) const LOCAL_STREAM_WRITE_CHUNK: usize = 4 * 1024;
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct ForegroundProcess {
+     pub pid: u32,
+diff --git a/src/platform/windows.rs b/src/platform/windows.rs
+index 4deb1864..d1a668a0 100644
+--- a/src/platform/windows.rs
++++ b/src/platform/windows.rs
+@@ -24,6 +24,10 @@ pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::C
+     }
+ }
+ 
++// PIPE_NOWAIT writes larger than the local-socket default pipe buffer can make
++// no progress while the peer polls with PeekNamedPipe instead of posting a read.
++pub(crate) const LOCAL_STREAM_WRITE_CHUNK: usize = 512;
++
+ pub(crate) fn wait_client_stream_readable(
+     _stream: &crate::ipc::LocalStream,
+ ) -> std::io::Result<()> {
+diff --git a/src/remote.rs b/src/remote.rs
+index ba935ec4..bf8e55e4 100644
+--- a/src/remote.rs
++++ b/src/remote.rs
+@@ -1,4 +1,6 @@
+ mod args;
++mod tcp_relay;
++pub(crate) use tcp_relay::run_remote_tcp_relay;
+ mod attach;
+ #[cfg(unix)]
+ mod host_unix;
+diff --git a/src/remote/attach.rs b/src/remote/attach.rs
+index 10db88a6..0b3dac0e 100644
+--- a/src/remote/attach.rs
++++ b/src/remote/attach.rs
+@@ -55,6 +55,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         manage_ssh_config,
+         session_name.clone(),
+     );
++    let attach_started = Instant::now();
+     let prepared_remote =
+         prepare_remote_herdr(&remote_ssh, remote.live_handoff, require_surface_interest)?;
+     ensure_remote_server_ready(
+@@ -65,6 +66,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         require_surface_interest,
+     )?;
+ 
++    if std::env::var_os("HERDR_REMOTE_TIMING").is_some() {
++        eprintln!(
++            "herdr remote: prepare and readiness: {:?}",
++            attach_started.elapsed()
++        );
++    }
+     let _bridge = SshStdioBridge::start(
+         remote.target,
+         prepared_remote.remote_herdr,
+@@ -74,7 +81,11 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         false,
+     )?;
+ 
+-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
++    run_client_process(
++        &local_socket,
++        &reattach_command,
++        remote.keybindings,
++    )
+ }
+ 
+ pub(crate) fn prepare_saved_ssh(target: &str, session_name: &str) -> io::Result<()> {
+@@ -594,6 +605,18 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
+     };
+ 
+     command.arg("-F").arg(&options.config_path);
++    #[cfg(windows)]
++    if std::env::var("HERDR_REMOTE_TCP_RELAY")
++        .map(|v| !v.is_empty() && v != "0")
++        .unwrap_or_else(|_| crate::config::Config::load().config.remote.tcp_relay)
++    {
++        if let Ok(exe) = std::env::current_exe() {
++            command.arg("-o").arg(format!(
++                "ProxyCommand=\"{}\" remote-tcp-relay %h %p",
++                exe.display()
++            ));
++        }
++    }
+     if let Some(control_path) = &options.control_path {
+         command
+             .arg("-S")
+@@ -2125,7 +2148,7 @@ fn copy_reader_to_local_stream<R: io::Read>(
+             if connection_stop.load(Ordering::Acquire) || bridge_stop.load(Ordering::Acquire) {
+                 return Ok(total);
+             }
+-            let chunk_len = (read - written).min(4 * 1024);
++            let chunk_len = (read - written).min(crate::platform::LOCAL_STREAM_WRITE_CHUNK);
+             match stream.write(&buffer[written..written + chunk_len]) {
+                 Ok(0) => thread::sleep(BRIDGE_IO_POLL),
+                 Ok(count) => written += count,
+@@ -2312,6 +2335,53 @@ mod tests {
+         let _ = std::fs::remove_file(socket);
+     }
+ 
++    #[test]
++    fn large_bridge_download_reaches_a_polling_peer() {
++        let socket = local_forward_socket_path("polling-download", "test");
++        let listener = crate::ipc::bind_private_local_listener(&socket).unwrap();
++        let mut peer = crate::ipc::connect_local_stream(&socket).unwrap();
++        let mut stream = listener.accept().unwrap();
++        peer.set_nonblocking(true).unwrap();
++        stream.set_nonblocking(true).unwrap();
++        let stop = Arc::new(AtomicBool::new(false));
++        let worker_stop = stop.clone();
++        let expected = vec![0x5a; 64 * 1024];
++        let payload = expected.clone();
++        let worker = thread::spawn(move || {
++            copy_reader_to_local_stream(
++                &mut payload.as_slice(),
++                &mut stream,
++                &worker_stop,
++                &AtomicBool::new(false),
++            )
++        });
++        let deadline = Instant::now() + Duration::from_secs(3);
++        let mut received = Vec::new();
++        let mut buffer = [0; 8192];
++        while received.len() < expected.len() && Instant::now() < deadline {
++            match crate::ipc::poll_local_stream_read_count(&mut peer, &mut buffer).unwrap() {
++                crate::ipc::LocalStreamReadCount::Data(n) => {
++                    received.extend_from_slice(&buffer[..n])
++                }
++                crate::ipc::LocalStreamReadCount::Pending => {
++                    thread::sleep(Duration::from_millis(1))
++                }
++                crate::ipc::LocalStreamReadCount::Closed => break,
++            }
++        }
++        stop.store(true, Ordering::Release);
++        worker.join().unwrap().unwrap();
++        drop(peer);
++        drop(listener);
++        let _ = std::fs::remove_file(socket);
++        assert_eq!(
++            received.len(),
++            expected.len(),
++            "polling peer must receive the complete download"
++        );
++        assert_eq!(received, expected);
++    }
++
+     #[test]
+     fn bridge_drop_while_waiting_for_client_is_bounded() {
+         let socket = local_forward_socket_path("drop-test", "default");
+diff --git a/src/remote/tcp_relay.rs b/src/remote/tcp_relay.rs
+new file mode 100644
+index 00000000..b1f0a647
+--- /dev/null
++++ b/src/remote/tcp_relay.rs
+@@ -0,0 +1,181 @@
++//! `herdr remote-tcp-relay <host> <port>` — a minimal ssh ProxyCommand that
++//! owns the TCP connection with `TCP_NODELAY` set (i0002 W1).
++//!
++//! OpenSSH only sets `TCP_NODELAY` on interactive (tty) sessions; the remote
++//! bridge runs `ssh -T`, so Nagle's algorithm can hold a keystroke packet
++//! back until the previous one is acked — up to a full extra RTT when typing
++//! fast on a high-latency link. Routing the connection through this relay
++//! (`-o ProxyCommand=<herdr> remote-tcp-relay %h %p`) puts the socket under
++//! our control. Injected on Windows when `remote.tcp_relay = true` (or
++//! `HERDR_REMOTE_TCP_RELAY=1`); see `remote::windows::apply_managed_ssh_options`.
++//!
++//! Note this only fixes the client→server leg. The server→client leg is
++//! sshd's socket and follows the same tty rule there; measure both with
++//! `HERDR_ECHO_TIMING` before assuming symmetric gains.
++
++use std::io;
++#[cfg(test)]
++use std::io::{Read, Write};
++use std::net::{Shutdown, TcpStream, ToSocketAddrs};
++use std::thread;
++
++fn copy_flush(
++    reader: &mut impl std::io::Read,
++    writer: &mut impl std::io::Write,
++) -> std::io::Result<u64> {
++    let mut buffer = [0u8; 16 * 1024];
++    let mut total = 0;
++    loop {
++        let n = match reader.read(&mut buffer) {
++            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
++            other => other?,
++        };
++        if n == 0 {
++            return Ok(total);
++        }
++        writer.write_all(&buffer[..n])?;
++        writer.flush()?;
++        total += n as u64;
++    }
++}
++
++pub(crate) fn run_remote_tcp_relay(args: &[String]) -> io::Result<()> {
++    let (host, port) = parse_relay_args(args).map_err(|usage| {
++        eprintln!("{usage}");
++        io::Error::new(io::ErrorKind::InvalidInput, "invalid remote-tcp-relay args")
++    })?;
++
++    let stream = connect_nodelay(&host, port)?;
++    relay_stdio(stream)
++}
++
++pub(crate) fn parse_relay_args(args: &[String]) -> Result<(String, u16), String> {
++    let usage = "usage: herdr remote-tcp-relay <host> <port>";
++    let [host, port] = args else {
++        return Err(usage.to_string());
++    };
++    if host.is_empty() {
++        return Err(usage.to_string());
++    }
++    let port: u16 = port
++        .parse()
++        .map_err(|_| format!("{usage} (invalid port `{port}`)"))?;
++    Ok((host.clone(), port))
++}
++
++fn connect_nodelay(host: &str, port: u16) -> io::Result<TcpStream> {
++    let addrs = (host, port).to_socket_addrs().map_err(|err| {
++        io::Error::new(
++            err.kind(),
++            format!("failed to resolve {host}:{port}: {err}"),
++        )
++    })?;
++    let mut last_err = None;
++    for addr in addrs {
++        match TcpStream::connect(addr) {
++            Ok(stream) => {
++                stream.set_nodelay(true)?;
++                return Ok(stream);
++            }
++            Err(err) => last_err = Some(err),
++        }
++    }
++    Err(last_err.unwrap_or_else(|| {
++        io::Error::new(
++            io::ErrorKind::AddrNotAvailable,
++            format!("no addresses resolved for {host}:{port}"),
++        )
++    }))
++}
++
++/// Splices stdin→socket and socket→stdout. Returns when the server side
++/// closes (ssh observes EOF on our stdout); a stdin EOF half-closes the
++/// socket so the server can finish sending.
++fn relay_stdio(stream: TcpStream) -> io::Result<()> {
++    let mut write_half = stream.try_clone()?;
++    let upload = thread::spawn(move || {
++        let mut stdin = io::stdin().lock();
++        let _ = copy_flush(&mut stdin, &mut write_half);
++        let _ = write_half.shutdown(Shutdown::Write);
++    });
++
++    let mut read_half = stream;
++    let mut stdout = io::stdout().lock();
++    let result = copy_flush(&mut read_half, &mut stdout).map(|_| ());
++    drop(stdout);
++    // If the server closed first, stdin may still be open and the upload
++    // thread blocked in read; exiting the process releases it. Only join
++    // when the upload already finished (stdin EOF path).
++    if upload.is_finished() {
++        let _ = upload.join();
++    }
++    result
++}
++
++/// Testable core of the relay: like [`relay_stdio`] but over arbitrary
++/// streams instead of the process stdio.
++#[cfg(test)]
++fn relay_streams(
++    mut input: impl Read + Send + 'static,
++    output: &mut impl Write,
++    stream: TcpStream,
++) -> io::Result<()> {
++    let mut write_half = stream.try_clone()?;
++    let upload = thread::spawn(move || {
++        let _ = copy_flush(&mut input, &mut write_half);
++        let _ = write_half.shutdown(Shutdown::Write);
++    });
++    let mut read_half = stream;
++    let result = copy_flush(&mut read_half, output).map(|_| ());
++    let _ = upload.join();
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::TcpListener;
++
++    #[test]
++    fn parse_relay_args_accepts_host_and_port() {
++        let args = vec!["example.com".to_string(), "22".to_string()];
++        assert_eq!(parse_relay_args(&args), Ok(("example.com".to_string(), 22)));
++    }
++
++    #[test]
++    fn parse_relay_args_rejects_bad_shapes() {
++        assert!(parse_relay_args(&[]).is_err());
++        assert!(parse_relay_args(&["host".to_string()]).is_err());
++        assert!(parse_relay_args(&["host".to_string(), "notaport".to_string()]).is_err());
++        assert!(parse_relay_args(&[String::new(), "22".to_string()]).is_err());
++        assert!(
++            parse_relay_args(&["host".to_string(), "22".to_string(), "extra".to_string()]).is_err()
++        );
++    }
++
++    #[test]
++    fn relay_sets_nodelay_and_splices_both_directions() {
++        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
++        let addr = listener.local_addr().expect("addr");
++
++        // Echo server: read everything, send it back uppercased, close.
++        let server = thread::spawn(move || {
++            let (mut conn, _) = listener.accept().expect("accept");
++            let mut received = Vec::new();
++            conn.read_to_end(&mut received).expect("read");
++            let upper = received.to_ascii_uppercase();
++            conn.write_all(&upper).expect("write");
++            conn.shutdown(Shutdown::Write).ok();
++        });
++
++        let stream = connect_nodelay(&addr.ip().to_string(), addr.port()).expect("connect");
++        assert!(stream.nodelay().expect("nodelay query"));
++
++        let input = io::Cursor::new(b"keystrokes".to_vec());
++        let mut output = Vec::new();
++        relay_streams(input, &mut output, stream).expect("relay");
++
++        assert_eq!(output, b"KEYSTROKES");
++        server.join().expect("server thread");
++    }
++}

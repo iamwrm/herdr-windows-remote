@@ -2,16 +2,29 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0005` of the current `v0.8.0`
+- **Status:** implemented in ownership patch `0004` of the current `v0.9.0`
   representation
 - **Upstream:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr))
-- **Deliverable:** `patches/herdr/0005-*-IV-0007.patch`
-- **Implementation base:** `v0.8.0` (`346411fa`), stacked after ownership
-  patches `0001`–`0004`
+- **Deliverable:** `patches/herdr/0004-*-IV-0007.patch`
+- **Implementation base:** `v0.9.0` (`b99002ac`), stacked after ownership
+  patches `0001`–`0003`
 - **Dependency:** [IV-0001](IV-0001-windows-remote.md) supplies the native
-  Windows SSH/named-pipe bridge; the upstream v19 protocol already supplies
+  Windows SSH/named-pipe bridge; the upstream v22 protocol supplies
   `ClientMessage::ClipboardImage`
+
+
+## v0.9.0 integration
+
+Patch 0004 replaces ImageFrameWriter and the SSH shell helper with a capacity limit in server::clipboard_image. Configure remote.clipboard_image_buffer_mb on the patched server. Images use the upstream per-user staging directory and survive client disconnects until FIFO eviction. Target validation, payload limits, failed-routing cleanup, and native transport remain upstream-owned. Stock Linux servers still support image paste but do not apply this custom FIFO policy.
+
+See [verification and migration](UPGRADE-v0.9.0.md). Descriptions below of earlier releases are historical.
+
+## v0.8.2 upgrade
+
+Upstream now supplies the Windows PNG/DIB decoder. This patch retains input-batch ordering, the per-user Linux FIFO, and `ImageFrameWriter` interception in `src/remote/windows.rs`, connected to upstream attach I/O. Protocol 20 is unchanged. Old decoder/pump descriptions below are historical.
+
+See [upgrade verification](UPGRADE-v0.8.2.md) for build and runtime evidence.
 
 ## Purpose
 
@@ -22,12 +35,11 @@ an image in the Windows clipboard behave like an image paste:
    or receive an empty host paste event;
 2. normalize the clipboard image to PNG;
 3. store it on Linux as
-   `/tmp/herdr-<unix-username>/clipboard-<random>.png`;
+   `/tmp/herdr-clipboard-images-<uid>/client-<random>.png`;
 4. paste that absolute path into the active remote pane.
 
 Files form a FIFO shared by every Herdr client for the same Unix account. The
-aggregate default budget is 64 MiB; configure it locally before launching the
-remote session:
+aggregate default budget is 64 MiB; configure it on the patched Linux server:
 
 ```toml
 [remote]

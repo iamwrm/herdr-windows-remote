@@ -2,8 +2,8 @@
 
 ## Record
 
-- **Status:** implemented in ownership patch `0003` of the current `v0.8.0`
-  representation; the latest publication is `v0.8.0-win.05` (`hcode` first
+- **Status:** implemented in ownership patch `0003` of the current `v0.9.0`
+  representation (unpublished); the latest publication is `v0.8.0-win.05` (`hcode` first
   shipped in `v0.7.5-win.01`); automated tests, isolated Windows launch
   verification, and live deb1 request-transport verification complete
 - **Upstream:** `checkouts/herdr`
@@ -11,11 +11,24 @@
 - **Deliverables:** `patches/herdr/0003-*-IV-0004.patch`,
   [`extras/remote-bin/hcode`](../extras/remote-bin/hcode), and the `hcode`
   release asset
-- **Implementation base:** `v0.8.0` (`346411fa`), stacked on ownership
+- **Implementation base:** `v0.9.0` (`b99002ac`), stacked on ownership
   patches `0001`–`0002`
 - **Dependencies:** [IV-0001](IV-0001-windows-remote.md) supplies the native
   Windows remote client; [IV-0002](IV-0002-latency-improvements.md) owns the
   preceding client/transport latency patch
+
+
+## v0.9.0 integration
+
+The hcode handler remains in patch 0003. It is scoped to the original --remote endpoint and its locally supplied SSH target; saved-machine messages cannot open files on the initial host. Saved-machine hcode routing is not enabled.
+
+See [verification and migration](UPGRADE-v0.9.0.md). Descriptions below of earlier releases are historical.
+
+## v0.8.2 upgrade
+
+Rebased onto stable v0.8.2. The integration retains its behavior on upstream native Windows remote attach. Shared client/config hooks are finalized by the complete five-patch series.
+
+See [upgrade verification](UPGRADE-v0.8.2.md) for build and runtime evidence.
 
 ## Purpose
 

@@ -2,17 +2,31 @@
 
 ## Record
 
-- **Status:** implemented; first published in `v0.8.0-win.02`
+- **Status:** implemented; first published in `v0.8.0-win.02`; the current
+  v0.9.0 representation is unpublished
 - **Upstreams:** `checkouts/herdr`
   ([herdrdev/herdr](https://github.com/herdrdev/herdr)) and read-only behavior
   reference [PrimeIntellect-ai/prime-agent](https://github.com/PrimeIntellect-ai/prime-agent)
   at `a18809e0`
 - **Deliverable:** ownership patch
-  `patches/herdr/0004-*-IV-0006.patch`
-- **Implementation base:** upstream herdr `v0.8.0` (`346411fa`), stacked after
+  `patches/herdr/0002-*-IV-0006.patch`
+- **Implementation base:** upstream herdr `v0.9.0` (`b99002ac`), stacked after
   [IV-0002](IV-0002-latency-improvements.md)'s predictive-echo implementation
 - **Supersedes for current builds:** [IV-0003](IV-0003-pi-predictive-echo.md)'s
   pi-side cursor adapter; that extension remains only for older herdr releases
+
+
+## v0.9.0 integration
+
+This initiative now shares patch 0002 with IV-0002 because software cursor prediction and its screen model have one lifecycle. The full safety-gate and reconciliation tests remain. No stable wire-codec changes are made.
+
+See [verification and migration](UPGRADE-v0.9.0.md). Descriptions below of earlier releases are historical.
+
+## v0.8.2 upgrade
+
+Rebased onto stable v0.8.2. The integration retains its behavior on upstream native Windows remote attach. Shared client/config hooks are finalized by the complete five-patch series.
+
+See [upgrade verification](UPGRADE-v0.8.2.md) for build and runtime evidence.
 
 ## Purpose
 
@@ -98,7 +112,7 @@ The prior visible-hardware-cursor path is unchanged.
 |---|---|---|
 | herdr | `src/client/screen_model.rs` | safe color/reverse style model and exact repaint SGR |
 | herdr | `src/client/predict.rs` | software-caret detection, local caret rendering, reconciliation, regressions |
-| this repo | `patches/herdr/0004-*-IV-0006.patch` | durable implementation patch |
+| this repo | `patches/herdr/0002-*-IV-0006.patch` | durable implementation patch, shared with IV-0002 |
 | this repo | `docs/IV-0006-software-cursor-predictive-echo.md` | lifecycle and evidence record |
 
 ## Non-goals

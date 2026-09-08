@@ -1,32 +1,14 @@
-From c0f15aa3c6a3fdbe413dfb5136c73c77751f3edc Mon Sep 17 00:00:00 2001
-From: iamwrm <iamwrm@gmail.com>
-Date: Sun, 2 Aug 2026 00:03:34 +0800
-Subject: [PATCH 3/4] feat(fork): open local VS Code from remote shells
- (IV-0004)
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Herdr patch stack <patches@example.invalid>
+Date: Tue, 8 Sep 2026 01:00:00 +0800
+Subject: [PATCH 3/4] feat(client): retain scoped hcode integration (IV-0004)
 
-Combine the complete IV-0004 integration:
-
-- validated title-control and legacy OSC 52 code-open requests
-- final hcode naming and VS Code window-preservation behavior
-- no-console Windows broker for terminal-safe protocol-handler launches
 ---
- Cargo.toml              |   1 +
- src/client/code_open.rs | 953 ++++++++++++++++++++++++++++++++++++++++
- src/client/mod.rs       |  35 +-
- src/config/model.rs     |  21 +
- src/main.rs             |  14 +
- src/platform/mod.rs     |   5 +
- src/platform/windows.rs |  32 +-
- src/remote.rs           |   1 +
- src/remote/launcher.rs  |  15 +-
- 9 files changed, 1068 insertions(+), 9 deletions(-)
- create mode 100644 src/client/code_open.rs
-
 diff --git a/Cargo.toml b/Cargo.toml
-index c6d89bed..a7498577 100644
+index a645a4f4..0868ab16 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -65,6 +65,7 @@ windows-sys = { version = "0.61.2", features = [
+@@ -71,6 +71,7 @@ windows-sys = { version = "0.61.2", features = [
      "Win32_System_Memory",
      "Win32_System_Ole",
      "Win32_System_Pipes",
@@ -994,86 +976,66 @@ index 00000000..ad3da98d
 +    }
 +}
 diff --git a/src/client/mod.rs b/src/client/mod.rs
-index 3eac9c04..3ece6315 100644
+index c5c9c1be..82306217 100644
 --- a/src/client/mod.rs
 +++ b/src/client/mod.rs
-@@ -12,6 +12,8 @@
+@@ -12,10 +12,12 @@
  //! - Forwards OSC 52 clipboard writes from server to its own stdout
  //! - Displays sound/toast notifications forwarded from server
  
 +mod code_open;
-+pub(crate) use code_open::maybe_run_broker as maybe_run_code_open_broker;
  mod echo_timing;
- mod input;
  mod predict;
-@@ -58,6 +60,9 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
- struct ClientLoopConfig {
-     /// `remote.predictive_echo` setting ("off" | "auto" | "always").
-     predictive_echo: String,
-+    /// `remote.code_open` setting: allow the remote `hcode` shim to open
-+    /// local VS Code Remote-SSH windows (i0004).
-+    code_open: bool,
-     sound_config: crate::config::SoundConfig,
-     mouse_scroll_lines: usize,
-     redraw_on_focus_gained: bool,
-@@ -1140,6 +1145,7 @@ fn run_client_with_mode(
-         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
-     let loop_config = ClientLoopConfig {
-         predictive_echo: loaded_config.config.remote.predictive_echo.clone(),
-+        code_open: loaded_config.config.remote.code_open,
-         sound_config: loaded_config.config.ui.sound,
-         mouse_scroll_lines,
-         redraw_on_focus_gained,
-@@ -1319,6 +1325,10 @@ async fn run_client_loop(
-         None
-     };
- 
-+    // `hcode <path>` typed on the remote host → local VS Code Remote-SSH
-+    // window (i0004). Only active for remote attach clients.
-+    let mut code_open = code_open::CodeOpen::from_client_env(config.code_open);
-+
-     let mut state = ClientState {
-         blit_encoder: render_ansi::BlitEncoder::new(),
-         mouse_capture_active: config.mouse_capture_active,
-@@ -1664,12 +1674,29 @@ async fn run_client_loop(
-                     handle_notify(kind, &message, body.as_deref(), &state.sound_config);
-                 }
-                 ServerMessage::Clipboard { data } => {
--                    forward_clipboard(&data);
--                    let _ = io::stdout().flush();
-+                    // Older installed `hcode` shims used OSC 52; keep their
-+                    // magic payloads away from the real clipboard.
-+                    let handled = code_open
-+                        .as_mut()
-+                        .is_some_and(|code_open| code_open.try_handle_clipboard(&data));
-+                    if !handled {
-+                        forward_clipboard(&data);
-+                        let _ = io::stdout().flush();
-+                    }
-                 }
-                 ServerMessage::WindowTitle { title } => {
--                    write_window_title(title.as_deref());
--                    let _ = io::stdout().flush();
-+                    // Current `hcode` uses chunked title-control messages so
-+                    // the official server does not show clipboard feedback.
-+                    // Consume those chunks before touching the host title.
-+                    let handled = title.as_deref().is_some_and(|title| {
-+                        code_open
-+                            .as_mut()
-+                            .is_some_and(|code_open| code_open.try_handle_window_title(title))
-+                    });
-+                    if !handled {
-+                        write_window_title(title.as_deref());
-+                        let _ = io::stdout().flush();
-+                    }
-                 }
-                 ServerMessage::ReloadSoundConfig => {
-                     reload_local_client_config(
+ mod prediction;
+ mod screen_model;
++pub(crate) use code_open::maybe_run_broker as maybe_run_code_open_broker;
+ mod attach;
+ mod catalog_reload;
+ mod clipboard_forwarding;
+@@ -561,6 +563,8 @@ async fn run_client_loop(
+             state.present_frame(frame);
+         }
+     }
++    let mut code_open =
++        code_open::CodeOpen::from_client_env(crate::config::Config::load().config.remote.code_open);
+     let mut next_surface_serial = 1_u64;
+     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
+     let mut scheduled_activation = None;
+@@ -1759,6 +1763,13 @@ async fn run_client_loop(
+                         }
+                     }
+                     ServerMessage::Clipboard { data } => {
++                        if endpoint_id.is_local()
++                            && code_open
++                                .as_mut()
++                                .is_some_and(|broker| broker.try_handle_clipboard(&data))
++                        {
++                            continue;
++                        }
+                         if forward_clipboard(&data) {
+                             let (width, height) = state.reported_size;
+                             let frame = state.shell.as_mut().and_then(|shell| {
+@@ -1774,6 +1785,15 @@ async fn run_client_loop(
+                         let _ = io::stdout().flush();
+                     }
+                     ServerMessage::WindowTitle { title } => {
++                        if endpoint_id.is_local()
++                            && title.as_deref().is_some_and(|title| {
++                                code_open
++                                    .as_mut()
++                                    .is_some_and(|broker| broker.try_handle_window_title(title))
++                            })
++                        {
++                            continue;
++                        }
+                         let _ = crate::terminal_effects::write_window_title(
+                             &mut io::stdout(),
+                             title.as_deref(),
 diff --git a/src/config/model.rs b/src/config/model.rs
-index e2bd39bb..5e638b81 100644
+index 1f9f6108..f17c3d66 100644
 --- a/src/config/model.rs
 +++ b/src/config/model.rs
-@@ -892,6 +892,12 @@ pub struct RemoteConfig {
+@@ -1037,6 +1037,12 @@ pub struct RemoteConfig {
      /// once echo delay is observed to be high), or `"always"`.
      /// Default: "auto".
      pub predictive_echo: String,
@@ -1086,7 +1048,7 @@ index e2bd39bb..5e638b81 100644
  }
  
  impl Default for RemoteConfig {
-@@ -900,6 +906,7 @@ impl Default for RemoteConfig {
+@@ -1045,6 +1051,7 @@ impl Default for RemoteConfig {
              manage_ssh_config: true,
              tcp_relay: false,
              predictive_echo: "auto".to_string(),
@@ -1094,7 +1056,7 @@ index e2bd39bb..5e638b81 100644
          }
      }
  }
-@@ -1602,6 +1609,20 @@ mouse_scroll_lines = 0
+@@ -1841,6 +1848,20 @@ mouse_scroll_lines = 0
          assert!(toml::from_str::<Config>(toml).is_err());
      }
  
@@ -1116,65 +1078,43 @@ index e2bd39bb..5e638b81 100644
      fn toast_config_parses() {
          let toml = r#"
 diff --git a/src/main.rs b/src/main.rs
-index f75d4f60..6978e46c 100644
+index 636abf56..5b3a198e 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -402,6 +402,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
- # Predictive local echo for remote terminal attach: "off", "auto", or "always".
- # Auto displays predictions only after observing enough network latency.
- # predictive_echo = "auto"
-+# Allow the remote `hcode` shim to open local VS Code Remote-SSH windows.
-+# code_open = true
- 
- [experimental]
- # Allow launching herdr from inside a herdr-managed pane.
-@@ -493,6 +495,17 @@ fn main() -> io::Result<()> {
+@@ -491,6 +491,9 @@ fn main() -> io::Result<()> {
              std::process::exit(2);
          }
      };
-+    // VS Code's Windows launcher and extension host can attach to their
-+    // parent's console and emit diagnostics. Handle this hidden mode before
-+    // normal argument parsing; its parent gives it no console or stdio.
 +    if let Some(result) = client::maybe_run_code_open_broker(&raw_args) {
-+        crate::logging::init_file_logging("herdr-client.log");
-+        if let Err(err) = &result {
-+            tracing::warn!(%err, "isolated VS Code URL broker failed");
-+        }
 +        return result;
 +    }
-+
      let args = match session::configure_from_args(&raw_args) {
          Ok(args) => args,
          Err(err) => {
-@@ -926,6 +939,7 @@ mod tests {
-         assert!(DEFAULT_CONFIG.contains("override ServerAlive* values in user config"));
-         assert!(DEFAULT_CONFIG.contains("# tcp_relay = false"));
-         assert!(DEFAULT_CONFIG.contains("# predictive_echo = \"auto\""));
-+        assert!(DEFAULT_CONFIG.contains("# code_open = true"));
-     }
- 
-     #[test]
 diff --git a/src/platform/mod.rs b/src/platform/mod.rs
-index 661c830a..a6a106aa 100644
+index f0c08ceb..39866d99 100644
 --- a/src/platform/mod.rs
 +++ b/src/platform/mod.rs
-@@ -212,6 +212,11 @@ mod fallback;
+@@ -298,6 +298,14 @@ mod fallback;
  #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
  pub use fallback::*;
  
 +#[cfg(not(windows))]
 +pub(crate) fn open_url_from_isolated_broker(url: &str) -> std::io::Result<()> {
-+    open_url(url)
++    if let Some(mut child) = open_url(url)? {
++        let _ = child.wait()?;
++    }
++    Ok(())
 +}
 +
  #[cfg(any(target_os = "linux", target_os = "macos"))]
  pub(crate) fn available_pane_shell_from_job(child_pid: u32, job: ForegroundJob) -> Option<String> {
      if job.process_group_id != child_pid
 diff --git a/src/platform/windows.rs b/src/platform/windows.rs
-index 55e0fd0b..7450b05b 100644
+index d1a668a0..7d0dfeea 100644
 --- a/src/platform/windows.rs
 +++ b/src/platform/windows.rs
-@@ -55,12 +55,14 @@ use windows_sys::{
+@@ -132,12 +132,14 @@ use windows_sys::{
                  },
              },
              Shell::{
@@ -1192,7 +1132,7 @@ index 55e0fd0b..7450b05b 100644
              },
          },
      },
-@@ -1229,7 +1231,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
+@@ -2040,7 +2042,7 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
              url.as_ptr(),
              std::ptr::null(),
              std::ptr::null(),
@@ -1201,7 +1141,7 @@ index 55e0fd0b..7450b05b 100644
          )
      };
      if result as isize > 32 {
-@@ -1242,6 +1244,28 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
+@@ -2053,6 +2055,28 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
      }
  }
  
@@ -1227,60 +1167,41 @@ index 55e0fd0b..7450b05b 100644
 +    }
 +}
 +
- // Windows does not wire clipboard-image bridging into semantic input yet.
- #[cfg_attr(windows, allow(dead_code))]
  pub fn read_clipboard_image() -> Option<ClipboardImage> {
+     for attempt in 0..10 {
+         if unsafe { OpenClipboard(null_mut()) } != 0 {
 diff --git a/src/remote.rs b/src/remote.rs
-index 6f5de59f..b632a6ed 100644
+index bf8e55e4..de497cc8 100644
 --- a/src/remote.rs
 +++ b/src/remote.rs
-@@ -14,6 +14,7 @@ mod windows;
- 
- pub(crate) use launcher::{
-     extract_remote_args, run_remote, REATTACH_COMMAND_ENV_VAR, REMOTE_KEYBINDINGS_ENV_VAR,
-+    REMOTE_TARGET_ENV_VAR,
- };
- pub(crate) use tcp_relay::run_remote_tcp_relay;
- 
-diff --git a/src/remote/launcher.rs b/src/remote/launcher.rs
-index 21b4eed0..59199845 100644
---- a/src/remote/launcher.rs
-+++ b/src/remote/launcher.rs
-@@ -68,6 +68,11 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
- 
- pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
- 
-+/// Ssh target of the active `herdr --remote` attach, exported to the spawned
-+/// client process so client-local integrations (the remote `hcode` shim →
-+/// local VS Code Remote-SSH, i0004) know which host they are attached to.
+@@ -1,4 +1,5 @@
+ mod args;
 +pub(crate) const REMOTE_TARGET_ENV_VAR: &str = "HERDR_REMOTE_TARGET";
-+
- #[derive(Debug, Clone, Copy, PartialEq, Eq)]
- pub(crate) enum RemoteKeybindings {
-     Local,
-@@ -235,6 +240,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
-         probe::save_cache(&remote.target, path, &prepared_remote.remote_herdr.platform);
+ mod tcp_relay;
+ pub(crate) use tcp_relay::run_remote_tcp_relay;
+ mod attach;
+diff --git a/src/remote/attach.rs b/src/remote/attach.rs
+index 0b3dac0e..01551632 100644
+--- a/src/remote/attach.rs
++++ b/src/remote/attach.rs
+@@ -73,7 +73,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         );
      }
- 
-+    let target = remote.target.clone();
-     let _bridge = sys::SshStdioBridge::start(
-         remote.target,
+     let _bridge = SshStdioBridge::start(
+-        remote.target,
++        remote.target.clone(),
          prepared_remote.remote_herdr,
-@@ -244,7 +250,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
-     )?;
- 
-     remote_timing("phase: setup before client", "", launch_started.elapsed());
--    run_client_process(&local_socket, &reattach_command, remote.keybindings)
-+    run_client_process(
-+        &local_socket,
-+        &reattach_command,
-+        remote.keybindings,
-+        &target,
-+    )
+         local_socket.clone(),
+         session_name,
+@@ -85,6 +85,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
+         &local_socket,
+         &reattach_command,
+         remote.keybindings,
++        &remote.target,
+     )
  }
  
- #[derive(Debug, Clone, PartialEq, Eq)]
-@@ -1592,6 +1603,7 @@ fn run_client_process(
+@@ -2196,6 +2197,7 @@ fn run_client_process(
      local_socket: &Path,
      reattach_command: &str,
      keybindings: RemoteKeybindings,
@@ -1288,14 +1209,11 @@ index 21b4eed0..59199845 100644
  ) -> io::Result<()> {
      let exe = std::env::current_exe()?;
      let status = Command::new(exe)
-@@ -1603,6 +1615,7 @@ fn run_client_process(
-         .env("HERDR_RENDER_ENCODING", "terminal-ansi")
+@@ -2206,6 +2208,7 @@ fn run_client_process(
+         )
          .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
          .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
-+        .env(REMOTE_TARGET_ENV_VAR, target)
++        .env("HERDR_REMOTE_TARGET", target)
          .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
          .stdin(Stdio::inherit())
          .stdout(Stdio::inherit())
--- 
-2.52.0.windows.1
-
